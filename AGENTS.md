@@ -8013,3 +8013,14 @@ A Markdown table never breaks a word, and one too wide for its pane scrolls side
 038-capend 2026-10-05: the end-gap race and the incubation warning. `PreviewMarkdown.endBuilt` was read only on a height change, so a walk that built the last block with no height change left it false and the next growth (a late picture) was not followed, leaving the view short of the end; `onContentYChanged` now reads it too (`tests/markdown-endhold.qml` `uniformChecks`, 80 px short before). The block list builds its cache delegates asynchronously, so the Markdown Loader going inactive mid-build printed `Cannot create delegate` and `Object or context destroyed during incubation`; `Component.onDestruction: body.model = null` cancels them first, and `tests/markdown-teardown.qml` (a stage of `tests/markdown-render.sh`, 300 on/off rounds) fails on either line. `ui/PreviewMarkdown.qml` goes from 621 to 623 for that comment and line (its budget row); `tests/markdown-render.sh` and `tests/markdown-endhold.qml` stay under their caps.
 
 Qt 6.12 palette 2026-10-09: qt6-declarative 6.12 adds a `Color` singleton to `QtQuick`, which shadows `qs.Commons`' `Color` where both are imported unqualified, so the palette read undefined and text drew black on black. The nine files that read it import `qs.Commons as Commons` beside the plain import and say `Commons.Color`, the fix Omarchy made in its shell (omacom/omarchy #14553, #14626); comments still say `Color`. `ui/Theme.qml` goes from 433 to 434, `shelf/Panel.qml` 430 to 431 and `shelf/ShelfCard.qml` 443 to 444 for that import line; `tests/staticgates-unqualified.tsv` moves the `ui/Theme.qml` rows below it down one line in both profiles and names `Commons` where it named `Color`.
+
+Quick Look document scrolling uses Ctrl+D/Ctrl+U and PageDown/PageUp in the GUI preview
+context, in every key preset. Each step moves half the document viewport; MarkdownPane
+forwards to PreviewMarkdown in both Rendered and Source, and plain text bounds its Flickable.
+Cursor navigation and the Space/Escape close actions retain their existing routes.
+`tests/preview-scroll.qml`, run by `tests/markdown-render.sh`, drives real key events through
+Focus.handleKey into Quick Look and checks half the actual Flickable viewport in all three views.
+Real keys reach both bounds, preserve bare file-navigation routes and close with Space/Escape.
+The listing owner is stubbed; full-pane file loading and native display behavior are separate proofs.
+Scoped file ceilings for this addition: `ui/Preview.qml` 674, `ui/PreviewMarkdown.qml` 632,
+`ui/js/Keymap.js` 359 and `tests/js/keymap.js` 316. `ui/js/Focus.js` is unchanged.
