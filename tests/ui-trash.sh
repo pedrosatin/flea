@@ -45,13 +45,33 @@ case_railorder() {
     kill_flea
 }
 
+# Registers owned trash names for the EXIT trap, except in the data home's trash, which is inside the case's sandbox.
+trash_trap_own() {
+    local trash="$1" root="$2" label="$3"
+    shift 3
+    [[ "$trash" == "$XDG_DATA_HOME/Trash/files" ]] && return 0
+    sandbox_trash_trap_own "$trash" "$root" "$@" || fail "$label: owned entries could not be registered for $trash"
+}
+
 trash_guard() {
     local path="$1" canonical
     [[ -n "$path" && "$path" == /* ]] || fail "trash: empty or relative mutation path"
     [[ -f "$trash_box/.flea-test-sandbox" ]] || fail "trash: missing owned fixture marker"
     canonical=$(realpath -m -- "$path") || fail "trash: could not resolve mutation path"
     [[ "$canonical" == "$trash_box/"* && "$canonical" != "$trash_box" ]] \
-        || fail "trash: mutation path is outside this case's sandbox"
+        || fail "trash: mutation path $path (resolved $canonical) is outside this case's sandbox $trash_box"
+}
+
+# A trash backing path keeps trash_guard's checks where it can sit in the sandbox, and must always sit inside the trash GLib used (trash_files, or ROOT).
+trash_guard_backing() {
+    local path="$1" root="${2:-${trash_files:-}}" canonical
+    [[ -n "$path" && "$path" == /* && -n "$root" && "$root" == /* ]] || fail "trash: empty or relative backing path"
+    [[ -f "$trash_box/.flea-test-sandbox" ]] || fail "trash: missing owned fixture marker"
+    canonical=$(realpath -m -- "$path") || fail "trash: could not resolve backing path $path"
+    root=$(realpath -m -- "$root") || fail "trash: could not resolve trash directory $root"
+    [[ "$canonical" == "$root/"* ]] || fail "trash: backing $path is outside $root"
+    # A private store lives inside this case's sandbox, so the full trash_guard holds there; a mount-top trash cannot.
+    [[ "$root" != "$trash_box/"* ]] || trash_guard "$path"
 }
 
 trash_bus_id() {
@@ -177,25 +197,40 @@ print(unquote(uri.path, errors="strict"))
 PY
 }
 
+# Original paths this test trashed with gio itself; every other row is Flea's own rename.
+declare -gA trash_gio_rows=()
+
+# Judges each row by the one rule that made it, so a row in the other store is refused.
+trash_guard_rows() {
+    local listing="$1" home="$2" uri original backing row_trash
+    trash_guard_count=0
+    trash_guard_dir=""
+    [[ -n "$listing" ]] || return 0
+    # Sample list row: "trash:///a.txt<TAB>/owned/fixture/payload/a.txt".
+    while IFS=$'\t' read -r uri original; do
+        [[ "$uri" == trash:///* && -n "$original" ]] || fail "trash: malformed provider row"
+        trash_guard "$original"
+        # The rules differ when the data home is on another device than HOME; callers whose window runs under another HOME pass it as $2.
+        if [[ -n "${trash_gio_rows[$original]:-}" ]]; then
+            row_trash=$(sandbox_trash_gio_dir "$original" "$home") || fail "trash: no gio trash directory for $original"
+        else
+            row_trash=$(sandbox_trash_files_dir "$original" "$home") || fail "trash: no GLib trash directory for $original"
+        fi
+        backing=$(trash_backing "$uri") || fail "trash: unavailable backing path"
+        trash_guard_backing "$backing" "$row_trash"
+        trash_guard_dir=$row_trash
+        trash_guard_count=$((trash_guard_count + 1))
+    done <<< "$listing"
+}
+
 trash_guard_store() {
-    local expected="$1" listing uri original backing count=0
+    local expected="$1" listing
     trash_private
     trash_guard "$XDG_DATA_HOME"
     listing=$(/usr/bin/gio trash --list) || fail "trash: provider listing failed"
-    if [[ -n "$listing" ]]; then
-        # Sample list row: "trash:///a.txt<TAB>/owned/fixture/payload/a.txt".
-        while IFS=$'\t' read -r uri original; do
-            [[ "$uri" == trash:///* && -n "$original" ]] || fail "trash: malformed provider row"
-            trash_guard "$original"
-            backing=$(trash_backing "$uri") || fail "trash: unavailable backing path"
-            trash_guard "$backing"
-            [[ "$backing" == "$XDG_DATA_HOME/Trash/files/"* ]] \
-                || fail "trash: provider backing is outside the private Trash store"
-            count=$((count + 1))
-        done <<< "$listing"
-    fi
-    [[ "$count" -eq "$expected" ]] || fail "trash: expected $expected private entries, found $count"
-    printf 'TRASH_GUARD count=%s backing=%s/Trash/files bus=%s\n' "$count" "$XDG_DATA_HOME" "$trash_private_bus_id"
+    trash_guard_rows "$listing" "${2:-$HOME}"
+    [[ "$trash_guard_count" -eq "$expected" ]] || fail "trash: expected $expected private entries, found $trash_guard_count"
+    printf 'TRASH_GUARD count=%s backing=%s bus=%s\n' "$trash_guard_count" "$trash_guard_dir" "$trash_private_bus_id"
 }
 
 trash_wait() {
@@ -324,7 +359,7 @@ case_trashfailure() { case_trash failure; }
 
 # Reopening Trash gives the keyboard to the listing, never to the Empty Trash button.
 case_trashfocus() {
-    local trash_box payload root trash_checks=0 trash_case_label=trashfocus state focused
+    local trash_box payload root trash_checks=0 trash_case_label=trashfocus state focused trash_files
     local trash_parent_bus_id="" trash_private_bus_id="" trash_bus_address="" trash_bus_pid="" trash_provider_pid=""
     [[ "$(realpath -e "$(command -v gio)")" == /usr/bin/gio ]] || fail "trash: product gio resolves to a stub"
     sandbox_require "$fixture_root"
@@ -341,11 +376,14 @@ case_trashfocus() {
     payload="$trash_box/payload"
     trash_guard "$payload"
     mkdir "$payload" || fail "trash: fixture creation failed"
+    # GLib trashes to the home store or the fixture mount's top trash by device.
+    trash_files=$(sandbox_trash_files_dir "$payload") || fail "trash: no GLib trash directory for $payload"
     trash_start_bus
     printf 'alpha\n' > "$payload/alpha.txt"
     printf 'beta\n' > "$payload/beta.txt"
     launch "$payload"
     wait_listing 2
+    trash_trap_own "$trash_files" "$payload" "trash" alpha.txt beta.txt
     trash_move alpha.txt 0 1
     trash_move beta.txt 1 0
     trash_rail
@@ -362,12 +400,17 @@ case_trashfocus() {
     [[ "$focused" == false ]] || fail "trash: reopening Trash kept the keyboard on Empty Trash, state $state"
     key j >/dev/null
     trash_wait '.opened and .cursor == 1 and (.busy == false)' 'reopened Trash answers listing keys'
+    # Both entries stay trashed; a mount-top trash is shared, so only this run's own entries go.
+    if [[ "$trash_files" != "$XDG_DATA_HOME/Trash/files" ]]; then
+        sandbox_trash_remove_own "$trash_files" "$payload" alpha.txt beta.txt \
+            || fail "trash: owned entries could not be removed from $trash_files"
+    fi
     trash_cleanup 0
 }
 
 # A live smoke of the Trash view's dd wiring; the prompt's timing and staleness are pinned headless in tests/arm-prompt.sh.
 case_trasharm() {
-    local trash_box payload root trash_checks=0 trash_case_label=trasharm seen tries
+    local trash_box payload root trash_checks=0 trash_case_label=trasharm seen tries trash_files
     local trash_parent_bus_id="" trash_private_bus_id="" trash_bus_address="" trash_bus_pid="" trash_provider_pid=""
     local prompt="Press d again to review permanent deletion, or Delete on its own."
     # Key codes through uinput, so a pair of presses lands inside the 1.5 s arm without the key helper's refocus.
@@ -389,11 +432,14 @@ case_trasharm() {
     payload="$trash_box/payload"
     trash_guard "$payload"
     mkdir "$payload" || fail "trasharm: fixture creation failed"
+    # GLib trashes to the home store or the fixture mount's top trash by device.
+    trash_files=$(sandbox_trash_files_dir "$payload") || fail "trasharm: no GLib trash directory for $payload"
     trash_start_bus
     printf 'alpha\n' > "$payload/alpha.txt"
     printf 'beta\n' > "$payload/beta.txt"
     launch "$payload"
     wait_listing 2
+    trash_trap_own "$trash_files" "$payload" "trasharm" alpha.txt beta.txt
     trash_move alpha.txt 0 1
     trash_move beta.txt 1 0
     trash_rail
@@ -422,6 +468,11 @@ case_trasharm() {
     key -k Return >/dev/null
     trash_wait '(.confirmation.opened == false) and .total == 2 and (.busy == false)' 'Cancel kept both items'
     trash_guard_store 2
+    # Both entries stay trashed; a mount-top trash is shared, so only this run's own entries go.
+    if [[ "$trash_files" != "$XDG_DATA_HOME/Trash/files" ]]; then
+        sandbox_trash_remove_own "$trash_files" "$payload" alpha.txt beta.txt \
+            || fail "trasharm: owned entries could not be removed from $trash_files"
+    fi
     trash_cleanup 0
 }
 
@@ -510,7 +561,7 @@ trash_confirmation_controls() {
         trash_wait '(.confirmation.opened == false) and .total == 1 and (.busy == false)' "$preset reflexive Return cancels selected delete"
 
         trash_empty_strip
-        trash_wait '.confirmation.all and .confirmation.title == "Empty Trash?" and .confirmation.cancel.enabled and .confirmation.danger.enabled' "$preset Empty Trash uses shared strip"
+        trash_wait '.confirmation.all and .confirmation.title == "Empty Trash?" and .confirmation.body == ((.countText | sub(" · "; ", ")) + ". This deletes it from disk. This cannot be undone.") and .confirmation.cancel.enabled and .confirmation.danger.enabled' "$preset Empty Trash uses shared strip"
         token=$(ipc trashState | jq -er '.confirmation.token')
         key -k Tab >/dev/null
         trash_wait '.confirmation.destructiveFocus' "$preset Tab reaches danger"
@@ -574,7 +625,8 @@ trash_failure_status() {
 }
 
 trash_restore_failures() {
-    local uri backing row original="$trash_box/missing-parent/leaf.txt"
+    local uri backing row original="$trash_box/missing-parent/leaf.txt" trash_files gio_files
+    trash_files=$(sandbox_trash_files_dir "$payload") || fail "trash: no GLib trash directory for $payload"
     trash_guard "$payload/beta.txt"
     (set -o noclobber; printf 'existing destination\n' > "$payload/beta.txt") \
         || fail "trash: refusing to overwrite the restore collision fixture"
@@ -587,7 +639,7 @@ trash_restore_failures() {
     [[ "$(cat "$payload/beta.txt")" == 'existing destination' ]] || fail "trash: Restore overwrote an existing file"
     uri=$(/usr/bin/gio trash --list | cut -f1)
     backing=$(trash_backing "$uri") || fail "trash: failed restore has no backing"
-    trash_guard "$backing"
+    trash_guard_backing "$backing"
     [[ "$(cat "$backing")" == beta ]] || fail "trash: collision changed the Trash survivor"
     trash_shot trash-restore-collision
     trash_guard "$trash_box/restore-blocker"
@@ -608,6 +660,10 @@ trash_restore_failures() {
     trash_guard "$original"
     mkdir "$trash_box/missing-parent" || fail "trash: missing-parent fixture creation failed"
     printf 'missing parent survivor\n' > "$original"
+    # The restore under test may fail, and a mount-top entry left behind would outlive this case; gio trashes leaf.txt below.
+    gio_files=$(sandbox_trash_gio_dir "$original") || fail "trash: no gio trash directory for $original"
+    trash_trap_own "$gio_files" "$trash_box" "trash" leaf.txt
+    trash_gio_rows[$original]=1
     trash_guard_store 0
     /usr/bin/gio trash -- "$original" || fail "trash: owned missing-parent setup failed"
     trash_wait '.opened and .total == 1 and (.busy == false)'
@@ -660,7 +716,12 @@ trash_uri() {
 }
 
 trash_stale_confirmations() {
-    local token uri backing identity replacement="$trash_box/replacement-beta" retired="$trash_box/retired-beta"
+    local token uri backing identity replacement="$trash_box/replacement-beta" retired="$trash_box/retired-beta" trash_files gio_files
+    trash_files=$(sandbox_trash_files_dir "$payload") || fail "trash: no GLib trash directory for $payload"
+    gio_files=$(sandbox_trash_gio_dir "$payload") || fail "trash: no gio trash directory for $payload"
+    # arrival.txt is trashed by gio below, so an early failure must not leave it in a mount-top trash.
+    trash_trap_own "$gio_files" "$payload" "trash" arrival.txt
+    trash_gio_rows[$payload/arrival.txt]=1
     trash_empty_strip
     trash_shot trash-empty-confirm-cancel
     trash_guard_store 1
@@ -697,7 +758,7 @@ trash_stale_confirmations() {
     trash_wait '.confirmation.destructiveFocus'
     uri=$(trash_uri "$payload/beta.txt")
     backing=$(trash_backing "$uri") || fail "trash: missing replacement fixture backing"
-    trash_guard "$backing"
+    trash_guard_backing "$backing"
     trash_guard "$replacement"
     trash_guard "$retired"
     (set -o noclobber; printf 'replacement contents\n' > "$replacement") \
@@ -705,7 +766,7 @@ trash_stale_confirmations() {
     trash_guard_store 1
     ln -- "$backing" "$retired" || fail "trash: could not retain the replaced inode"
     # An atomic same-name replacement retains the old inode through its owned hard link.
-    trash_guard "$backing"
+    trash_guard_backing "$backing"
     mv -T -- "$replacement" "$backing" || fail "trash: owned replacement failed"
     [[ "$(stat -c '%d:%i' "$backing")" != "$(stat -c '%d:%i' "$retired")" \
         && "$(cat "$backing")" == 'replacement contents' && "$(cat "$retired")" == beta ]] \
@@ -736,28 +797,33 @@ trash_stale_confirmations() {
     trash_guard_store 1
     uri=$(trash_uri "$payload/arrival.txt")
     backing=$(trash_backing "$uri") || fail "trash: unrelated arrival lost backing"
-    trash_guard "$backing"
+    trash_guard_backing "$backing" "$gio_files"
     [[ "$(cat "$backing")" == 'later arrival' && "$(cat "$retired")" == beta ]] \
         || fail "trash: selected deletion changed an unrelated fixture"
     trash_empty_confirmed 1
 }
 
-# The 30 day sweep, GM's ruling of 2026-09-11. It runs once, at startup, before the Trash window has
+# The 30 day sweep, decided 2026-09-11. It runs once, at startup, before the Trash window has
 # ever existed, so this is its own launch with the setting already on and the fixture already holding
 # items older than the threshold. Everything here is inside the marked fixture the caller made, and
 # trash_guard refuses any path outside it.
 trash_sweep_case() {
-    local info recent old_one old_two swept day
+    local info recent old_one old_two swept day trash_files trash_info
+    # The fixture is trashed by gio, which follows HOME's device.
+    trash_files=$(sandbox_trash_gio_dir "$payload") || fail "trash: no gio trash directory for $payload"
+    trash_trap_own "$trash_files" "$payload" "trash" keep.txt stale-one.txt stale-two.txt
     for name in keep.txt stale-one.txt stale-two.txt; do
+        trash_gio_rows[$payload/$name]=1
         printf '%s\n' "$name" > "$payload/$name"
         /usr/bin/gio trash -- "$payload/$name" || fail "trash: sweep fixture could not be trashed"
     done
-    trash_guard "$XDG_DATA_HOME/Trash/info"
+    trash_info="${trash_files%/files}/info"
+    [[ -n "$trash_info" && "$trash_info" == /* ]] || fail "trash: no GLib trash info directory for $payload"
     # gio writes DeletionDate into the .trashinfo beside each item, and it is the same field the
     # sweep reads back through trash::deletion-date, so backdating it here is backdating the item.
     for name in stale-one.txt stale-two.txt; do
-        info="$XDG_DATA_HOME/Trash/info/$name.trashinfo"
-        trash_guard "$info"
+        info="$trash_info/$name.trashinfo"
+        trash_guard_backing "$info" "$trash_info"
         [[ -f "$info" ]] || fail "trash: sweep fixture has no trashinfo for $name"
         sed -i "s/^DeletionDate=.*/DeletionDate=$(date -d '40 days ago' +%Y-%m-%dT%H:%M:%S)/" "$info" \
             || fail "trash: sweep fixture could not be backdated"
@@ -781,11 +847,16 @@ trash_sweep_case() {
     # midnight, so a run either side of UTC midnight cannot disagree with the product.
     day=$(( $(date -d 'today 00:00:00' +%s) / 86400 ))
     [[ "$swept" == "$day" ]] || fail "trash: the sweep recorded day $swept, expected $day"
+    # The survivor stays trashed; a mount-top trash is shared, so only this run's own entry goes.
+    if [[ "$trash_files" != "$XDG_DATA_HOME/Trash/files" ]]; then
+        sandbox_trash_remove_own "$trash_files" "$payload" keep.txt \
+            || fail "trash: owned entries could not be removed from $trash_files"
+    fi
     trash_cleanup 0
 }
 
 case_trash() {
-    local trash_box payload row uri backing root trash_checks=0 pointer_x pointer_y
+    local trash_box payload row uri backing root trash_checks=0 pointer_x pointer_y trash_files
     local trash_case_label="${1:-full}"
     local trash_parent_bus_id="" trash_private_bus_id="" trash_bus_address="" trash_bus_pid="" trash_provider_pid=""
     [[ "$(realpath -e "$(command -v gio)")" == /usr/bin/gio ]] || fail "trash: product gio resolves to a stub"
@@ -805,6 +876,8 @@ case_trash() {
     trash_guard "$payload"
     [[ ! -e "$payload" ]] || fail "trash: refusing to reuse a prior payload"
     mkdir "$payload" || fail "trash: fixture creation failed"
+    # GLib trashes to the home store or the fixture mount's top trash by device.
+    trash_files=$(sandbox_trash_files_dir "$payload") || fail "trash: no GLib trash directory for $payload"
     trash_start_bus
     if [[ "$trash_case_label" == sweep ]]; then trash_sweep_case; return; fi
     launch "$payload"
@@ -834,6 +907,7 @@ case_trash() {
     printf 'alpha\n' > "$payload/alpha.txt"
     printf 'beta\n' > "$payload/beta.txt"
     wait_listing 2
+    trash_trap_own "$trash_files" "$payload" "trash" alpha.txt beta.txt
     trash_move alpha.txt 0 1
     trash_move beta.txt 1 0
     trash_wait '.count == 2'
@@ -851,14 +925,21 @@ case_trash() {
     trash_wait '.total == 1 and (.busy == false)'
     [[ "$(cat "$payload/alpha.txt")" == alpha ]] || fail "trash: native Restore lost file contents"
     trash_guard_store 1
-    if [[ "$trash_case_label" == basic ]]; then trash_cleanup 0; fi
+    # One entry stays trashed on these exits; a mount-top trash is shared, so only this run's own entry goes.
+    trash_leave_owned() {
+        if [[ "$trash_files" != "$XDG_DATA_HOME/Trash/files" ]]; then
+            sandbox_trash_remove_own "$trash_files" "$payload" beta.txt \
+                || fail "trash: owned entries could not be removed from $trash_files"
+        fi
+    }
+    if [[ "$trash_case_label" == basic ]]; then trash_leave_owned; trash_cleanup 0; fi
     if [[ "$trash_case_label" == full || "$trash_case_label" == controls || "$trash_case_label" == keys ]]; then
         trash_confirmation_controls "$trash_case_label"
-        if [[ "$trash_case_label" != full ]]; then trash_cleanup 0; fi
+        if [[ "$trash_case_label" != full ]]; then trash_leave_owned; trash_cleanup 0; fi
     fi
     if [[ "$trash_case_label" == full || "$trash_case_label" == restore ]]; then
         trash_restore_failures
-        if [[ "$trash_case_label" == restore ]]; then trash_cleanup 0; fi
+        if [[ "$trash_case_label" == restore ]]; then trash_leave_owned; trash_cleanup 0; fi
     fi
     if [[ "$trash_case_label" == failure ]]; then trash_empty_confirmed 1
     else trash_stale_confirmations; fi
@@ -872,15 +953,16 @@ case_trash() {
     mkdir "$payload/locked"
     printf 'survive failed delete\n' > "$payload/locked/child.txt"
     wait_listing 3
+    trash_trap_own "$trash_files" "$payload" "trash" good.txt locked
     trash_move good.txt 0 2
     trash_move locked 1 1
     # The lock goes on where the permanent delete will meet it, which is the trash's own backing copy.
     # gio refuses to trash a directory it cannot write at all: measured on the box, "Unable to trash
     # file ...: Permission denied", so locking it before the move left the row in the listing and this
     # block never reached the failure it exists to prove.
-    locked_backing=$(trash_backing "$(/usr/bin/gio trash --list | grep -F "/locked" | cut -f1)") \
+    locked_backing=$(trash_backing "$(trash_uri "$payload/locked")") \
         || fail "trash: missing locked backing"
-    trash_guard "$locked_backing"
+    trash_guard_backing "$locked_backing"
     chmod 0555 "$locked_backing"
     trash_rail
     trash_wait '.total == 2 and (.busy == false)'
@@ -917,7 +999,7 @@ case_trash() {
     trash_shot trash-partial-failure
     uri=$(/usr/bin/gio trash --list | cut -f1)
     backing=$(trash_backing "$uri") || fail "trash: missing survivor backing"
-    trash_guard "$backing"
+    trash_guard_backing "$backing"
     [[ "$(cat "$backing/child.txt")" == 'survive failed delete' ]] || fail "trash: failed survivor changed"
     chmod u+w "$backing"
     key -k F5 >/dev/null

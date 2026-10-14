@@ -6,7 +6,7 @@ import "flea" as Flea
 
 // e6 columnscost: a ColumnsArea at the shipped default limit (3) builds no
 // great-grandparent or grandparent pane, and one ColumnRow holds its ceiling.
-// tests/columnscost.sh drives it offscreen; the controller pins the counts.
+// tests/columnscost.sh drives it offscreen; the maintainer pins the counts.
 ShellRoot {
     id: root
 
@@ -234,8 +234,8 @@ ShellRoot {
         showSize: false
     }
 
-    // One lazy frame, label and mark without the wrapper; measured ceiling pins idle row cost.
-    readonly property int columnRowMax: 17
+    // One lazy frame, label and mark without the wrapper, and the chevron built on first draw, so a row at rest holds none; measured ceiling pins idle row cost.
+    readonly property int columnRowMax: 15
 
     // Delegates are built on the polish pass, so the read waits one turn like mount-listing.qml.
     Timer {

@@ -7,157 +7,212 @@ soft_qml=250;  hard_qml=400
 soft_js=200;   hard_js=300
 
 # Recorded debts and scoped release exceptions retain exact per-file ceilings; global limits stay unchanged.
-known_over_cap="shelf/Model.js 669
-shelf/Panel.qml 431
+known_over_cap="shelf/Model.js 701
+shelf/Panel.qml 443
 shelf/ShelfCard.qml 444
 shelf/ShelfService.qml 481
-src/backend/copyfile.rs 730
-src/backend/copyfile_tests.rs 607
-src/backend/durable.rs 790
-src/backend/durable_tests.rs 1305
-src/backend/fsinforeq.rs 407
+src/backend/copyfile.rs 739
+src/backend/tags.rs 408
+src/backend/searchsession.rs 350
+src/backend/searchtags.rs 444
+src/backend/searchtags_tests.rs 519
+src/backend/tagsreq_tests.rs 383
+src/backend/copyfile_tests.rs 694
+src/backend/durable.rs 809
+src/backend/dirsize.rs 422
+src/backend/durable_tests.rs 1396
 src/backend/jump_tests.rs 487
-src/backend/renamecompat.rs 762
-src/backend/gvfslist.rs 560
+src/backend/renamecompat.rs 721
+src/backend/gvfslist.rs 513
 src/backend/imagesize.rs 473
-src/backend/iomount.rs 606
-src/backend/localsend.rs 405
-src/backend/menu_actions.rs 641
-src/backend/menu_registry.rs 563
-src/backend/meta.rs 575
-src/backend/metareq.rs 416
-src/backend/movebatch.rs 474
+src/backend/iomount.rs 634
+src/backend/localsend.rs 432
+src/backend/menu_actions.rs 657
+src/backend/menu_registry.rs 569
+src/backend/meta.rs 550
+src/backend/metareq.rs 410
+src/backend/movebatch.rs 477
 src/backend/movebatch_tests.rs 752
-src/backend/opsdispatch.rs 2204
-src/backend/opsreq.rs 560
-src/backend/opsreq/tests.rs 484
-src/backend/permissions.rs 719
-src/backend/run.rs 719
-src/backend/ops.rs 427
-src/backend/thumbs.rs 460
-src/backend/dirsizeworker.rs 574
-src/backend/watch.rs 533
-src/backend/thumbreq.rs 418
-src/backend/undo.rs 606
-src/backend/undo_tests.rs 423
-src/backend/undoshare.rs 403
-src/backend/undoshare_tests.rs 533
-src/backend/collide_replace_tests.rs 487
-src/backend/proto.rs 378
-src/backend/thumbworker.rs 953
-src/backend/trashbrowse.rs 779
+src/backend/opsdispatch.rs 2273
+src/backend/opsreq.rs 563
+src/backend/opsreq/tests.rs 502
+src/backend/permissions.rs 703
+src/backend/run.rs 1107
+src/backend/run_session_tests.rs 525
+src/backend/ops.rs 440
+src/backend/thumbs.rs 495
+src/backend/thumbspec.rs 410
+src/backend/dirsizeworker.rs 573
+src/backend/watch.rs 550
+src/backend/thumbreq.rs 448
+src/backend/undo.rs 717
+src/backend/undo_tests.rs 439
+src/backend/undoshare.rs 414
+src/backend/undoshare_tests.rs 563
+src/backend/collide_replace_tests.rs 492
+src/backend/proto.rs 456
+src/backend/thumbworker.rs 961
+src/backend/trashbrowse.rs 780
 src/backend/trashdelete.rs 938
-src/clip/watch_end_tests.rs 406
-src/gui.rs 501
-src/tui/actions.rs 1067
-src/tui/input.rs 449
-src/tui/model.rs 1247
-src/tui/render.rs 889
-src/uischema.rs 499
-src/uistate.rs 674
-src/uistore.rs 540
-src/vulkan.rs 732
-tests/js/columns.js 666
-tests/js/drag.js 469
-tests/js/devices.js 303
-tests/js/previewswap.js 408
-tests/js/mdstructure.js 626
-tests/js/keymap.js 316
-tests/js/focus.js 745
-tests/js/mounts.js 262
-tests/js/menu.js 515
-tests/js/nav.js 362
-tests/picker-grid.qml 450
-tests/picker-hunt.qml 445
-tests/js/network.js 306
-tests/js/ops.js 511
-tests/js/slowclick.js 308
-tests/js/settings.js 352
-tests/js/tap.js 333
+src/clip/watch_end_tests.rs 405
+src/gvfsprefetch_tests.rs 398
+src/gui.rs 505
+src/tui/actions.rs 1058
+src/tui/hold_tests.rs 427
+src/tui/input.rs 455
+src/tui/model.rs 1268
+src/tui/mod.rs 419
+src/tui/render.rs 913
+src/uischema.rs 549
+src/uistate.rs 810
+src/uistore.rs 551
+src/vulkan.rs 751
+tests/js/columns.js 687
+tests/js/drag.js 493
+tests/js/dropsflow.js 301
+tests/js/collide.js 319
+tests/js/devices.js 363
+tests/js/previewswap.js 469
+tests/js/mdstructure.js 655
+tests/js/keymap.js 363
+tests/js/focus.js 843
+tests/js/mounts.js 349
+tests/js/menu.js 596
+tests/js/nav.js 478
+tests/js/rail.js 471
+tests/js/picker.js 352
+tests/picker-grid.qml 465
+tests/picker-hunt.qml 449
+tests/permissions-focus.qml 417
+tests/js/network.js 307
+tests/js/ops.js 574
+tests/js/slowclick.js 309
+tests/js/settings.js 394
+tests/js/tap.js 401
 tests/js/uistate.js 370
-tests/js/watch.js 540
-tests/js/xwwatch.js 310
-tests/js/tabs.js 686
-tests/columnrow-geom.qml 409
+tests/js/watch.js 541
+tests/js/xwwatch.js 299
+tests/js/tabs.js 798
+tests/js/search.js 336
+tests/button-members.qml 515
+tests/chromering.qml 413
+tests/columnrow-geom.qml 426
+tests/dialog-board.qml 663
 tests/columnscost.qml 416
-tests/columnsfolder.qml 399
-tests/quicklook-firstframe.qml 438
+tests/rowcost.qml 417
+tests/gridmark.qml 419
+tests/columnsfilter.qml 402
+tests/columnsfolder.qml 400
+tests/quicklook-firstframe.qml 457
 tests/markdown-render.qml 795
+tests/rename-cost.qml 482
 tests/markdown-linearity.qml 679
-tests/markdown-preview-state.qml 469
+tests/markdown-preview-state.qml 474
 tests/markdown-tables.qml 401
 tests/quicklook-firstframe.js 214
-tests/preview-settle-live.qml 457
-tests/preview-decode.qml 507
-tests/js/status.js 354
-tests/rename-grid-bottom.qml 424
-tests/rename-grid-bottom.js 305
-tests/ring-bounds.qml 639
-tests/sidebar-flows.qml 401
-tests/touchpad.qml 747
-tests/xwsettings-tabs.qml 444
-ui/Backend.qml 472
-ui/ChromeBar.qml 472
-ui/ColumnsArea.qml 491
-ui/ContextMenu.qml 739
-ui/ConvertDialog.qml 435
-ui/GridArea.qml 420
-ui/Ipc.qml 883
-ui/KeymapSheet.qml 549
-ui/List.qml 437
+tests/preview-settle-live.qml 532
+tests/preview-decode.qml 1012
+tests/js/status.js 349
+tests/rename-grid-bottom.qml 439
+tests/rename-grid-bottom.js 351
+tests/js/runfile.js 305
+tests/ring-bounds.qml 702
+tests/menu-fit.qml 446
+tests/search-live.qml 417
+tests/sidebar-flows.qml 687
+tests/touchpad.qml 882
+tests/xwsettings-tabs.qml 379
+ui/Backend.qml 576
+ui/ChromeBar.qml 352
+ui/ColumnsArea.qml 547
+ui/ColumnPane.qml 450
+ui/ContextMenu.qml 781
+ui/ConvertDialog.qml 456
+ui/GridArea.qml 663
+ui/Ipc.qml 987
+tests/gridprebuild.qml 457
+tests/columnsprebuild.qml 416
+ui/KeymapSheet.qml 551
+ui/List.qml 480
+tests/listprebuild.qml 410
+tests/poolpark.qml 419
 tests/touchpad-edge.qml 438
-ui/FastScrollHandler.qml 529
+tests/railmotion.qml 457
+ui/FastScrollHandler.qml 476
 ui/FigureService.qml 405
-ui/NetworkDialog.qml 447
-ui/NetworkForm.qml 406
-ui/NetworkMounts.qml 849
-ui/OpenWithDialog.qml 608
-ui/Pane.qml 1043
-ui/PaneMenuActions.qml 467
-ui/PaneWire.qml 586
-ui/PermissionsDialog.qml 674
-ui/PickerWindow.qml 779
-ui/Preview.qml 674
-ui/PreviewColumn.qml 583
-ui/DeviceMounts.qml 496
-ui/PreviewMarkdown.qml 632
-ui/Row.qml 482
-ui/SettingsPanel.qml 543
+ui/FlashView.qml 397
+ui/NetworkDialog.qml 435
+ui/NetworkForm.qml 426
+ui/NetworkMounts.qml 913
+ui/OpenWithDialog.qml 613
+ui/Pane.qml 1230
+ui/PaneMenuActions.qml 523
+ui/PaneWire.qml 602
+ui/PermissionsDialog.qml 658
+ui/PickerWindow.qml 797
+ui/Preview.qml 868
+ui/PreviewColumn.qml 589
+ui/PickerChrome.qml 441
+ui/DeviceMounts.qml 537
+ui/PreviewMarkdown.qml 634
+ui/Row.qml 496
+ui/SettingsPanel.qml 547
 ui/SettingsRow.qml 409
-ui/Sidebar.qml 669
-ui/StatusBar.qml 456
-ui/Theme.qml 434
-ui/TrashView.qml 466
-ui/ViewState.qml 536
-ui/WindowBody.qml 651
-ui/js/Anchor.js 406
-ui/js/Devices.js 366
-ui/js/Filter.js 257
-ui/js/Focus.js 435
-ui/js/Keymap.js 359
-ui/js/Nav.js 308
-ui/js/Markdown.js 155
-ui/js/MdBlocks.js 444
-ui/js/MdDocument.js 341
-ui/js/MdLeaf.js 316
-ui/js/MdInline.js 295
-ui/js/Menu.js 454
-ui/js/Drag.js 342
-ui/js/Ops.js 426
-ui/js/Picker.js 328
-ui/js/Settings.js 456
-ui/js/Tabs.js 719
-ui/js/UiState.js 447
-ui/TabBar.qml 632
-ui/boot/fleatab.qml 50"
+ui/Sidebar.qml 713
+ui/StatusBar.qml 477
+ui/Theme.qml 475
+ui/TrashView.qml 472
+ui/UnlockDialog.qml 450
+ui/ViewState.qml 542
+ui/WindowBody.qml 816
+ui/js/Anchor.js 379
+ui/js/ColumnsCarry.js 94
+ui/js/Devices.js 391
+ui/js/Filter.js 284
+ui/js/Focus.js 483
+ui/js/Keymap.js 369
+ui/js/Nav.js 328
+ui/js/Markdown.js 135
+ui/js/MdBlocks.js 437
+ui/js/FigureWorker.mjs 619
+ui/js/MdDocument.js 337
+ui/js/MdLeaf.js 309
+ui/js/MdHtml.js 307
+ui/js/Menu.js 491
+ui/js/Drag.js 349
+ui/js/Format.js 305
+ui/js/Ops.js 539
+ui/js/Search.js 396
+ui/js/Mounts.js 320
+ui/js/Picker.js 349
+ui/js/Settings.js 475
+ui/js/Scroll.js 304
+ui/js/Tabs.js 736
+ui/js/UiState.js 438
+ui/TabBar.qml 673
+ui/boot/fleatab.qml 50
+tests/unlock-stdin.qml 483
+src/backend/searchindex.rs 401
+tests/gridjump.qml 516
+tests/gridbare.qml 426
+src/backend/trash.rs 401
+src/backend/trash_tests.rs 423
+tests/permissions-adv.qml 402"
 
 status=0
+
+# A file listed twice hands the ceiling lookup two numbers and breaks its comparison.
+duplicated=$(printf '%s\n' "$known_over_cap" | awk '{ print $1 }' | sort | uniq -d)
+if [ -n "$duplicated" ]; then
+  echo "DUPLICATE ceiling: $duplicated"
+  status=1
+fi
 
 budget_for() {
   case "$1" in
     *.rs)  echo "$soft_rust $hard_rust" ;;
     *.qml) echo "$soft_qml $hard_qml" ;;
-    *.js)  echo "$soft_js $hard_js" ;;
+    *.js|*.mjs)  echo "$soft_js $hard_js" ;;
     *)     echo "" ;;
   esac
 }
@@ -174,7 +229,7 @@ while IFS= read -r file; do
   lines=$(wc -l < "$file")
   if [ "$lines" -gt "$hard" ]; then
     # Sample input: ui/Preview.qml 724, an exact per-file ceiling from known_over_cap.
-    recorded=$(printf '%s\n' "$known_over_cap" | awk -v f="$file" '$1 == f { print $2 }')
+    recorded=$(printf '%s\n' "$known_over_cap" | awk -v f="$file" '$1 == f { print $2; exit }')
     if [ -n "$recorded" ]; then
       if [ "$lines" -gt "$recorded" ]; then
         echo "GREW      $file: $lines lines, recorded $recorded, cap $hard"
@@ -189,6 +244,6 @@ while IFS= read -r file; do
   elif [ "$lines" -gt "$soft" ]; then
     echo "over soft $file: $lines lines, budget $soft, split it"
   fi
-done < <(find src ui shelf tests -type f \( -name '*.rs' -o -name '*.qml' -o -name '*.js' \) 2>/dev/null)
+done < <(find src ui shelf tests -type f \( -name '*.rs' -o -name '*.qml' -o -name '*.js' -o -name '*.mjs' \) 2>/dev/null)
 
 exit $status

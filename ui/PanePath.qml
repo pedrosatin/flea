@@ -8,16 +8,19 @@ Rectangle {
 
     property string path: ""
     property string home: ""
+    property var pathAlias: null
     property bool focused: false
     // ui/ChromeBar.qml's inputLive: false while Quick Look covers the strip, so a press on it stays Quick Look's.
     property bool inputLive: true
+    // Drops callout 4: the pane whose collide sends a drop on a crumb.
+    property var pane: null
     readonly property alias crumbItems: crumbs
     readonly property alias crumbSlot: slot
 
     signal chosen(string path)
     signal editRequested()
 
-    color: root.focused ? Theme.color.surface : Theme.color.background
+    color: root.focused ? Glass.surface : Glass.background
 
     // Where no crumb is, the strip keeps the one gesture it had before issue 45: a double click types the path.
     component TypeArea: Item {
@@ -54,7 +57,7 @@ Rectangle {
                 id: crumbs
                 // Empty while the strip is hidden, because the single view keeps it at height 0 and would rebuild its crumbs on every move.
                 model: root.visible
-                       ? Crumbs.fitCrumbs(Crumbs.crumbs(root.path, root.home),
+                       ? Crumbs.fitCrumbs(Crumbs.crumbs(root.path, root.home, root.pathAlias),
                                           Math.floor((slot.width - 2 * Theme.spacing.rowPaddingX) / metrics.advanceWidth))
                        : []
 
@@ -62,6 +65,7 @@ Rectangle {
                     height: slot.height
                     restColor: Theme.color.foreground
                     inputLive: root.inputLive
+                    dropPane: root.pane
                     onChosen: function (path) { root.chosen(path) }
                     onEditRequested: root.editRequested()
                 }
@@ -81,6 +85,6 @@ Rectangle {
     Rectangle {
         anchors { left: parent.left; right: parent.right; bottom: parent.bottom }
         height: Theme.spacing.hairline
-        color: Theme.color.muted
+        color: Theme.color.mutedFrame
     }
 }

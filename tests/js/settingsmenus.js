@@ -14,13 +14,16 @@ function runInventory(check) {
     var builtMark = {}
     var shapes = [
         { rowInDropbox: false, rowIsArchive: true, rowIsImage: true, rowIsSymlink: true,
-          selectionCount: 1, selectionModes: undefined, hasShebang: true, cursorIsTarget: true },
+          selectionCount: 1, selectionModes: undefined, hasShebang: true, cursorIsTarget: true,
+          tagSubmenu: [{ id: "Red", label: "Red" }] },
         { rowInDropbox: true, rowIsArchive: false, rowIsImage: false, rowIsSymlink: false,
-          selectionCount: 1, selectionModes: undefined, hasShebang: false },
+          selectionCount: 1, selectionModes: undefined, hasShebang: false,
+          tagSubmenu: [{ id: "Red", label: "Red" }] },
         // Permissions040: Permissions takes the whole selection, so one shape
         // selects three files and the row still builds.
         { rowInDropbox: false, rowIsArchive: false, rowIsImage: false, rowIsSymlink: false,
-          selectionCount: 3, selectionModes: [0o100644, 0o100644, 0o040755], hasShebang: false }
+          selectionCount: 3, selectionModes: [0o100644, 0o100644, 0o040755], hasShebang: false,
+          tagSubmenu: [{ id: "Red", label: "Red" }] }
     ]
     for (var s = 0; s < shapes.length; s++) {
         var rows = Menu.listingEntries({
@@ -29,14 +32,20 @@ function runInventory(check) {
             localSendInstalled: true, clipboardAvailable: true,
             archiveFormats: ["zip"], canConvert: true, canExtract: true, selectionCount: shapes[s].selectionCount,
             selectionModes: shapes[s].selectionModes, rowMode: 0o100644, rowIsSymlink: shapes[s].rowIsSymlink,
+            rowName: "debian-13.iso", flashZipMember: "",
             rowInDropbox: shapes[s].rowInDropbox, rowIsArchive: shapes[s].rowIsArchive,
             rowIsImage: shapes[s].rowIsImage, hiddenActions: [], hasShebang: shapes[s].hasShebang,
             cursorIsTarget: shapes[s].cursorIsTarget,
+            // The Tags row builds only where a tag flyout exists, the way a folder with tags in use builds it.
+            tagSubmenu: shapes[s].tagSubmenu,
             // One script, so the Run script row is built here the way a box with a scripts directory builds it.
             scripts: [{ id: "one.sh", label: "one" }]
         })
         for (var i = 0; i < rows.length; i++) {
             if (rows[i].separator === true)
+                continue
+            // The rename row names its count over several rows (pinned in menu.js); the switch carries the one-row wording.
+            if (shapes[s].selectionCount > 1 && rows[i].action === "rename")
                 continue
             built[rows[i].id || rows[i].action] = rows[i].label
             builtMark[rows[i].id || rows[i].action] = rows[i].glyph !== undefined ? rows[i].glyph : rows[i].mark
@@ -83,7 +92,7 @@ function runInventory(check) {
           Object.keys(built).filter(function (id) { return reachable.indexOf(id) < 0 }).join(","), "")
 }
 
-// GM's ruling, and it is easy to get backwards: menu.hidden stores what is HIDDEN, and a master's count is of ENABLED actions, so one id in the set reads "5 of 6".
+// The rule, and it is easy to get backwards: menu.hidden stores what is HIDDEN, and a master's count is of ENABLED actions, so one id in the set reads "5 of 6".
 function runMaster(check) {
     var BASIC = Settings.BASIC
     check("nothing hidden is all six enabled", Settings.basicEnabled([], BASIC), 6)
@@ -127,8 +136,8 @@ function runMaster(check) {
         .filter(function (row) { return row.kind === "group" })
     check("every heading reports the group it governs, and a group of one row has no master at all",
           groups.map(function (row) { return row.label + "|" + (row.master ? row.value + "|" + row.state : "no master") }).join(", "),
-          "Basic file actions|6 of 6|all, Destructive|no master, Open and inspect|5 of 9|some, "
-          + "Extras|14 of 14|all, Shortcuts|no master, Always shown|no master")
+          "Basic file actions|6 of 6|all, Destructive|no master, Open and inspect|8 of 12|some, "
+          + "Extras|15 of 15|all, Shortcuts|no master, Always shown|no master")
     var inspect = groups[2]
     check("a heading with a master is a focus stop and one without is not",
           Settings.focusable(inspect) + "|" + Settings.focusable(groups[1]), "true|false")

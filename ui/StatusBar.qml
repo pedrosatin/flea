@@ -13,6 +13,8 @@ Item {
 
     property string path: ""
     property int total: 0
+    // The flasher's own count line while it owns the pane, set by the window from the host.
+    property string flashCount: ""
     property string listingState: "loading"
     // The pane whose listing this strip is counting, or null while the trash view owns the pane.
     property var pane: null
@@ -23,7 +25,11 @@ Item {
     property int selectionCount: 0
     property string fsName: ""
     property real fsFree: 0
+    // True while the pane's fs facts for its folder are still out, so the slot draws nothing yet.
+    property bool fsPending: false
     property string notice: ""
+    // Each notice carries a serial, so a withdrawal names the notice it owns.
+    property int noticeSerial: 0
     // [{text, detail, place}]: place is the path a no-Trash refusal was raised in, "" for every other error.
     property var errors: []
     // An arm's prompt and its record, kept apart from the notice so the arm's own life, not the text, ranks it.
@@ -41,7 +47,7 @@ Item {
     readonly property var shown: Status.transientOf(root.errors, root.notice, root.prompt, root.armLive)
     readonly property string transient_: root.shown.text
     readonly property string errorDetail: root.shown.detail
-    // Directive 48, GM's final: no centre lane at all. The transient sits beside the disk facts, one
+    // Directive 48, final form: no centre lane at all. The transient sits beside the disk facts, one
     // padding before the text those facts actually draw, which is not the left edge of their fixed
     // zone box: a short filesystem line would otherwise leave the pair drifting apart by the slack.
     readonly property real diskTextWidth: Math.min(disk.implicitWidth, disk.width)
@@ -106,13 +112,20 @@ Item {
     // Completion messages cannot acknowledge a failure; each error requires its own dismissal.
     function say(text, isError, detail) {
         if (!text) { root.dismiss(); return }
-        if (!isError && Status.isPrompt(text)) { root.startArm(text); return }
         if (isError) {
             root.errors = Status.withError(root.errors, text, detail, root.path)
             return
         }
+        // The serial moves with the notice, so a later withdrawal names this one.
         root.notice = text
+        root.noticeSerial += 1
         root.syncNoticeTimer()
+    }
+
+    // An arm's prompt arrives on its own channel, so the bar starts the arm from the call and not from the sentence.
+    function sayArm(text) {
+        if (!text) { root.dismiss(); return }
+        root.startArm(text)
     }
 
     // A surface replacing its own standing verdict names the one it is replacing. say("") dismisses
@@ -126,6 +139,10 @@ Item {
     function dismiss() {
         if (root.transientIsError) root.errors = root.errors.slice(1)
         else root.notice = ""
+    }
+    // A stale serial names a past notice, so only the still-standing one is cleared.
+    function withdraw(serial) {
+        if (serial === root.noticeSerial) root.notice = ""
     }
     // A refusal and an arm belong to the place they were raised in, so leaving that place drops both.
     onPathChanged: {
@@ -185,19 +202,20 @@ Item {
 
     function escapePressed() {
         if (root.transientIsError) { root.dismiss(); return true }
-        // A final flush cannot be cancelled: every file is already complete.
-        if (root.transfer.running && root.transfer.writing !== true) { root.cancelTransfer(); return true }
+        // A final flush cannot be cancelled (every file is complete), and a flash stops only by its own Cancel.
+        var transfer = root.transfer
+        if (transfer.running && transfer.writing !== true && transfer.flash !== true) { root.cancelTransfer(); return true }
         return false
     }
 
-    function setActivity(owner, text, transfer) {
-        root.activities = Status.activityChanged(root.activities, owner, transfer.running ? Ops.progressLine(transfer) : text, transfer)
+    function setActivity(owner, text, transfer, starting) {
+        root.activities = Status.activityChanged(root.activities, owner, transfer.running ? Ops.progressLine(transfer) : text, transfer, starting === true)
         root.busy = Status.displayedStarting(root.activities)
     }
 
     // A completion hidden by an error or live activity keeps its full display time after acknowledgement.
     function syncNoticeTimer() {
-        if (root.notice && Status.noticeShown(root.slot()) && root.notice.indexOf(Status.UNDO_HINT) < 0)
+        if (root.notice && Status.noticeShown(root.slot()) && (Status.undoHint().length === 0 || root.notice.indexOf(Status.undoHint()) < 0))
             clear.restart()
         else clear.stop()
     }
@@ -218,6 +236,10 @@ Item {
         if (root.listingState !== "ready") {
             return root.itemText()
         }
+        // The flasher's own count, which names drives rather than items and never a selection.
+        if (root.flashCount.length > 0) {
+            return root.flashCount
+        }
         if (root.selectionCount > 0) {
             var head = Format.count(root.selectionCount) + " of " + Format.count(root.total) + " selected"
             return root.selectionBytes >= 0 ? head + " · " + Format.size(root.selectionBytes) : head
@@ -232,10 +254,9 @@ Item {
         return root.itemText()
     }
 
-    // The one fact on this strip a result or an error may not evict, so a pane with no answer for
-    // it says unknown rather than describing the filesystem the pane just failed to leave.
+    // The one fact a result or an error may not evict: unknown once answered with nothing, never the folder failed to leave, and empty while the answer is out.
     function fsText() {
-        return root.fsName.length ? root.fsName + " · " + Format.size(root.fsFree) + " free" : "unknown"
+        return root.fsName.length ? root.fsName + " · " + Format.size(root.fsFree) + " free" : root.fsPending ? "" : "unknown"
     }
 
     function slot() {
@@ -264,7 +285,7 @@ Item {
         id: background
         width: parent.width
         height: Theme.chromeHeight
-        color: Theme.color.surface
+        color: Glass.surface
         border.width: 0
     }
 
@@ -329,7 +350,7 @@ Item {
             sourceComponent: Flea.Spinner {
                 width: Theme.chromeMarkSize
                 height: Theme.chromeMarkSize
-                color: Theme.color.muted
+                color: Theme.color.mutedFrame
             }
         }
 
@@ -377,13 +398,13 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             visible: root.undoSplit
             width: visible ? implicitWidth : 0
-            text: root.undoSplit ? "z undoes" : ""
+            text: root.undoSplit ? Status.hintKey(Status.undoHint()) : ""
             color: undoHover.hovered ? Theme.color.foreground : Theme.color.muted
             font.family: Theme.font.family
             font.pixelSize: Theme.font.caption
             textFormat: Text.PlainText
             Accessible.role: Accessible.Link
-            Accessible.name: "z undoes"
+            Accessible.name: Status.hintKey(Status.undoHint())
             Accessible.onPressAction: root.clickUndo()
             HoverHandler { id: undoHover; cursorShape: Qt.PointingHandCursor }
             TapHandler {
@@ -405,7 +426,7 @@ Item {
         x: detailView.x; y: detailView.y
         width: detailView.width; height: detailView.height
         visible: detailView.visible
-        color: Theme.color.surface
+        color: Glass.surface
         border.width: 0
     }
     Flickable {

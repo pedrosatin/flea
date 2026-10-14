@@ -9,7 +9,7 @@ pub(crate) fn mount_type_in(path: &Path, body: &str) -> Option<String> {
 }
 
 // Sample dev: makedev(8,17) is 0x811 and answers "8:17"; the glibc major/minor packing, see sys/sysmacros.h.
-fn dev_majmin(dev: u64) -> String {
+pub(crate) fn dev_majmin(dev: u64) -> String {
     let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & 0xffff_f000);
     let minor = (dev & 0xff) | ((dev >> 12) & 0xffff_ff00);
     format!("{major}:{minor}")
@@ -19,6 +19,26 @@ fn dev_majmin(dev: u64) -> String {
 pub(crate) fn fstype_for_dev(dev: u64, body: &str) -> Option<String> {
     let want = dev_majmin(dev);
     body.lines().filter_map(parse_line).find(|(_, _, majmin, _)| *majmin == want).map(|(_, fstype, _, _)| fstype)
+}
+
+// The mountpoints ui/js/Devices.js isSystemPath names exactly; a test reads that script's list, so the two cannot drift.
+const SYSTEM_MOUNTS: &[&str] = &[
+    "/bin", "/boot", "/compat/linux/proc", "/compat/linux/sys", "/etc", "/home", "/lib", "/lib64", "/libexec",
+    "/live/cow", "/live/image", "/media", "/mnt", "/net", "/opt", "/rescue", "/root", "/run", "/sbin", "/srv",
+    "/tmp", "/usr", "/usr/X11R6", "/usr/local", "/usr/obj", "/usr/ports", "/usr/src", "/usr/xobj", "/var",
+    "/var/crash", "/var/local", "/var/log", "/var/log/audit", "/var/mail", "/var/run", "/var/tmp",
+];
+
+// Sample: "/" and "/home" answer true, "/home/gm/Data" and "/mnt/data" false; ui/js/Devices.js isSystemPath, rule for rule.
+fn is_system_mount(mount: &Path) -> bool {
+    let p = mount.to_string_lossy();
+    let under = |dir: &str| p == dir || p.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'));
+    p == "/" || p.contains("/.") || under("/dev") || under("/proc") || under("/sys") || SYSTEM_MOUNTS.contains(&&*p)
+}
+
+// Sample: against `1 0 0:29 /@ / rw - btrfs /dev/mapper/root rw` an entry on 0:29 answers true, as a mount of its device sits on "/".
+pub(crate) fn on_system_volume(entry: &MountEntry, body: &str) -> bool {
+    body.lines().filter_map(parse_line).any(|(mount, _, majmin, _)| majmin == entry.majmin && is_system_mount(&mount))
 }
 
 // The mount that owns a path: its mount point, its filesystem type, its device numbers and its source.
@@ -44,6 +64,11 @@ pub(crate) fn mount_entry_in(path: &Path, body: &str) -> Option<MountEntry> {
     best.map(|(_, entry)| entry)
 }
 
+// Every mount point with whether its filesystem can wedge a syscall, a later line winning a point mounted twice as mount_entry_in does.
+pub(crate) fn wedge_points_in(body: &str) -> std::collections::HashMap<PathBuf, bool> {
+    body.lines().filter_map(parse_line).map(|(mount, fstype, _, _)| (mount, super::netfs::can_wedge(&fstype))).collect()
+}
+
 // The super options of the deepest mount owning path, so a caller can read windows_names off ntfs3.
 pub(crate) fn mount_options_in(path: &Path, body: &str) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
@@ -58,6 +83,29 @@ pub(crate) fn mount_options_in(path: &Path, body: &str) -> Option<String> {
         }
     }
     best.map(|(_, opts)| opts)
+}
+
+// The raw mount options (field 5) of the deepest mount owning path, for the run card's noexec rule: "2 1 0:9 / /mnt/stick rw,noexec - vfat /dev/sdb1 rw" answers "rw,noexec".
+pub(crate) fn raw_mount_options_in(path: &Path, body: &str) -> Option<String> {
+    let mut best: Option<(usize, String)> = None;
+    for line in body.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if !fields.contains(&"-") {
+            continue;
+        }
+        if fields.len() < 6 {
+            continue;
+        }
+        let mount = PathBuf::from(OsString::from_vec(unescape(fields[4])));
+        if !path.starts_with(&mount) {
+            continue;
+        }
+        let depth = mount.components().count();
+        if best.as_ref().map(|(old, _)| depth >= *old).unwrap_or(true) {
+            best = Some((depth, fields[5].to_string()));
+        }
+    }
+    best.map(|(_, options)| options)
 }
 
 // Sample line as above: the fields after the source are the filesystem's super options.
@@ -85,6 +133,31 @@ pub(crate) fn enclosing<'a>(path: &Path, mounts: &'a [(PathBuf, String)]) -> Opt
         }
     }
     best.map(|(_, mount)| mount)
+}
+
+// One counted read of the mount table, so a walk pays one read and passes the body down.
+pub(crate) fn read_body() -> String {
+    #[cfg(test)]
+    READS.with(|reads| reads.set(reads.get() + 1));
+    std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default()
+}
+
+// Thread-local, so parallel suites never see each other's reads; tests reset it with test_reset.
+#[cfg(test)]
+thread_local! {
+    static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Counted reads since the last reset, so a session walk asserts at most one over a known walk.
+#[cfg(test)]
+pub(crate) fn test_reset() {
+    READS.with(|reads| reads.set(0));
+}
+
+// The counted reads since the last reset.
+#[cfg(test)]
+pub(crate) fn test_reads() -> usize {
+    READS.with(|reads| reads.get())
 }
 
 // Sample line as above: mount point, fstype, major:minor and source, or None for a line with no "-" or too few fields.
@@ -132,6 +205,10 @@ fn octal_byte(bytes: &[u8], i: usize) -> Option<u8> {
 mod tests {
     use super::*;
 
+    fn on_system(path: &str, body: &str) -> bool {
+        mount_entry_in(Path::new(path), body).is_some_and(|entry| on_system_volume(&entry, body))
+    }
+
     #[test]
     fn deepest_mount_identifies_rclone_and_decodes_its_path() {
         let info = "1 0 8:1 / / rw - ext4 /dev/a rw\n\
@@ -165,6 +242,50 @@ mod tests {
     }
 
     #[test]
+    fn the_system_mountpoints_are_the_set_the_rail_hides() {
+        let script = include_str!("../../ui/js/Devices.js");
+        let list = script.split("var exact = [").nth(1).and_then(|rest| rest.split(']').next()).expect("isSystemPath keeps its exact list");
+        let named: Vec<&str> = list.split('"').skip(1).step_by(2).collect();
+        assert_eq!(named, SYSTEM_MOUNTS, "ui/js/Devices.js and this list name the same mountpoints");
+        let rules = script.split("function isSystemPath(p) {").nth(1).and_then(|body| body.split("var exact").next()).expect("isSystemPath keeps its rules above its list");
+        let literals: Vec<&str> = rules.split('"').skip(1).step_by(2).collect();
+        assert_eq!(literals, ["/", "/.", "/dev", "/proc", "/sys", "/dev/", "/proc/", "/sys/"], "isSystemPath's other rules are the ones is_system_mount mirrors");
+        for path in ["/", "/home", "/boot", "/var", "/dev", "/dev/shm", "/proc/1", "/sys/fs", "/home/gm/.mnt/x"] {
+            assert!(is_system_mount(Path::new(path)), "{path} is a system mountpoint");
+        }
+        for path in ["/mnt/data", "/home/gm/Data", "/home/gm/gdrive", "/run/media/gm/stick", "/devices", "/boot/efi"] {
+            assert!(!is_system_mount(Path::new(path)), "{path} is not");
+        }
+    }
+
+    #[test]
+    fn a_volume_is_the_system_volume_when_a_mount_of_its_device_sits_on_a_system_path() {
+        // Sample: sdb1 (8:17) is mounted twice.
+        let info = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    30 1 8:17 / /mnt/data rw - ext4 /dev/sdb1 rw\n\
+                    31 1 8:17 /sub /home/gm/Data rw - ext4 /dev/sdb1 rw\n\
+                    32 1 0:50 / /home/gm/gdrive rw - fuse.rclone remote: rw\n";
+        assert!(on_system("/etc", info), "the device holding / is the system volume");
+        assert!(!on_system("/mnt/data/x", info), "a data volume mounted twice, on no system path");
+        assert!(!on_system("/home/gm/gdrive/x", info), "a FUSE mount under home is no system volume");
+        assert!(!on_system("/elsewhere", "30 1 8:17 / /mnt/data rw - ext4 /dev/sdb1 rw\n"), "a path no mount owns is no claim");
+        assert!(on_system("/mnt/data/x", &format!("{info}33 1 8:17 / /srv rw - ext4 /dev/sdb1 rw\n")), "any one mount of the device on a system path decides");
+    }
+
+    #[test]
+    fn every_btrfs_subvolume_of_the_root_filesystem_is_on_the_system_volume() {
+        // Sample from a btrfs root: stat gives / 0:31 and /home/flea-sandbox 0:73, while every line of that one filesystem names 0:29.
+        let info = "1 0 0:29 /@ / rw - btrfs /dev/mapper/root rw\n\
+                    2 1 0:29 /@home /home rw - btrfs /dev/mapper/root rw\n\
+                    3 1 0:29 /@log /var/log rw - btrfs /dev/mapper/root rw\n\
+                    4 2 0:29 /@home/flea-sandbox /home/flea-sandbox rw - btrfs /dev/mapper/root rw\n\
+                    5 1 0:52 / /mnt/backup rw - btrfs /dev/sdc1 rw\n";
+        assert!(on_system("/etc", info), "the root subvolume");
+        assert!(on_system("/home/flea-sandbox/cap-sysrefusal/listing", info), "a subvolume mounted under home shares the filesystem's number with /");
+        assert!(!on_system("/mnt/backup/photos", info), "a second btrfs filesystem has its own number and is judged alone");
+    }
+
+    #[test]
     fn malformed_mountinfo_is_ignored() {
         assert_eq!(mount_type_in(Path::new("/home/pi"), "junk\n"), None);
     }
@@ -189,5 +310,17 @@ mod tests {
         assert_eq!(unescape("\\134"), b"\\".to_vec());
         assert_eq!(unescape("\\400"), b"\\400".to_vec());
         assert_eq!(unescape("\\777"), b"\\777".to_vec());
+    }
+
+    #[test]
+    fn the_deepest_mount_names_its_options_for_the_noexec_rule() {
+        let info = "1 0 8:1 / / rw - ext4 /dev/a rw\n\
+                    30 1 8:17 / /media/stick rw,noexec - vfat /dev/sdb1 rw\n";
+        assert_eq!(
+            raw_mount_options_in(Path::new("/media/stick/photo.jpg"), info).as_deref(),
+            Some("rw,noexec")
+        );
+        assert_eq!(raw_mount_options_in(Path::new("/elsewhere"), info).as_deref(), Some("rw"));
+        assert_eq!(raw_mount_options_in(Path::new("/home/pi"), "junk\n"), None);
     }
 }

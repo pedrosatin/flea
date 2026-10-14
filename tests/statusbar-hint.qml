@@ -153,8 +153,38 @@ ShellRoot {
             bar880.activities = [{ owner: null, text: "Copying 1 of 2", transfer: { running: false } }]
             bar880.searchLine = root.repeat("s", 200)
             bar880.searchRunning = true
+        } else if (root.step === 6) {
+            settleBar(bar880)
+            bar880.say("The last tab cannot be closed", false)
+            var serialOwn = bar880.noticeSerial
+            bar880.say("Copy failed.", true)
+            bar880.withdraw(serialOwn)
+            check("a matching withdraw clears the standing notice", bar880.notice, "")
+            check("a matching withdraw keeps the error", bar880.errors.length, 1)
+            check("and the error is what is drawn", bar880.transient_, "Copy failed.")
+        } else if (root.step === 7) {
+            settleBar(bar880)
+            bar880.say("The last tab cannot be closed", false)
+            var serialStale = bar880.noticeSerial
+            bar880.say("Copy failed.", true)
+            bar880.say("Later notice.", false)
+            bar880.withdraw(serialStale)
+            check("a stale withdraw keeps the later notice", bar880.notice, "Later notice.")
+            check("and it keeps the error", bar880.errors.length, 1)
+            settleBar(bar880)
+            bar880.activities = [{ owner: null, text: "Copying 1 of 2", transfer: { running: false } }]
+            bar880.searchLine = root.repeat("s", 200)
+            bar880.searchRunning = true
         } else {
             check("long search still elides its tail", bar880.secondaryItem.truncated, true)
+            var drawn = bar1100.fsText()
+            check("a pane with its fs facts draws them", drawn.indexOf("overlay · ") === 0 && drawn.slice(-5) === " free", true)
+            bar1100.fsName = ""
+            bar1100.fsFree = 0
+            bar1100.fsPending = true
+            check("a pane whose fs facts are out draws an empty slot", bar1100.fsText() + "|" + bar1100.diskItem.text, "|")
+            bar1100.fsPending = false
+            check("a pane that asked and got no answer says unknown", bar1100.fsText(), "unknown")
             root.done = true
             if (root.failures.length === 0)
                 console.log("STATUSHINT PASS checks=" + root.checks)

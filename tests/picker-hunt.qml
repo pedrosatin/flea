@@ -122,7 +122,7 @@ ShellRoot {
             listing.current.signal(root.killSignal)
             stage = 1
         } else if (win.listingFailed) {
-            check("a lost listing worker is reported", win.message.indexOf("The listing backend exited with code") === 0 && win.messageError, true)
+            check("a lost listing worker is reported", win.message.indexOf("Flea stopped responding, so this folder could not be listed.") === 0 && win.messageError, true)
             check("a lost listing worker keeps its rows", win.rows.length > 0 && win.total === win.rows.length, true)
             check("a lost listing worker draws no empty hero", heroItem().visible, false)
             finish()
@@ -147,14 +147,15 @@ ShellRoot {
         check("save form exposes its status line", !!form, true)
         if (!form) return
         var line = form.statusItem
-        check("collision line is shown", line.visible && line.text.indexOf(win.saveName) === 0, true)
+        var plain = line.text.replace(/\u200b/g, "")
+        check("collision line is shown", line.visible && plain.indexOf(win.saveName) === 0, true)
         // One pixel under the sentence's own width pushes only the last word onto a second line.
         var narrow = Math.floor(wrapped(line, Text.NoWrap, line.text, line.width).width) - 1
         var reference = wrapped(line, Text.WordWrap, line.text, narrow)
         check("collision sentence wraps onto two lines", reference.lines, 2)
         check("collision sentence breaks between words", wrapped(line, line.wrapMode, line.text, narrow), reference)
         var name = "x".repeat(Math.ceil(root.overlongNameFactor * line.width))
-        var overlong = wrapped(line, line.wrapMode, name + line.text.slice(win.saveName.length), line.width)
+        var overlong = wrapped(line, line.wrapMode, name + plain.slice(win.saveName.length), line.width)
         check("one unbroken name stays inside the card", overlong.width <= line.width, true)
         check("one unbroken name breaks inside itself", overlong.lines > 1, true)
     }
@@ -326,6 +327,9 @@ ShellRoot {
                 win.focusView()
                 if (!win.viewItem().activeFocus) return
                 root.check("real cursor is a file", win.rowFor(win.cursorIndex).n, "a.txt")
+                // The press pumps the event loop and the 20 ms poll would re-enter stage 0 and press twice, so the stage is claimed first.
+                root.stage = 1
+                root.stamp = Date.now()
                 if (scenario.indexOf("cursor-") === 0) {
                     root.check("cursor file enables Open", win.canAccept, true)
                     console.log("PICKER_HUNT INPUT Return action="
@@ -362,7 +366,6 @@ ShellRoot {
                     root.check("arrow moves the real cursor", win.rowFor(win.cursorIndex).n, "b.txt")
                     root.press(Qt.Key_Space)
                 }
-                root.stage = 1
                 root.stamp = Date.now()
                 return
             }
@@ -407,7 +410,8 @@ ShellRoot {
                 } else if (scenario === "control" || (scenario === "marked-open" || scenario === "marked-enter")) {
                     root.check("Space marks one real file", win.marks.length, 1)
                     if ((scenario === "marked-open" || scenario === "marked-enter")) {
-                        root.check("marked file is b.txt", win.marks[0].path.split("/").pop(), "b.txt")
+                        if (win.marks.length > 0)
+                            root.check("marked file is b.txt", win.marks[0].path.split("/").pop(), "b.txt")
                         root.press(win.viewMode === "grid" ? Qt.Key_Right : Qt.Key_Down)
                         root.check("cursor moves off marked file", win.rowFor(win.cursorIndex).n, "c.txt")
                         var preset = Flea.ViewState.keysPreset

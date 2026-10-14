@@ -25,9 +25,9 @@ Item {
     Rectangle { anchors.fill: parent; color: Theme.color.surface }
     Flea.CardScroll {
         id: body
-        bleed: Theme.ringClearance
+        bleed: Theme.focusClearance
         anchors.fill: parent
-        anchors.margins: Theme.spacing.rowPaddingX - Theme.ringClearance
+        anchors.margins: Theme.spacing.rowPaddingX - Theme.focusClearance
         Column {
             id: column
             width: parent.width
@@ -50,7 +50,7 @@ Item {
                     color: Theme.color.background
                     border.width: Theme.spacing.hairline
                     // Muted at rest, accent on focus: the frame DialogField, MenuActionDialog, OpenWithDialog and PermissionsDialog draw.
-                    border.color: field.activeFocus ? Theme.color.accent : Theme.color.muted
+                    border.color: field.activeFocus ? Theme.color.accent : Theme.color.mutedFrame
                     TextInput {
                         id: field
                         anchors.fill: parent
@@ -74,7 +74,7 @@ Item {
                 }
                 Text {
                     visible: !root.refused
-                    text: "Output URI"
+                    text: "Saves to"
                     textFormat: Text.PlainText
                     color: Theme.color.foreground
                     font { family: Theme.font.family; pixelSize: Theme.font.caption }
@@ -91,7 +91,7 @@ Item {
                     clip: true
                     activeFocusOnTab: true
                     Accessible.role: Accessible.StaticText
-                    Accessible.name: "Output URI"
+                    Accessible.name: "Saves to"
                     Accessible.description: uriText.text
                     Keys.onPressed: function(event) {
                         if (event.key === Qt.Key_Home) contentX = 0
@@ -119,11 +119,11 @@ Item {
                 id: statusLine
                 width: parent.width
                 visible: text.length > 0
-                text: root.refused ? "Refused · " + root.askedName + " · " + Picker.NAME_REFUSED
-                    : root.picker.saveError || (root.picker.saveCollision ? root.picker.saveName + " already exists here · review before continuing" : "")
+                text: root.refused ? Format.fill(Picker.SAVE_REFUSED, root.askedName, Picker.NAME_REFUSED)
+                    : root.picker.saveError || (root.picker.saveCollision ? Format.fill(Picker.SAVE_EXISTS, Picker.jointName(root.picker.saveName)) : "")
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
-                color: Theme.color.error
+                color: Theme.color.errorOnSurface
                 font { family: Theme.font.family; pixelSize: Theme.font.caption }
             }
             Row {
@@ -133,7 +133,7 @@ Item {
                 Flea.DialogButton {
                     id: cancelButton
                     label: "Cancel"
-                    activeFocusOnTab: true
+                    tabStop: true
                     enabled: !root.picker.submitting
                     tabHandle: true
                     onTabbed: function(from, back) { root.picker.stepFocus(from, back) }
@@ -143,7 +143,7 @@ Item {
                     id: useButton
                     label: "Use this location"
                     destructive: true
-                    activeFocusOnTab: true
+                    tabStop: true
                     enabled: !root.picker.submitting
                     tabHandle: true
                     onTabbed: function(from, back) { root.picker.stepFocus(from, back) }
@@ -165,7 +165,7 @@ Item {
     function focusItems() { return root.visible ? [field, outputUri].concat(root.picker.saveCollision ? [cancelButton, useButton] : []) : [] }
     function controls() {
         return root.focusItems().map(function(item) {
-            return root.picker.control(item === field ? "Filename" : item === outputUri ? "Output URI" : item.label, item, item.enabled)
+            return root.picker.control(item === field ? "Filename" : item === outputUri ? "Saves to" : item.label, item, item.enabled)
         })
     }
 }

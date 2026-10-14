@@ -5,18 +5,19 @@ const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const focusStep = require("./rename-grid-focus.js");
 const owner = require("./rename-grid-owner.js");
+const count = require("./rename-grid-count.js");
 const repo = path.resolve(process.argv.slice(2).find(arg => !arg.startsWith("--")) || path.join(__dirname, ".."));
 const option = name => process.argv.find(arg => arg.startsWith(`--${name}=`))?.slice(name.length + 3);
 const testCase = option("case") || "all";
-assert.ok(["all", "legacy", "measurement", "pending", "focus", "owner"].includes(testCase));
+assert.ok(["all", "legacy", "measurement", "pending", "focus", "owner", "reuse", "count"].includes(testCase));
 const productRoot = path.resolve(option("product-root") || repo);
 // Isolate the new normal-token cases from the existing oversized-token lifetime fixture.
 if (testCase === "all") {
-    for (const selected of ["legacy", "measurement", "pending", "focus", "owner"]) {
+    for (const selected of ["legacy", "measurement", "pending", "focus", "owner", "reuse", "count"]) {
         const result = spawnSync(process.execPath, [__filename, repo, `--case=${selected}`, `--product-root=${productRoot}`], {stdio: "inherit"});
         assert.equal(result.status, 0, `${selected} case failed`);
     }
-    fs.writeSync(1, `rename-grid-bottom: 126 prior + ${owner.checks} owner checks, 0 failed\n`);
+    fs.writeSync(1, `rename-grid-bottom: 157 prior + ${owner.checks} owner checks, 0 failed\n`);
     process.exit(0);
 }
 // These functions run in the generated Qt fixture, with its real GridView and Loader.
@@ -62,9 +63,53 @@ function measurementStep(turn) {
         probe.finish()
     }
 }
+// A count change pools the editing tile, then Grid hands it back to its own row (turns 1-2) or to another row (turn 3).
+function reuseStep(turn) {
+    if (turn === 2) {
+        var next = probe.editor()
+        probe.check(next && next.ownsEdit() && next.inputItem.activeFocus, "same-row reuse keeps focus in the owning editor on the next turn")
+        probe.check(next && next.current === "reuse-draft.md" && next.inputItem.selectionStart === 2 && next.inputItem.selectionEnd === 9 && next.inputItem.cursorPosition === 2, "same-row reuse keeps the draft, selection and caret on the next turn")
+        editPane.renamingIndex = -1
+    }
+    if (turn === 0 || turn === 2) {
+        Theme.rowHeight = 31
+        editPane.shownTotal = 20
+        view.visible = true
+        editPane.setCursor(19)
+        editPane.renamingIndex = 19
+    }
+    if (turn !== 1 && turn !== 3) return
+    var sameRow = turn === 1, label = sameRow ? "same-row reuse" : "cross-row reuse"
+    var field = probe.editor()
+    probe.check(field && field.ownsEdit() && probe.tiles().filter(function(tile) { return !tile.pooled }).length === 20,
+        label + " starts on the last tile of a listing the viewport holds whole")
+    if (!field) { probe.finish(); return }
+    var tile = field.editorHost
+    field.inputItem.text = "reuse-draft.md"
+    field.inputItem.select(9, 2)
+    // An empty pool makes the editing tile the oldest pooled tile, the first one Grid hands back.
+    view.reuseItems = false
+    view.reuseItems = true
+    // StableModel holds the editing tile current, so the cross-row arm moves the current item off it first, the pool order that hands it to another row.
+    if (!sameRow) view.currentIndex = 0
+    editPane.shownTotal = sameRow ? 19 : 15
+    probe.check(tile.pooled && view.renameEditor !== null && tile.editorField === view.renameEditor,
+        label + " pooled tile keeps the owning editor")
+    editPane.shownTotal = 20
+    probe.check(!tile.pooled && (tile.row.n === editPane.rowFor(19).n) === sameRow,
+        label + " hands the editing tile back to " + (sameRow ? "its own row" : "another row"))
+    var held = probe.tiles().filter(function(each) { return each.editorField && !each.pooled })
+    var kept = held.length === 1 ? held[0].editorField : null
+    probe.check(kept && kept === view.renameEditor && kept === probe.editor() && kept.ownsEdit(),
+        label + " leaves one laid-out tile holding the owning editor")
+    probe.check(kept && kept.current === "reuse-draft.md" && kept.inputItem.selectionStart === 2
+        && kept.inputItem.selectionEnd === 9 && kept.inputItem.cursorPosition === 2, label + " keeps the draft, selection and caret")
+    if (sameRow) probe.check(kept && kept.inputItem.activeFocus, label + " keeps keyboard focus")
+    else { editPane.renamingIndex = -1; probe.finish(); return }
+}
 function restorePendingLoader() {
     var loader = probe.pendingLoader
-    loader.active = Qt.binding(function() { return loader.parent.renaming })
+    loader.active = Qt.binding(function() { return loader.parent.pooled ? loader.parent.pooledEditorRow >= 0 : loader.parent.renaming })
 }
 function retirePendingField(field, draft, checkCaret) {
     field.inputItem.text = draft
@@ -214,7 +259,7 @@ function pendingRetirementStep(turn) {
         probe.finish()
     }
 }
-const made = spawnSync("mktemp", ["-d", path.join(repo, ".rename-grid-bottom.XXXXXXXX")], {encoding: "utf8"});
+const made = spawnSync("mktemp", ["-d", path.join(process.env.FLEA_RENAME_GRID_ROOT || process.env.FLEA_FIXTURE_ROOT || "/home/flea-sandbox", ".rename-grid-bottom.XXXXXXXX")], {encoding: "utf8"}); // hard rule 9: writes stay under the sandbox root
 assert.equal(made.status, 0, made.stderr);
 const testRoot = made.stdout.trim();
 fs.writeFileSync(path.join(testRoot, ".flea-test-sandbox"), "real Qt bottom Grid rename regression\n");
@@ -223,8 +268,8 @@ function write(name, text) {
     fs.mkdirSync(path.dirname(file), {recursive: true});
     fs.writeFileSync(file, text);
 }
-// Use the complete product view, tile and editor. Only unrelated chrome and services are stubbed.
-for (const name of ["GridArea", "GridTile", "RenameField", "FastScrollHandler"])
+// Use the complete product view, model, tile and editor. Only unrelated chrome and services are stubbed.
+for (const name of ["GridArea", "StableModel", "CursorMark", "GridTile", "RenameField", "PrebuildDriver", "FastScrollHandler"])
     write(`flea/${name}.qml`, fs.readFileSync(path.join(name === "FastScrollHandler" ? repo : productRoot, "ui", `${name}.qml`), "utf8"));
 fs.cpSync(path.join(repo, "ui/js"), path.join(testRoot, "flea/js"), {recursive: true});
 write("flea/qmldir", ["Theme", "ViewState", "Style", "Util"].map(name => `singleton ${name} 1.0 ${name}.qml`).join("\n") + "\n");
@@ -237,6 +282,7 @@ QtObject {
     property int chromeHeight: 23
     property real bodySmallAdvance: 8
     property real disabledOpacity: 0.5
+    property int clipMarkSize: 12
     property var spacing: ({rowPaddingY: 4, rowPaddingX: 14, gap: 8, hairline: 1})
     property var grid: ({captionHeight: 34, captionLineHeight: 17, minCellWidth: 146})
     property var color: ({background: "#101315", surface: "#181825", foreground: "#eeeeee", muted: "#aaaaaa", error: "#ff7777", accent: "#77aaff"})
@@ -267,7 +313,7 @@ QtObject {
 write("flea/Util.qml", "pragma Singleton\nimport QtQuick\nQtObject { function alpha(color, value) { return color } }\n");
 write("flea/Glyph.qml", "import QtQuick\nItem { property int maxSize: 128; property string name; property color color }\n");
 write("flea/ViewportScrollBar.qml", "import QtQuick\nItem { property var flickable; property var ctrlWheelAction }\n");
-write("flea/SelectionBand.qml", "import QtQuick\nItem { property var pane; property var flickable; property int columns; property real cellWidth; property real cellHeight }\n");
+write("flea/SelectionBand.qml", "import QtQuick\nItem { property var pane; property var flickable; property int columns; property real cellWidth; property real cellHeight; property var rowAt }\n");
 write("flea/FileDrag.qml", "import QtQuick\nItem { property var pane; property int dropIndex: -1; property bool dragCopy: false; property bool dragLink: false }\n");
 write("flea/RowDrag.qml", "import QtQuick\nItem { property var session; property int listingIndex; property var row }\n");
 let fixture = fs.readFileSync(path.join(repo, "tests/rename-grid-bottom.qml"), "utf8");
@@ -276,13 +322,13 @@ assert.ok(!fixture.includes("20 * 0.917") && !fixture.includes("20 * 0.833"), "t
 if (testCase !== "legacy") {
     const timer = fixture.indexOf("    Timer {\n        interval: 80"), finish = fixture.indexOf("    function finish()", timer);
     assert.ok(timer >= 0 && finish > timer);
-    const functions = [measurementStep, focusStep, restorePendingLoader, retirePendingField, pendingRetirementStep, owner.ownerStep].map(fn => fn.toString()).join("\n");
+    const functions = [measurementStep, reuseStep, count.countStep, count.countKept, focusStep, restorePendingLoader, retirePendingField, pendingRetirementStep, owner.ownerStep].map(fn => fn.toString()).join("\n");
     fixture = fixture.slice(0, timer) + functions + `
     Timer {
         interval: 80; running: true; repeat: true
         onTriggered: {
             if (probe.step === 0) probe.plainHeight = view.cellHeight
-            probe.${({measurement: "measurementStep", pending: "pendingRetirementStep", focus: "focusStep", owner: "ownerStep"})[testCase]}(probe.step++)
+            probe.${({measurement: "measurementStep", pending: "pendingRetirementStep", focus: "focusStep", owner: "ownerStep", reuse: "reuseStep", count: "countStep"})[testCase]}(probe.step++)
         }
     }
 ` + fixture.slice(finish);
@@ -300,6 +346,6 @@ const output = result.stdout + result.stderr;
 fs.writeFileSync(path.join(testRoot, "probe.log"), output);
 fs.writeSync(1, `rename-grid-bottom evidence: ${testRoot}\n${output.trim()}\n`);
 assert.equal(result.status, 0);
-assert.equal(output.split(`RENAME_GRID_BOTTOM CHECKS=${({legacy: 66, measurement: 10, pending: 25, focus: 26, owner: owner.checks})[testCase]}`).length - 1, 1);
+assert.equal(output.split(`RENAME_GRID_BOTTOM CHECKS=${({legacy: 68, measurement: 10, pending: 25, focus: 27, owner: owner.checks, reuse: 13, count: 14})[testCase]}`).length - 1, 1);
 assert.equal(output.split("RENAME_GRID_BOTTOM DONE failures=0").length - 1, 1);
 assert.doesNotMatch(output, /\bFAIL\b|\bWARN(?:ING)?\b|Error|error:|Binding loop|failed to load|Unable to assign|Cannot assign/i);

@@ -1,6 +1,9 @@
 .import "../../ui/js/Keymap.js" as Keymap
+.import "../../ui/js/KeyName.js" as KeyName
 
 function run(check) {
+    // The hints the status strip draws follow the preset, so this suite hands it back as it found it.
+    var startPreset = Keymap.preset
     var none = Qt.NoModifier, ctrl = Qt.ControlModifier, shift = Qt.ShiftModifier
     var alt = Qt.AltModifier, meta = Qt.MetaModifier
     function key(preset, name, text, mods, expected, context, frontend) {
@@ -44,12 +47,22 @@ function run(check) {
         key(preset, "Insert", "", ctrl, "", "listing", "gui")
         key(preset, "1", "1", none, "tab1", "listing", "tui")
         key(preset, "9", "9", none, "tab9", "listing", "tui")
-        key(preset, "1", "1", none, "", "listing", "gui")
+        key(preset, "1", "1", none, "tab1", "listing", "gui")
+        key(preset, "9", "9", none, "tab9", "listing", "gui")
+        // Bare digits name tabs in the listing, tags in the open Tags list, and nothing typed into a field.
+        key(preset, "1", "1", none, "tag1", "menu", "gui")
+        key(preset, "7", "7", none, "tag7", "menu", "gui")
+        key(preset, "1", "1", none, "tab1", "rail", "gui")
+        for (var t = 0; t < 5; t++) key(preset, "1", "1", none, "", ["editor", "panel", "preview", "pdf", "media"][t], "gui")
         key(preset, "N", "", preset === "mac" ? meta : ctrl, "windowNew")
         key(preset, "N", "", preset === "mac" ? meta : ctrl, "", "listing", "tui")
         key(preset, "1", "", preset === "windows" ? ctrl | shift : ctrl, "viewList")
         key(preset, "2", "", preset === "windows" ? ctrl | shift : ctrl, "viewColumns")
         key(preset, "3", "", preset === "windows" ? ctrl | shift : ctrl, "viewGrid")
+        // KEYS-03: the Dual view has its own chord beside the three, and Shift+Tab walks the ring back from the listing.
+        key(preset, "4", "", preset === "windows" ? ctrl | shift : ctrl, "viewDual")
+        key(preset, "Tab", "", shift, "focusPrevious")
+        key(preset, "Backtab", "", shift, "focusPrevious")
         key(preset, "Comma", "", ctrl, "settings")
         for (var f = 0; f < 2; f++) {
             var frontend = ["gui", "tui"][f]
@@ -130,6 +143,7 @@ function run(check) {
     key("mac", "D", "", meta, "duplicate")
     key("mac", "Z", "", meta, "undo")
     key("mac", "Z", "", meta | shift, "redo")
+    key("default", "Z", "", ctrl | shift, "redo")
     key("mac", "A", "", meta, "selectAll")
     key("mac", "I", "", meta, "properties")
     key("mac", "BracketLeft", "", meta, "historyBack")
@@ -227,6 +241,10 @@ function run(check) {
     check("one-action hints match the whole table on every preset", hintMismatches.join(" "), "")
     Keymap.setPreset("vim")
     check("sheet is populated from effective current bindings", Keymap.sheetFor(Keymap.preset, "gui").length > 30, true)
+    var tabRow = Keymap.sheetFor("default", "gui").filter(function (row) { return row.action === "focusNext" })[0]
+    check("the sheet reads Tab as scope / focus, with no pane-only wording", tabRow.keys + "|" + tabRow.label, "tab|scope / focus")
+    var backRow = Keymap.sheetFor("default", "gui").filter(function (row) { return row.action === "focusPrevious" })[0]
+    check("and Shift+Tab as focus back, in the Move group", backRow.label + "|" + (Keymap.SHEET_GROUPS.move.indexOf("focusPrevious") >= 0), "focus back|true")
     // One cap names one key. Joining every spelling an action answers to produced caps of 40
     // characters on Default and 78 on Mac, wider than the card, and they drew over the next column.
     var widestCap = 0, identifierLabel = ""
@@ -313,4 +331,33 @@ function run(check) {
           tabsDefault.filter(function (r) { return r.action === "tabNext" })[0].keys + "|"
           + tabsDefault.filter(function (r) { return r.action === "tabPrevious" })[0].keys, "ctrl-pagedown|ctrl-pageup")
     check("the generator names the pairs it evens", (Keymap.SHEET_MIRRORS || []).length > 0, true)
+    // KeyName asks for one action's own rows with no modifier kind, as the UI does, yet names the row the whole table lists first.
+    function firstRow(rows, action) { return rows.filter(function (r) { return r.action === action })[0] }
+    var drawn = ["newFolder", "textSizeUp", "textSizeDown", "textSizeReset", "trash", "loadPreview", "keymapSheet", "filter"]
+    var drifted = []
+    try {
+        for (var kp = 0; kp < Keymap.PRESETS.length; kp++) {
+            Keymap.setPreset(Keymap.PRESETS[kp])
+            var whole = Keymap.bindingRows(Keymap.PRESETS[kp], "gui")
+            for (var ka = 0; ka < drawn.length; ka++) {
+                var first = firstRow(whole, drawn[ka])
+                var plain = Keymap.hintFor(drawn[ka])
+                var want = plain.length > 0 ? plain : first ? KeyName.spelled(first.keys) : ""
+                var row = KeyName.rowFor(drawn[ka])
+                if (KeyName.keyFor(drawn[ka]) !== want || (row ? row.keys : "") !== (first ? first.keys : ""))
+                    drifted.push(Keymap.PRESETS[kp] + ":" + drawn[ka])
+            }
+        }
+    } finally {
+        Keymap.setPreset(startPreset)
+    }
+    check("KeyName names the whole table's first row for each action it draws in every preset", drifted.join(" "), "")
+    check("and a chord-only action is named", KeyName.keyFor("newFolder").length > 0, true)
+    // A key keys.toml names as a mark is spelled as that mark, and underscore is not minus.
+    check("underscore, minus and plus are three marks", ["ctrl-shift-underscore", "ctrl-shift-minus", "ctrl-shift-plus"].map(KeyName.spelled).join("|"),
+          "Ctrl+Shift+_|Ctrl+Shift+-|Ctrl+Shift++")
+    Keymap.setPreset("default")
+    check("a sentence with several keys names them all", KeyName.hintedAll("%1 and %2 step", ["textSizeUp", "textSizeDown"]), "Ctrl+Shift++ and Ctrl+Shift+- step")
+    check("and is empty when the preset binds none of one of them", KeyName.hintedAll("%1 and %2 step", ["textSizeUp", "noSuchAction"]), "")
+    Keymap.setPreset(startPreset)
 }

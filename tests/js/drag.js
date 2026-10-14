@@ -1,4 +1,8 @@
 .import "../../ui/js/Drag.js" as Drag
+.import "../../ui/js/DragOut.js" as DragOut
+.import "../../ui/js/Crumbs.js" as Crumbs
+.import "../../ui/js/DropDev.js" as DropDev
+.import "../../ui/js/Messages.js" as Messages
 .import "dragfixture.js" as Fixture
 .import "sourcefixture.js" as Source
 
@@ -30,21 +34,21 @@ function run(check) {
 
     // The status bar's half of the board's caption, "copy vs move reads in the status bar".
     check("the bar names the verb, the count and the folder",
-          Drag.line(2, "omarchy", false), "Move 2 items to omarchy · ctrl at lift copies")
+          Drag.line(2, "omarchy", false), "Move 2 items to omarchy · Ctrl copies, Shift moves")
     check("a copy line drops the hint", Drag.line(1, "omarchy", true), "Copy 1 item to omarchy")
     check("with no folder under the pointer it says where one would go",
-          Drag.line(3, "", false), "Move 3 items to a folder · ctrl at lift copies")
+          Drag.line(3, "", false), "Move 3 items to a folder · Ctrl copies, Shift moves")
 
-    // The drop is the transfer request, rows and not paths, the shape Ops.moveToDropbox sends.
+    // The by-index drop is the transfer request, rows and not paths, the shape Ops.moveToDropbox sends.
     var sent = []
     var mover = Fixture.pane(sent, [], rows)
-    check("a drop on a folder sends one transfer", Drag.drop(mover, [2, 3], 0, false), true)
+    check("a drop on a folder sends one transfer", Drag.dropByIndex(mover, [2, 3], 0, "move"), true)
     check("and it is a move of those rows into that folder",
           JSON.stringify(sent), JSON.stringify([{ c: "transfer", op: "move", rows: [2, 3], dest: "/d/omarchy" }]))
     check("and the clipboard was never part of it", mover.clipboard, "untouched")
     var copied = []
-    Drag.drop(Fixture.pane(copied, [], rows), [2], 1, true)
-    check("under ctrl it is a copy", copied.length === 1 ? copied[0].op + " " + copied[0].dest : "nothing sent", "copy /d/flea")
+    Drag.dropByIndex(Fixture.pane(copied, [], rows), [2], 1, "copy")
+    check("a copy verb drops as a copy", copied.length === 1 ? copied[0].op + " " + copied[0].dest : "nothing sent", "copy /d/flea")
 
     // The marker carries where the rows were lifted from, so a drop after the listing changed can
     // resolve by path, and the wire carries the same paths as plain text for a terminal.
@@ -110,7 +114,7 @@ function run(check) {
     check("a refused drop sends nothing", Drag.dropInto(Fixture.pane(refused, [], rows), wire[Drag.ROWS_MIME], urls, "/d", 42), false)
     check("and nothing reached the backend", refused.length, 0)
     var folded = []
-    check("a drop of a folder onto itself sends nothing", Drag.drop(Fixture.pane(folded, [], rows), [0, 2], 0, false), false)
+    check("a drop of a folder onto itself sends nothing", Drag.dropByIndex(Fixture.pane(folded, [], rows), [0, 2], 0, "move"), false)
     check("and nothing went out", folded.length, 0)
     // A folder into itself or its own subtree is refused by path too, the gate the floor, the tabs and
     // a folder row all share; a sibling whose name merely starts the same is not the subtree.
@@ -131,22 +135,11 @@ function run(check) {
     check("and never on another listing", Drag.canDropByIndex(wire[Drag.ROWS_MIME], "/e", [0, 2], 1), false)
     check("nor in a view that does not own the lifted indices", Drag.canDropByIndex(wire[Drag.ROWS_MIME], "/d", [], 1), false)
     var onFile = []
-    check("a drop on a file sends nothing", Drag.drop(Fixture.pane(onFile, [], rows), [2], 3, false), false)
-    check("a drop on a row that is not loaded sends nothing", Drag.drop(Fixture.pane(onFile, [], rows), [2], 9, false), false)
+    check("a drop on a file sends nothing", Drag.dropByIndex(Fixture.pane(onFile, [], rows), [2], 3, "move"), false)
+    check("a drop on a row that is not loaded sends nothing", Drag.dropByIndex(Fixture.pane(onFile, [], rows), [2], 9, "move"), false)
     check("and nothing went out either way", onFile.length, 0)
 
     // A drop from another application: file:// URIs in, one transfer naming paths out.
-    check("a file URI becomes a path",
-          String(Drag.pathsFromUrls(["file:///d/a.txt"])), "/d/a.txt")
-    check("percent escapes are decoded",
-          String(Drag.pathsFromUrls(["file:///d/a%20b.txt"])), "/d/a b.txt")
-    check("several URIs keep their order",
-          String(Drag.pathsFromUrls(["file:///d/a.txt", "file:///d/b.txt"])), "/d/a.txt,/d/b.txt")
-    check("a non-file URI is left behind rather than guessed at",
-          String(Drag.pathsFromUrls(["https://example.com/a.txt"])), "")
-    check("and it does not take the file ones with it",
-          String(Drag.pathsFromUrls(["https://example.com/a.txt", "file:///d/a.txt"])), "/d/a.txt")
-    check("no urls at all is no paths", Drag.pathsFromUrls(null).length, 0)
 
     var external = []
     check("an external drop on a folder sends one transfer",
@@ -165,7 +158,7 @@ function run(check) {
     check("and so is a hash, which encodeURI would leave alone", Drag.uriFor("/d/a#b.txt"), "file:///d/a%23b.txt")
     check("the separators survive the encoding", Drag.uriFor("/d/x/y.txt"), "file:///d/x/y.txt")
     check("a URI this side writes round trips back to its path",
-          String(Drag.pathsFromUrls([Drag.uriFor("/d/a b#c.txt")])), "/d/a b#c.txt")
+          String(DragOut.filePaths([Drag.uriFor("/d/a b#c.txt")])), "/d/a b#c.txt")
 
     var mime = Drag.mimeFor(Fixture.pane([], [], rows), [0, 2], false)
     check("the wire carries the marker, sender first then the rows it holds",
@@ -219,7 +212,7 @@ function run(check) {
           Drag.label(Drag.verbFor(true, false, false, 56, 32, true) === "copy"), "copy here")
     check("and so does the bar line",
           Drag.line(1, "omarchy", Drag.verbFor(true, false, false, 56, 56, true) === "copy"),
-          "Move 1 item to omarchy · ctrl at lift copies")
+          "Move 1 item to omarchy · Ctrl copies, Shift moves")
 
     check("the marker's third field is the ctrl bit the lift read",
           Drag.markerPayload([0, 2], true).split("\n")[2], "copy")
@@ -255,32 +248,32 @@ function run(check) {
         ["file:///source/a.txt", "file:///source/link"])
     check("a different view reads the full carried count from the marker", feedback.count, 2)
     check("target feedback follows same-device move", Drag.feedbackLine(feedback, "folder", 56),
-        "Move 2 items to folder · ctrl at lift copies")
+        "Move 2 items to folder · Ctrl copies, Shift moves")
     check("target feedback follows cross-device copy", Drag.feedbackLine(feedback, "folder", 32),
         "Copy 2 items to folder")
     check("an unknown destination is described as copy", Drag.feedbackLine(feedback, "folder", 0),
         "Copy 2 items to folder")
     check("leaving a target restores the source gesture's generic line", Drag.feedbackLine(feedback, "", feedback.dev),
-        "Move 2 items to a folder · ctrl at lift copies")
+        "Move 2 items to a folder · Ctrl copies, Shift moves")
     var wideFeedback = Drag.feedbackFor(Drag.markerPayload([1, 3, 5], false, "/source", 56), [])
     check("a wide payload keeps its whole count in another view", wideFeedback.count, 3)
     check("wide feedback never promises external reach", Drag.feedbackLine(wideFeedback, "folder", 56),
-        "Move 3 items to folder · ctrl at lift copies · too wide to drag out")
+        "Move 3 items to folder · Ctrl copies, Shift moves · too wide to drag out")
     var foreignFeedback = Drag.feedbackFor("other\n0,1,2\nmove\n/source\n56", ["file:///source/a.txt"])
     check("foreign feedback counts actual paths, never foreign row indices", foreignFeedback.count, 1)
     check("foreign feedback moves on the same device", Drag.feedbackLine(foreignFeedback, "folder", 56),
-        "Move 1 item to folder · ctrl at lift copies")
+        "Move 1 item to folder · Ctrl copies, Shift moves")
     check("a pathless foreign payload has no live feedback", Drag.feedbackLine(Drag.feedbackFor("", []), "folder", 56), "")
     check("ctrl survives the feedback handoff", Drag.feedbackLine(Drag.feedbackFor(
         Drag.markerPayload([1], true, "/source", 56), ["file:///source/a.txt"]), "folder", 56), "Copy 1 item to folder")
 
     check("an outside offer of move alone says move",
-        Drag.feedbackLine(Drag.feedbackFor("", ["file:///p/one"], "", Qt.MoveAction), "drafts", 0), "Move 1 item to drafts · ctrl at lift copies")
+        Drag.feedbackLine(Drag.feedbackFor("", ["file:///p/one"], "", Qt.MoveAction), "drafts", 0), "Move 1 item to drafts · Ctrl copies, Shift moves")
   var moveDrag = "9f2c\nmove"
   var copyDrag = "9f2c\ncopy"
   check("a shelf drag's own verb is what the hover says",
         Drag.feedbackLine(Drag.feedbackFor("", ["file:///p/one", "file:///p/two"], moveDrag), "drafts", 0),
-        "Move 2 items to drafts · ctrl at lift copies")
+        "Move 2 items to drafts · Ctrl copies, Shift moves")
   check("and a shelf drag lifted with ctrl says copy",
         Drag.feedbackLine(Drag.feedbackFor("", ["file:///p/one"], copyDrag), "drafts", 0),
         "Copy 1 item to drafts")
@@ -357,14 +350,45 @@ function run(check) {
     check("a foreign move offer still moves with no marker", Drag.dropVerb("", Qt.MoveAction, 0), "move")
     check("a foreign copy offer still copies with no marker", Drag.dropVerb("", Qt.CopyAction, 0), "copy")
 
+    // The four sentences ui:cap_drops waits on, from the real functions: a plain own lift on device 56 over the Photos row, over the parent crumb whose device the backend has answered on the lift's own device (CrumbDrop destDev is DropDev.devFor, pinned by tests/js/dropsflow.js), and over the Columns parent row.
+    var capRow = Drag.feedbackFor(Drag.markerPayload([2], false, "/cap-drops", 56), ["file:///cap-drops/a.txt"])
+    check("cap_drops Photos row reads a move, as the hover-open leg waits too", Drag.feedbackLine(capRow, "Photos", 56),
+        "Move 1 item to Photos · Ctrl copies, Shift moves")
+    var capCrumbs = Crumbs.crumbs("/home/gm/cap-drops/deep/outer/inner", "/home/gm", null)
+    check("cap_drops names the crumb above the leaf by its own text, slash included", capCrumbs[capCrumbs.length - 2].text, "outer/")
+    var capCrumb = Drag.feedbackFor(Drag.markerPayload([0], false, "/cap-drops/deep/outer/inner", 56), ["file:///cap-drops/deep/outer/inner/note.txt"])
+    var capDest = capCrumbs[capCrumbs.length - 2].path
+    // The backend answers each asked ancestor on the lift's device (one volume); the devs line lands through Messages and CrumbDrop's own binding reads it.
+    var capReply = {t: "devs", devs: {}}
+    DropDev.askPaths("/home/gm/cap-drops/deep/outer/inner").forEach(function (asked) { capReply.devs[asked] = 56 })
+    var capRoot = {pathDevs: {}, dest: capDest}
+    capRoot.pane = {backend: capRoot}
+    Messages.route(capRoot, JSON.parse(JSON.stringify(capReply)))
+    var capBind = Source.slice(Source.source("ui/CrumbDrop.qml"), "destDev:", "\n").substring("destDev:".length)
+    var capDev = new Function("root", "DropDev", "return (" + capBind + ")")(capRoot, DropDev)
+    check("cap_drops crumb device is the one the devs reply answered for it", capDev, 56)
+    check("cap_drops crumb reads a move, because its device is the lift's", Drag.feedbackLine(capCrumb, capCrumbs[capCrumbs.length - 2].text, capDev),
+        "Move 1 item to outer/ · Ctrl copies, Shift moves")
+    var capColumn = Drag.feedbackFor(Drag.markerPayload([0], false, "/cap-drops/Photos", 56), ["file:///cap-drops/Photos/p1.txt"])
+    check("cap_drops Columns parent row reads a move", Drag.feedbackLine(capColumn, "deep", 56),
+        "Move 1 item to deep · Ctrl copies, Shift moves")
+
+    // The two sentences ui:cap_dropmods waits on in the second window, from a plain and a ctrl lift made in the first (one device).
+    check("cap_dropmods b1 reads a move over sub2 before ctrl",
+          Drag.feedbackLine(Drag.feedbackFor("another-flea\n0\nmove\n/cap-dropmods\n56\n1\n0", ["file:///cap-dropmods/b1.txt"], "", Qt.MoveAction), "sub2", 56),
+          "Move 1 item to sub2 · Ctrl copies, Shift moves")
+    check("cap_dropmods b2 reads a copy over sub2 before shift",
+          Drag.feedbackLine(Drag.feedbackFor("another-flea\n0\ncopy\n/cap-dropmods\n56\n1\n0", ["file:///cap-dropmods/b2.txt"], "", Qt.CopyAction), "sub2", 56),
+          "Copy 1 item to sub2")
+
     // Drops.html specimens e and f specify this exact move hint, including when Ctrl is read.
     var boardHover = Drag.feedbackFor("another-flea\n0\nmove\n/source\n56\n1\n0", ["file:///source/a.txt"], "", Qt.CopyAction)
     check("Drops040 cross-window move status matches the approved board",
-          Drag.feedbackLine(boardHover, "claude", 56), "Move 1 item to claude · ctrl at lift copies")
+          Drag.feedbackLine(boardHover, "claude", 56), "Move 1 item to claude · Ctrl copies, Shift moves")
     check("Drops040 specimen b folder badge matches the board", Drag.label(Drag.copyingFor(boardHover, 32)), "copy here")
     check("Drops040 specimen f row badge matches the board", Drag.label(Drag.copyingFor(boardHover, 56)), "move here")
     check("Drops040 specimen f parent-column status matches the board",
-          Drag.feedbackLine(boardHover, "themes", 56), "Move 1 item to themes · ctrl at lift copies")
+          Drag.feedbackLine(boardHover, "themes", 56), "Move 1 item to themes · Ctrl copies, Shift moves")
 
     // Each row below travels the real mimeFor path, so a dropped shift field, an ignoring feedback, an unlinked badge or a lift that drops a marker field is caught.
     var lifts = [
@@ -386,7 +410,7 @@ function run(check) {
             var spot = arms[ai][0], into = arms[ai][1], verb = arms[ai][2]
             var hostile = verb === "move" ? Qt.CopyAction : Qt.MoveAction
             var back = Drag.feedbackFor(lifted[Drag.ROWS_MIME], lifted["text/uri-list"].split("\r\n"), "", hostile)
-            var want = verb === "move" ? "Move 2 items to omarchy · ctrl at lift copies"
+            var want = verb === "move" ? "Move 2 items to omarchy · Ctrl copies, Shift moves"
                 : verb === "copy" ? "Copy 2 items to omarchy" : "Link 2 items to omarchy"
             var badge = verb === "move" ? "move here" : verb === "copy" ? "copy here" : "link here"
             check("a " + tag + " lift " + spot + " drops as " + verb,
@@ -399,7 +423,7 @@ function run(check) {
     }
     // F16: startOffer arms pane.dragHolding before Drag.active, or a QDrag.exec finish handler overwrites the hold.
     var offer = Source.slice(Source.source("ui/FileDrag.qml"), "function startOffer()", "function deliverPaths")
-    var arm = offer.indexOf("root.pane.dragHolding = true")
+    var arm = offer.indexOf("root.host.dragHolding = true")
     var exec = offer.indexOf("root.Drag.active = true")
     check("startOffer arms the watch before entering the platform drag", arm >= 0 && exec >= 0 && arm < exec, true)
 

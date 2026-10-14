@@ -1,8 +1,12 @@
 .import "../../ui/js/Devices.js" as Devices
+.import "../../ui/js/Format.js" as Format
 .import "../../ui/js/Mounts.js" as Mounts
 .import "../../ui/js/Eject.js" as Eject
 .import "../../ui/js/Cloud.js" as Cloud
 .import "../../ui/js/NetFs.js" as NetFs
+.import "../../ui/js/Messages.js" as Messages
+.import "../../ui/js/Motion.js" as Motion
+.import "sourcefixture.js" as Source
 
 // RailAdditions rules 1 and 2: the volumes nothing has mounted, behind their own switch, and the
 // menu those rows carry. Split out of tests/js/devices.js, which keeps the 0.2.1 rail's own parse.
@@ -27,26 +31,38 @@ function labels(rows) {
 
 function run(check) {
     var off = Devices.parseDevices(unmountedBox, false)
-    check("with the switch off the rail is the one 0.2.1 drew", labels(off), "nvme0n1")
+    // Unlock (U039): a locked container is a rail row wherever it sits, even with the switch off.
+    check("with the switch off the rail is 0.2.1 plus the locked container", labels(off), "nvme0n1,Samsung SSD 870")
     var on = Devices.parseDevices(unmountedBox, true)
-    check("the volume nothing mounted joins the rail, and only it", labels(on), "nvme0n1,Archive")
+    check("the volume nothing mounted joins the rail, and only it beside the locked one", labels(on), "nvme0n1,Archive,Samsung SSD 870")
     check("the unmounted volume reads as unmounted", on[1].mounted, false)
     check("it has no mountpoint to open, so it has no path", on[1].path, "")
     check("it keeps the RailDetails column's own size", on[1].size, 1000398934016)
     check("it is not removable, so nothing offers to eject a fixed disk", on[1].removable, false)
     check("and it carries its device node, which is what gio mounts", on[1].device, "/dev/sdb1")
-    check("only a row built under the switch carries the board's own menu", on[1].volumeMenu, true)
+    var unmountedEntry = { path: on[1].path, label: on[1].label, group: "device", kind: on[1].kind,
+                           device: on[1].device, mounted: on[1].mounted, removable: on[1].removable }
+    check("the volume nothing mounted still offers Mount",
+          solid(Mounts.railMenu(unmountedEntry)).map(function (r) { return r.label }).join(","), "Mount")
     // A stick is a row either way, so it is the one that says what the switch does to an existing row.
     var stickBox = '{"blockdevices":[{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"disk","model":"USB Flash Disk","fstype":null,"parttypename":null,'
               + '"children":[{"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":["/run/media/gm/128GB"],"rm":true,"size":124656812032,"type":"part","model":null,"fstype":"vfat","parttypename":"W95 FAT32"}]}]}'
-    check("and a row built without it carries the menu it carried in 0.2.1",
-          Devices.parseDevices(stickBox, false)[0].volumeMenu, false)
+    check("and a mounted stick is still a row with the switch off",
+          labels(Devices.parseDevices(stickBox, false)), "128GB")
 
     // Rule 1's three exceptions, each named by lsblk rather than guessed from a name.
     check("swap is not a place to browse", labels(on).indexOf("sdb3"), -1)
     check("the EFI system partition is the box's own plumbing", labels(on).indexOf("sdb2"), -1)
     check("a volume with no filesystem has nothing to mount", labels(on).indexOf("sdb4"), -1)
-    check("a locked LUKS container mounts through its crypt child, never itself", labels(on).indexOf("sdb5"), -1)
+    // Unlock (U039): the locked container's menu is the dialog, not the mount its activation used to attempt.
+    var lockedRow = null
+    for (var l = 0; l < on.length; l++) {
+        if (on[l].locked === true)
+            lockedRow = on[l]
+    }
+    check("a locked LUKS container is a rail row", lockedRow !== null, true)
+    // The parsed row itself, not a hand-built one: the menu reads group, kind and locked too.
+    check("and its menu is Unlock", Mounts.railMenu(Object.assign({ group: "device" }, lockedRow)).map(function (r) { return r.label + ":" + r.action }).join(","), "Unlock:unlockVolume")
 
     // A USB LUN with media but no filesystem is not a rail row, removable or not.
     function bootBox(sda) {
@@ -127,21 +143,156 @@ function run(check) {
 
     // Rule 2's rows, which only a row from rule 1 carries.
     function solid(rows) { return rows.filter(function (r) { return r.separator !== true }) }
-    var unmounted = { group: "device", kind: "volume", mounted: false, removable: false, volumeMenu: true }
+    var unmounted = { group: "device", kind: "volume", mounted: false, removable: false }
     check("an unmounted volume offers the mount its own activation does",
           solid(Mounts.railMenu(unmounted)).map(function (r) { return r.label + ":" + r.action }).join(","), "Mount:mountVolume")
-    var mounted = { group: "device", kind: "volume", mounted: true, removable: false, volumeMenu: true }
+    var mounted = { group: "device", kind: "volume", mounted: true, removable: false }
     check("a mounted one offers the open beside the release",
           solid(Mounts.railMenu(mounted)).map(function (r) { return r.label + ":" + r.action }).join(","),
           "Open:open,Unmount:unmountVolume")
-    var stick = { group: "device", kind: "volume", mounted: true, removable: true, volumeMenu: true }
+    var stick = { group: "device", kind: "volume", mounted: true, removable: true }
     check("and Eject stays where it stands today, on a volume somebody can pull out",
-          solid(Mounts.railMenu(stick)).map(function (r) { return r.label }).join(","), "Open,Unmount,Eject")
-    check("with the switch off a mounted stick opens beside its eject",
-          solid(Mounts.railMenu({ group: "device", kind: "volume", mounted: true, removable: true })).map(function (r) { return r.label }).join(","),
-          "Open,Eject")
-    check("and an unmounted one opens no menu at all",
-          Mounts.railMenu({ group: "device", kind: "volume", mounted: false, removable: true }).length, 0)
+          solid(Mounts.railMenu(stick)).map(function (r) { return r.label }).join(","), "Open,Unmount,Eject,Flash image")
+    check("and an unmounted one offers Mount and the way in from a drive",
+          solid(Mounts.railMenu({ group: "device", kind: "volume", mounted: false, removable: true })).map(function (r) { return r.label }).join(","), "Mount,Flash image")
+
+    // Every mounted volume offers Unmount with the switch off, so Ctrl+E releases it.
+    var twoDisk = '{"blockdevices":['
+        + '{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[null],"rm":false,"size":256060514304,"type":"disk","model":"KBG40ZNS256G","fstype":null,"parttypename":null,'
+        + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"size":256060514304,"type":"part","model":null,"fstype":"btrfs","parttypename":"Linux filesystem"}]},'
+        + '{"name":"nvme1n1","path":"/dev/nvme1n1","label":null,"mountpoints":[null],"rm":false,"size":1000398934016,"type":"disk","model":"Samsung SSD 870","fstype":null,"parttypename":null,'
+        + '"children":[{"name":"nvme1n1p1","path":"/dev/nvme1n1p1","label":"Data","mountpoints":["/mnt/data"],"rm":false,"size":1000398934016,"type":"part","model":null,"fstype":"ext4","parttypename":"Linux filesystem"}]},'
+        + '{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":124656812032,"type":"disk","model":"USB Flash Disk","fstype":null,"parttypename":null,'
+        + '"children":[{"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":["/run/media/gm/128GB"],"rm":true,"size":124656812032,"type":"part","model":null,"fstype":"vfat","parttypename":"W95 FAT32"}]}]}'
+    function railEntryOf(row) {
+        return { path: row.path, label: row.label, group: "device", kind: row.kind,
+                 device: row.device, mounted: row.mounted, removable: row.removable, glyph: "drive" }
+    }
+    var railRows = Devices.parseDevices(twoDisk, false).map(railEntryOf)
+    function railRow(label) {
+        for (var i = 0; i < railRows.length; i++)
+            if (railRows[i].label === label) return railRows[i]
+        return null
+    }
+    function railActions(entry) {
+        return solid(Mounts.railMenu(entry)).map(function (r) { return r.label }).join(",")
+    }
+    // The flags reach the pane only as the backend's fsinfo line, through Messages.route into the shipped PaneWire.onFsInfo.
+    var onFsInfoBody = Source.block(Source.source("ui/PaneWire.qml"),
+        "function onFsInfo(fs, free, path, storageClass, tagable, systemVolume)", "ui/PaneWire.qml")
+    function answer(pane, line) {
+        var onFsInfo = new Function("root", "pane", "ExtThumbs", "ViewState",
+            "return function (fs, free, path, storageClass, tagable, systemVolume) {" + onFsInfoBody + "}")(
+            { pane: pane }, pane, { verdict: function () { return "" } }, { preview: "" })
+        Messages.route({ fsInfo: onFsInfo }, JSON.parse(line))
+    }
+    // Sample output, src/backend/fsinfo.rs: {"t":"fsinfo","fs":"btrfs","free":7,"path":"/home/gm","class":"","tagable":false,"system":true}
+    var tagRoot = { path: "/home/gm", recentMode: "", fsName: "", fsFree: 0, storageClass: "", storageKnown: false,
+                    systemVolume: false, canTag: false, extVerdict: "", listArea: null, said: "",
+                    message: function (t) { this.said = t }, ejectHidden: function () {} }
+    answer(tagRoot, '{"t":"fsinfo","fs":"btrfs","free":7,"path":"/home/gm","class":"","tagable":true}')
+    check("the fsinfo line also carries the tag verdict", tagRoot.canTag, true)
+    function fsInfoLine(path, system) {
+        var line = { t: "fsinfo", fs: "btrfs", free: 7, path: path, "class": "", tagable: false }
+        if (system)
+            line.system = true
+        return JSON.stringify(line)
+    }
+    check("the fixture writes the backend's own fsinfo line, as src/backend/fsinfo.rs pins it",
+          Source.source("src/backend/fsinfo.rs").indexOf('r#"' + fsInfoLine("/home/gm", true) + '"#') >= 0, true)
+    // facts: system rides the line for facts.from (default path), and a Recent mode opens after that line lands.
+    function ejector(path, entries, railCursor, facts) {
+        var f = facts || {}
+        var root = { path: path, recentMode: "", fsName: "", fsFree: 0, storageClass: "", storageKnown: false,
+                     systemVolume: false, extVerdict: "", listArea: null, said: "", told: 0, handed: 0,
+                     message: function (t) { this.said = t; this.told += 1 }, ejectHidden: function () { this.handed += 1 } }
+        answer(root, fsInfoLine(f.from || path, f.system === true))
+        root.recentMode = f.recent || ""
+        var rail = entries === null ? null : { entries: entries, cursorIndex: railCursor || 0, released: [],
+                     releaseChosen: function (a, k) { this.released.push(a + ":" + k) } }
+        Eject.release(root, rail, railCursor !== undefined)
+        return { said: root.said, told: root.told, handed: root.handed, released: rail ? rail.released : [] }
+    }
+    check("a mounted internal volume offers Open and Unmount with the switch off",
+          railActions(railRow("Data")), "Open,Unmount")
+    var dataOut = ejector("/mnt/data/photos", railRows)
+    check("Ctrl+E inside it releases that volume and says nothing",
+          dataOut.released.join(",") + "|" + dataOut.said, "unmountVolume:/dev/nvme1n1p1|")
+    check("with the switch off a mounted stick offers Open, Unmount, Eject and Flash image",
+          railActions(railRow("128GB")), "Open,Unmount,Eject,Flash image")
+    check("and Ctrl+E still picks eject there",
+          Eject.releaseFromRows(Mounts.railMenu(railRow("128GB"))), "eject")
+    var bareStick = '{"blockdevices":[{"name":"nvme0n1","path":"/dev/nvme0n1","label":null,"mountpoints":[null],"rm":false,"size":1,"type":"disk","model":"KBG40ZNS256G","fstype":null,"parttypename":null,'
+        + '"children":[{"name":"nvme0n1p1","path":"/dev/nvme0n1p1","label":null,"mountpoints":["/"],"rm":false,"size":1,"type":"part","model":null,"fstype":"btrfs","parttypename":"Linux filesystem"}]},'
+        + '{"name":"sda","path":"/dev/sda","label":null,"mountpoints":[null],"rm":true,"size":2,"type":"disk","model":"Stick","fstype":null,"parttypename":null,'
+        + '"children":[{"name":"sda1","path":"/dev/sda1","label":"USB","mountpoints":[null],"rm":true,"size":2,"type":"part","model":null,"fstype":"vfat","parttypename":"W95 FAT32"}]}]}'
+    var idleRows = Devices.parseDevices(bareStick, false).map(railEntryOf)
+    check("an unmounted stick offers Mount and Flash image with the switch off",
+          railActions(idleRows[1]), "Mount,Flash image")
+    check("Ctrl+E on an unmounted volume row releases nothing",
+          Eject.releaseFromRows(Mounts.railMenu(idleRows[1])), "")
+    var systemSentence = "This folder is on a system volume, which Flea never unmounts"
+    var noVolume = "This folder is not on a volume Flea can unmount"
+    check("Ctrl+E under home names the system volume when the backend says a system mountpoint holds it",
+          ejector("/home/user/Documents", railRows, undefined, { system: true }).said, systemSentence)
+    var cloudRows = railRows.concat([{ label: "gdrive", group: "network", kind: "cloud",
+        uri: "", path: "/home/u/gdrive", mounted: true, glyph: "server" }])
+    check("Ctrl+E inside a cloud row names no volume",
+          ejector("/home/u/gdrive/notes/f.txt", cloudRows, undefined).said, noVolume)
+    // Rail shown, hidden (device rows only) or NETWORK off: the flag alone decides, set for home and unset for a FUSE mount in it.
+    var homePlace = { label: "Home", group: "places", kind: "place", path: "/home/u", glyph: "home" }
+    function homeThenFuse(rows) {
+        return ejector("/home/u", rows, undefined, { system: true }).said + "|" + ejector("/home/u/mergerfs/notes", rows).said
+    }
+    check("home names the system volume and a FUSE mount in it names none, with the rail shown",
+          homeThenFuse(cloudRows), systemSentence + "|" + noVolume)
+    check("and the same with the rail hidden, where only the device rows are read",
+          homeThenFuse(railRows), systemSentence + "|" + noVolume)
+    check("and the same with the rail shown and NETWORK off",
+          homeThenFuse([homePlace].concat(railRows)), systemSentence + "|" + noVolume)
+    check("a folder reached through a link into a data volume names no system volume, whatever its path says",
+          ejector("/home/user/Data/photos", railRows, undefined).said, noVolume)
+    check("a Recent history spans mounts, so it names no system volume however the last folder was flagged",
+          ejector("/", railRows, undefined, { system: true, recent: "results" }).said, noVolume)
+    check("Ctrl+E under a GVFS folder names no volume",
+          ejector("/run/user/1000/gvfs/smb-share:server=x,share=y/docs/f.txt", railRows, undefined).said, noVolume)
+    check("Ctrl+E on a kernel network mount no row holds names no volume",
+          ejector("/mnt/nas/docs", railRows, undefined).said, noVolume)
+    check("a late fsinfo line for the folder just left never flags the one now shown",
+          ejector("/srv/media", railRows, undefined, { system: true, from: "/home/user/Documents" }).said, noVolume)
+    // A favourite carries its folder's path and a menu of its own but releases nothing, so it never stands for the volume that holds a folder.
+    var photos = { label: "Photos", group: "favourite", kind: "favourite", path: "/mnt/data/photos", storedPath: "/mnt/data/photos", glyph: "folder" }
+    var documents = { label: "Docs", group: "favourite", kind: "favourite", path: "/home/user/Documents", storedPath: "~/Documents", glyph: "folder" }
+    var shadowed = ejector("/mnt/data/photos/2024", [photos].concat(railRows))
+    check("a favourite inside a volume does not shadow that volume's release",
+          shadowed.released.join(",") + "|" + shadowed.said, "unmountVolume:/dev/nvme1n1p1|")
+    check("a favourite over a system folder does not hide the system volume sentence",
+          ejector("/home/user/Documents/notes", [documents].concat(railRows), undefined, { system: true }).said, systemSentence)
+    check("a favourite over a folder no volume row holds names no volume",
+          ejector("/mnt/data/photos/2024", [photos]).said, noVolume)
+    // Every branch of Ctrl+E ends in one whole sentence, or hands the key on: the hidden rail's flow, or the rail's release.
+    function ending(run) { return run.told + " said|" + run.handed + " handed|" + run.released.length + " released" }
+    check("a hidden rail hands the key to its one-shot flow and says nothing itself",
+          ending(ejector("/mnt/data/photos", null)), "0 said|1 handed|0 released")
+    check("a listing inside a mounted volume hands its release to the rail and says nothing itself",
+          ending(ejector("/mnt/data/photos", railRows)), "0 said|0 handed|1 released")
+    check("a system folder says its sentence once and releases nothing",
+          ending(ejector("/home/user", railRows, undefined, { system: true })), "1 said|0 handed|0 released")
+    check("a folder no volume holds says its sentence once and releases nothing",
+          ending(ejector("/mnt/data2", railRows)), "1 said|0 handed|0 released")
+    check("the rail's own disk row says its sentence once and releases nothing",
+          ending(ejector("/home/user", railRows, 0)), "1 said|0 handed|0 released")
+    check("a rail row with nothing to release says so once",
+          ending(ejector("/home/user", [photos], 0)) + "|" + ejector("/home/user", [photos], 0).said,
+          "1 said|0 handed|0 released|Photos has nothing to eject or unmount")
+    check("Ctrl+E on the system disk names that drive",
+          ejector("/home/user", railRows, 0).said, "nvme0n1 is the system drive, which Flea never unmounts")
+    var cashRow = { label: "CASH$$", group: "device", kind: "disk", device: "/dev/sda", path: "/", mounted: true, glyph: "drive" }
+    check("a label holding dollar signs is printed as written",
+          ejector("/", [cashRow], 0).said, "CASH$$ is the system drive, which Flea never unmounts")
+    check("and both busy sentences fill a label whole",
+          [Mounts.WORDS.stillUnmounting, Mounts.WORDS.stillEjecting].map(function (w) { return Format.fill(w, "CASH$$") }).join("|"),
+          "Still unmounting CASH$$; wait for its result|Still ejecting CASH$$; wait for its result")
 
     // CloudMounts: a FUSE mount inside the home folder shows in NETWORK under its
     // folder's name. Sample input, /proc/self/mountinfo lines (id parent maj:min root
@@ -152,14 +303,15 @@ function run(check) {
     // 18 1 8:1 / /home/u rw,nosuid,nodev - btrfs /dev/sda1 rw
     // 40 1 0:40 / /run/user/1000/gvfs rw,nosuid,nodev - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000
     var mountsBody = "23 1 8:1 / /home/u/gdrive rw,nosuid,nodev - fuse.rclone remote: rw,user_id=1000,group_id=1000\n"
-        + "24 1 8:1 / /home/u/My\\040Drive rw,nosuid,nodev - fuse.rclone remote: rw,user_id=1000,group_id=1000\n"
+        + "24 1 8:1 / /home/u/My\\040Drive rw,nosuid,nodev - fuse.mergerfs merge: rw,user_id=1000,group_id=1000\n"
         + "31 1 0:27 / /home/u/ProtonDrive rw,nosuid,nodev - fuse.protondrive proton: rw,user_id=1000\n"
         + "18 1 8:1 / /home/u rw,nosuid,nodev - btrfs /dev/sda1 rw\n"
         + "40 1 0:40 / /run/user/1000/gvfs rw,nosuid,nodev - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000\n"
     var clouds = Cloud.parseCloudMounts(mountsBody, "/home/u")
-    check("three FUSE mounts inside home parse to three rows", clouds.length, 3)
-    check("the first row names the folder's own path", clouds[0].path, "/home/u/gdrive")
-    check("an octal escape decodes to the folder's real name", clouds[1].path, "/home/u/My Drive")
+    check("only non-network FUSE inside home parses to a cloud row", clouds.length, 1)
+    check("a network fstype inside home is never a cloud row",
+          clouds.some(function (c) { return c.path === "/home/u/gdrive" || c.path === "/home/u/ProtonDrive" }), false)
+    check("the row names the folder's own octal-decoded path", clouds[0].path, "/home/u/My Drive")
     check("the home directory itself is not a cloud mount",
           clouds.some(function (c) { return c.path === "/home/u" }), false)
     check("the gvfs FUSE mount is not inside home and stays out",
@@ -168,7 +320,7 @@ function run(check) {
     check("garbage parses to nothing", Cloud.parseCloudMounts("not mountinfo at all\n", "/home/u").length, 0)
     check("no home means no rows", Cloud.parseCloudMounts(mountsBody, "").length, 0)
     check("a stacked mountpoint names one row, not two",
-          Cloud.parseCloudMounts(mountsBody + "44 1 0:44 / /home/u/gdrive rw - fuse.rclone remote: rw\n", "/home/u").length, 3)
+          Cloud.parseCloudMounts(mountsBody + "44 1 0:44 / /home/u/My\\040Drive rw - fuse.mergerfs merge: rw\n", "/home/u").length, 1)
 
     // The row itself: a server mark and a green square, and no menu at defaults, like
     // Dropbox's row, because the tool that made the mount owns it.
@@ -183,6 +335,7 @@ function run(check) {
     check("nfs4 names network", NetFs.isNetworkFstype("nfs4"), true)
     check("cifs names network", NetFs.isNetworkFstype("cifs"), true)
     check("smb3 names network", NetFs.isNetworkFstype("smb3"), true)
+    check("smb2 names network too", NetFs.isNetworkFstype("smb2"), true)
     check("davfs names network", NetFs.isNetworkFstype("davfs"), true)
     check("fuse.sshfs names network", NetFs.isNetworkFstype("fuse.sshfs"), true)
     check("fuse.rclone names network", NetFs.isNetworkFstype("fuse.rclone"), true)
@@ -194,6 +347,7 @@ function run(check) {
     check("the document portal stays local", NetFs.isNetworkFstype("fuse.portal"), false)
     check("a local mergerfs stays local", NetFs.isNetworkFstype("fuse.mergerfs"), false)
     check("gocryptfs stays local", NetFs.isNetworkFstype("fuse.gocryptfs"), false)
+    check("protondrive names network again", NetFs.isNetworkFstype("fuse.protondrive"), true)
     check("nfsd stays local", NetFs.isNetworkFstype("nfsd"), false)
     check("a bare sshfs stays local", NetFs.isNetworkFstype("sshfs"), false)
     // Kernel and outside-home FUSE mounts become NETWORK rows without a per-row stat.
@@ -202,10 +356,10 @@ function run(check) {
         + "32 1 0:47 / /mnt/ssh rw - fuse.sshfs user@h:/ rw\n"
         + "33 1 0:48 / /home/u/gdrive rw - fuse.rclone remote: rw\n"
         + "40 1 0:40 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw\n"
-    var nets = Cloud.parseNetworkMounts(netBody, "/home/u")
-    check("kernel nfs, cifs and outside-home sshfs become rows", nets.length, 3)
-    check("the inside-home rclone stays a cloud row, not a second one",
-        nets.some(function (n) { return n.path === "/home/u/gdrive" }), false)
+    var nets = Cloud.parseNetworkMounts(netBody)
+    check("kernel nfs, cifs, outside-home sshfs and inside-home rclone become rows", nets.length, 4)
+    check("the inside-home rclone is a share row with its fstype",
+        nets.some(function (n) { return n.path === "/home/u/gdrive" && n.fstype === "fuse.rclone" }), true)
     check("the gvfs root never becomes a row",
         nets.some(function (n) { return n.path.indexOf("/run/") === 0 }), false)
     // The portal, the bridge, the server proc and a local FUSE mount never become rows.
@@ -214,8 +368,104 @@ function run(check) {
         + "12 1 0:51 / /proc/fs/nfsd rw - nfsd nfsd rw\n"
         + "13 1 8:1 / /mnt/merge rw - fuse.mergerfs merge rw\n"
         + "14 1 0:45 / /mnt/nas rw - nfs nas:/share rw\n"
-    var narrow = Cloud.parseNetworkMounts(narrowBody, "/home/u")
+    var narrow = Cloud.parseNetworkMounts(narrowBody)
     check("portal, bridge, nfsd and mergerfs beside one NFS yield exactly it",
         narrow.length === 1 && narrow[0].path === "/mnt/nas", true)
+    check("fuse.gvfsd-fuse alone gives no row, gvfs shows those shares itself",
+        Cloud.parseNetworkMounts("40 1 0:40 / /run/user/1000/gvfs rw - fuse.gvfsd-fuse gvfsd-fuse rw\n").length, 0)
+    check("an in-home protondrive line is one network row",
+        Cloud.parseNetworkMounts("31 1 0:27 / /home/u/ProtonDrive rw,nosuid,nodev - fuse.protondrive proton: rw,user_id=1000\n").length, 1)
+    check("and never a cloud row",
+        Cloud.parseCloudMounts("31 1 0:27 / /home/u/ProtonDrive rw,nosuid,nodev - fuse.protondrive proton: rw,user_id=1000\n", "/home/u").length, 0)
+    // Issue #257 round 2: mountinfo rows are the rows and gio only lends names, so what stays here is the mark split the rail draws from the fstype.
+    check("cifs draws the eject mark", NetFs.isCifsFstype("cifs"), true)
+    check("smb2 draws it too", NetFs.isCifsFstype("smb2"), true)
+    check("smb3 draws it too", NetFs.isCifsFstype("smb3"), true)
+    check("smbfs draws it too", NetFs.isCifsFstype("smbfs"), true)
+    check("the split reads case-insensitively", NetFs.isCifsFstype("CIFS"), true)
+    check("nfs keeps its square", NetFs.isCifsFstype("nfs"), false)
+    check("nfs4 keeps its square too", NetFs.isCifsFstype("nfs4"), false)
+    check("sshfs keeps its square", NetFs.isCifsFstype("fuse.sshfs"), false)
+    check("rclone keeps its square", NetFs.isCifsFstype("fuse.rclone"), false)
+    check("a local fstype keeps its square", NetFs.isCifsFstype("ext4"), false)
+    check("no fstype at all keeps its square", NetFs.isCifsFstype(""), false)
+    runCursorFollow(check)
+    runSlide(check)
 }
 
+// After an unlock the shipped ui/UnlockHost.qml follow puts the cursor on the crypt row, sliced from the file over a stub rail.
+function hostRoot() {
+    // lsblk names the crypt row /dev/mapper/luks-*, where udisksctl said /dev/dm-0, so the row is found by its mountpoint.
+    return { sidebar: { deviceEntries: [{ device: "/dev/sdb1", path: "" },
+        { device: "/dev/mapper/luks-a", path: "/run/media/u/Backup" }],
+        placesEntries: [0, 1], networkEntries: [0], cursorIndex: 1 }, pendingPath: "" }
+}
+function hostBody(marker) {
+    var src = Source.source("ui/UnlockHost.qml")
+    return Source.slice(src, marker, "    Loader {")
+}
+function followOn(path) {
+    var root = hostRoot()
+    var body = hostBody("    function followUnlocked(path) {") + hostBody("    function landCursor(stash) {")
+    new Function("root", "path", body + "; root.followUnlocked = followUnlocked; root.landCursor = landCursor; followUnlocked(path);")(root, path)
+    return root.sidebar.cursorIndex + "|" + root.pendingPath
+}
+function landOn(path, stash, cursor) {
+    var root = hostRoot()
+    root.pendingPath = path
+    root.sidebar.cursorIndex = cursor
+    var body = hostBody("    function landCursor(stash) {")
+    new Function("root", "stash", body + "; root.landCursor = landCursor; return landCursor(stash);")(root, stash)
+    return root.sidebar.cursorIndex + "|" + root.pendingPath
+}
+
+// UL10: the cursor usually sits on the locked row the user activated, so the follow survives the rebuild while it still sits there.
+function settleOn(cursor, locked) {
+    var root = hostRoot()
+    root.pendingPath = "/run/media/u/Backup"
+    root.sidebar.cursorIndex = cursor
+    root.lockedCursor = locked
+    var body = hostBody("    function landCursor(stash) {")
+    new Function("root", body + "; root.settleFollow = settleFollow; root.landCursor = landCursor; settleFollow();")(root)
+    return root.sidebar.cursorIndex + "|" + root.pendingPath
+}
+// Sample input: the cursor on rail index 3 with device /dev/sdb1 answers 3 when that is the locked row, else -1.
+function cursorOnRow(cursor, device) {
+    var root = hostRoot()
+    root.sidebar.cursorIndex = cursor
+    var body = hostBody("    function cursorOnRow(device) {")
+    return new Function("root", "device", body + "; return cursorOnRow(device);")(root, device)
+}
+
+function runCursorFollow(check) {
+    check("the cursor lands on the unlocked row", followOn("/run/media/u/Backup"), "4|")
+    check("a miss stashes for the next rebuild", followOn("/run/media/u/Gone"), "1|/run/media/u/Gone")
+    check("a landed rebuild clears the stash", landOn("/run/media/u/Backup", false, -1), "4|")
+    check("a missed rebuild without stash clears", landOn("/run/media/u/Gone", false, -1), "-1|")
+    check("a cursor still on the locked row follows to the crypt row", settleOn(3, 3), "4|")
+    check("a cursor that moved off the locked row drops the follow", settleOn(1, 3), "1|")
+    check("no cursor at all still follows", settleOn(-1, -1), "4|")
+    check("a cursor on a row that was never the locked one drops the follow", settleOn(3, -1), "3|")
+    check("the cursor on the locked row is recorded at its rail index", cursorOnRow(3, "/dev/sdb1"), 3)
+    check("the cursor on another device row records nothing", cursorOnRow(4, "/dev/sdb1"), -1)
+    check("the cursor on a places row records nothing", cursorOnRow(1, "/dev/sdb1"), -1)
+    check("no cursor records nothing", cursorOnRow(-1, "/dev/sdb1"), -1)
+    check("opening the dialog records where the cursor sat",
+        Source.source("ui/UnlockHost.qml").indexOf("root.lockedCursor = root.cursorOnRow(device)") >= 0, true)
+}
+
+
+// The auto-hidden rail slides on x in the shell's curve and builds once; docked mode keeps its own Loader condition.
+function runSlide(check) {
+    var rail = Source.source("ui/PaneRail.qml")
+    check("the pointer rests 120 ms at the edge before the rail opens", Motion.dwellMs, 120)
+    check("the show reads the open duration", rail.indexOf("root.revealed ? Motion.durMs.open : Motion.durMs.close") >= 0, true)
+    check("the slide eases on OutCubic", rail.indexOf("easing.type: Easing.OutCubic") >= 0, true)
+    check("the slide is off with reduced motion", Source.slice(rail, "Behavior on slide", "NumberAnimation").indexOf("enabled: !Theme.reducedMotion") >= 0, true)
+    check("the dwell timer reads the token", Source.slice(rail, "id: dwell", "onTriggered").indexOf("interval: Motion.dwellMs") >= 0, true)
+    check("the strip is one row lead-in wide", Source.slice(rail, "id: strip", "enabled:").indexOf("width: Theme.spacing.rowPaddingX") >= 0, true)
+    check("the rail moves on x and not on width", Source.slice(rail, "id: rail", "visible:").indexOf("x: root.overlay ? (root.slide - 1) * width : 0") >= 0, true)
+    check("visible drops when the hide slide ends", rail.indexOf("visible: !root.held && (!root.overlay || root.slide > 0)") >= 0, true)
+    check("an auto-hide Sidebar stays built after its first reveal", rail.indexOf("(root.overlay ? (root.built || root.releaseHold) : (!root.hidden || root.releaseHold))") >= 0, true)
+    check("a withdrawn rail reads zero width", rail.indexOf("railWidth: root.hidden ? 0 : rail.width") >= 0, true)
+}

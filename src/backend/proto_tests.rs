@@ -22,6 +22,13 @@ fn convert_preserves_probe_and_caller_identity_without_changing_legacy_activatio
 }
 
 #[test]
+fn a_peek_carries_the_folder_order_the_column_remembers() {
+    assert!(matches!(parse_request(r#"{"c":"peek","path":"/a","first":1,"by":"size","desc":true}"#),
+        Request::Peek { by, desc: true, .. } if by.as_deref() == Some("size")));
+    assert!(matches!(parse_request(r#"{"c":"peek","path":"/a","first":1}"#), Request::Peek { by: None, desc: false, .. }));
+}
+
+#[test]
 fn a_watching_peek_names_the_column_directories_drawn() {
     assert!(matches!(parse_request(r#"{"c":"peek","path":"/a","first":1,"watch":true,"keep":["/a","/a/b, [odd]"]}"#),
         Request::Peek { watch: true, keep, .. } if keep == ["/a", "/a/b, [odd]"]));
@@ -315,6 +322,18 @@ fn emits_an_error_line_naming_operation_and_path() {
         error_line_with_mode(&e, 0),
         r#"{"t":"error","where":"scan","path":"/root","msg":"permission denied"}"#
     );
+    // A typed cause rides after msg, the same way.
+    assert_eq!(
+        error_line_with_code(&e, "emptyclipboard"),
+        r#"{"t":"error","where":"scan","path":"/root","msg":"permission denied","code":"emptyclipboard"}"#
+    );
+}
+
+#[test]
+fn a_devs_request_carries_the_paths_named_and_a_bare_one_carries_none() {
+    assert!(matches!(parse_request(r#"{"c":"devs","paths":["/","/home/gm","/odd, [dir]"]}"#),
+        Request::Devs { paths } if paths == ["/", "/home/gm", "/odd, [dir]"]));
+    assert!(matches!(parse_request(r#"{"c":"devs"}"#), Request::Devs { paths } if paths.is_empty()));
 }
 
 #[test]
@@ -330,8 +349,8 @@ fn a_jump_request_carries_both_client_sources_and_a_bare_one_carries_none() {
 #[test]
 fn slow_names_its_op_path_and_sentence() {
     assert_eq!(
-        slow_line("rename", "/hung/a.txt", "/hung is slow. The rename continues and will finish on its own."),
-        r#"{"t":"slow","op":"rename","path":"/hung/a.txt","msg":"/hung is slow. The rename continues and will finish on its own."}"#
+        slow_line("rename", "/hung/a.txt", "/hung is slow. The rename will finish on its own."),
+        r#"{"t":"slow","op":"rename","path":"/hung/a.txt","msg":"/hung is slow. The rename will finish on its own."}"#
     );
 }
 

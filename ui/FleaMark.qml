@@ -1,5 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
+import "js/Motion.js" as Motion
 
 // Flea's own mark: the Omarchy spiral redrawn as a 24-grid stroke glyph, per BrandMoments.dc.html's
 // "The mark" cell. It paints itself in from blank and then holds. The caller drives the repeat, so
@@ -8,7 +9,7 @@ import QtQuick.Shapes
 Item {
     id: root
 
-    property color color: Theme.color.muted
+    property color color: Theme.color.mutedFrame
     // The mark draws on the same 24 unit grid as every Glyph, scaled to the slot.
     readonly property real grid: 24
     readonly property real markScale: Math.min(root.width, root.height) / root.grid
@@ -57,11 +58,11 @@ Item {
         }
     }
 
-    // BrandMoments.dc.html's draw timing, 0.2s delay then 1.8s; OutCubic replaces its cubic-bezier(0.4, 0, 0.2, 1) per GM's 2026-09-25 motion ruling.
+    // BrandMoments.dc.html's draw timing, 0.2s delay then 1.8s; OutCubic replaces its cubic-bezier(0.4, 0, 0.2, 1), the motion choice of 2026-09-25.
     SequentialAnimation {
         id: draw
         // The caption's own fade-out, so a repeat dissolves the finished mark rather than cutting it.
-        NumberAnimation { target: root; property: "opacity"; to: 0.0; duration: 180; easing.type: Easing.OutQuad }
+        NumberAnimation { target: root; property: "opacity"; to: 0.0; duration: Motion.durMs.close; easing.type: Easing.OutCubic }
         // Blank before opacity comes back, never after: an offset of a whole mark is what hides the seam.
         PropertyAction { target: stroke; property: "dashOffset"; value: root.markDashes }
         PropertyAction { target: root; property: "opacity"; value: 1.0 }

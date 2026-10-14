@@ -70,14 +70,17 @@ function apply(p, kind) {
     var needed = new Function("permissionsDialog", body(source, "onRefreshNeeded"))
     var card = {opened: true, transportFailed: false, requestId: APPLY_ID, busy: true, facts: {ok: true},
         multiPaths: ["/d/b", "/d/d"], multiBase: APPLY_ID, inspectStride: INSPECT_STRIDE,
-        applyingMany: true, multiApplySent: MARKS.length, multiApplySkipped: [], errorText: "",
-        cancelFocus: {forceActiveFocus: function () {}}, requested: function () {}, close: function () { card.opened = false }}
+        applyingMany: true, multiApplySkipped: [], errorText: "",
+        cancelButton: {forceActiveFocus: function () {}}, requested: function () {}, close: function () { card.opened = false }}
     card.changed = function (note) { changed({owner: p}, {say: function () {}}, note) }
     card.refreshNeeded = function () { needed({owner: p}) }
     card.isMulti = kind !== "single"
     var dialogSource = Source.source("ui/PermissionsDialog.qml")
     var receiveMany = new Function("root", "Permissions", "message", "with(root) " + body(dialogSource, "receiveMany"))
     card.receiveMany = function (message) { receiveMany(card, Permissions, message) }
+    // The failed-batch branch re-reads through the shipped helper, so the fake carries it too.
+    var inspectAll = new Function("root", "with(root) " + body(dialogSource, "inspectAll"))
+    card.inspectAll = function () { inspectAll(card) }
     if (kind === "single") {
         var receive = new Function("root", "message", "with(root) " + body(dialogSource, "receive"))
         receive(card, {id: APPLY_ID, op: "apply", ok: true})
@@ -86,19 +89,21 @@ function apply(p, kind) {
 
 function undo(p, op, redo) {
     var handler = new Function("pane", "Ops", "Status", "op", "ok", body(Source.source("ui/PaneWire.qml"), redo ? "onRedone" : "onUndone"))
-    handler(p, Ops, {UNDO_HINT: ""}, op, true)
+    handler(p, Ops, {undoHint: function () { return "" }}, op, true)
 }
 
 function run(check) {
     Guards.run(check, body, pane, apply)
     var modes = ["list", "grid", "columns", "dual"]
-    var kinds = ["single", "batch", "partial", "undo", "redo"]
+    // A tag change is metadata-only like a mode change, so undoing or redoing one keeps marks and cursor too.
+    var kinds = ["single", "batch", "partial", "undo", "redo", "tagundo", "tagredo"]
     for (var m = 0; m < modes.length; m++) {
         for (var k = 0; k < kinds.length; k++) {
             var p = pane(modes[m], false, false)
             if (kinds[k] === "single") p.selection.only(CURSOR)
             var marks = p.selectedIndices().join(","), cursor = p.cursorIndex, y = p.listArea.contentY
             if (kinds[k] === "undo" || kinds[k] === "redo") undo(p, "permissions", kinds[k] === "redo")
+            else if (kinds[k] === "tagundo" || kinds[k] === "tagredo") undo(p, "settags", kinds[k] === "tagredo")
             else apply(p, kinds[k])
             var label = modes[m] + " " + kinds[k]
             check(label + " dispatches its reread", p.sent[0], "list /d")
@@ -129,6 +134,24 @@ function run(check) {
     busy.wire.reread()
     land(busy, ["a", "b", "c", "d", "e"])
     check("deferred permissions reread keeps marks", busy.selectedIndices().join(","), MARKS.join(","))
+    var free = pane("list", false, false)
+    apply(free, "batch")
+    check("the same apply sends with no button held", free.sent.length > 0, true)
+    var pressed = pane("list", false, false)
+    pressed.pointerHeld = true
+    apply(pressed, "batch")
+    check("a held button holds permissions reread", pressed.sent.length, 0)
+    check("a held button retains the debt", pressed.wire.stale, true)
+    // The two PaneWire expressions that pay the debt on a release, read from its source and run on the stub wire.
+    var wireSource = Source.source("ui/PaneWire.qml")
+    var onBusyChanged = new Function("root", "watchSettle", wireSource.match(/onWatchBusyChanged: (.*)\n/)[1])
+    var onSettled = new Function("root", wireSource.match(/id: watchSettle[\s\S]*?onTriggered: (.*)\n/)[1])
+    var settle = {running: false, start: function () { settle.running = true }}
+    pressed.pointerHeld = false
+    onBusyChanged(pressed.wire, settle)
+    check("the release arms the burst timer", settle.running, true)
+    onSettled(pressed.wire)
+    check("the released button pays the reread", pressed.sent.join("|"), free.sent.join("|"))
     var deep = pane("list", true, true)
     deep.held = DEEP_START
     deep.total = DEEP_START + deep.rows.length

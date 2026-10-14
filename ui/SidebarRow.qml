@@ -11,8 +11,12 @@ Item {
 
     required property int index
     required property var modelData
+    // The place the pane stands in: the fill and the accent edge. The keyboard cursor is a separate frame and moves on its own.
+    property bool lit: false
     property bool cursor: false
     property bool focused: false
+    // The keyboard is on this row's eject mark, which then draws its own frame in the foreground at its hit box.
+    property bool markFocused: false
     // Network only, driven from ui/Sidebar.qml's renamingIndex; swaps the label for the editor.
     property bool renaming: false
 
@@ -40,6 +44,8 @@ Item {
     // A share or a removable volume carries a mount-state dot; the internal disk is always there
     // and always mounted, so a dot on it would say nothing, and a favourite is not a mount at all.
     readonly property var placesState: ViewState.state.places || ({})
+    // The eject mark's accessible name, one whole sentence per kind of row, each filled by Format.fill.
+    readonly property var ejectWords: ({ eject: "Eject %1", unmount: "Unmount %1" })
     readonly property string detail: root.modelData.kind === "trash"
         ? (root.placesState.trashCount === true && root.modelData.count > 0 ? String(root.modelData.count) : "")
         : root.modelData.group === "device" && root.placesState.driveSize === true && root.modelData.size !== null
@@ -67,11 +73,10 @@ Item {
     Accessible.role: Accessible.ListItem
     Accessible.name: root.modelData.label
 
-    // A rail row is a row, so its cursor is the list row's own: a square full-bleed fill and the
-    // accent bar, per the canvas and the icon spec's "the rail rounds nothing"; see ui/Row.qml.
+    // The rail rounds nothing: a lit place is the list row's square full-bleed fill, see ui/Row.qml.
     Rectangle {
         anchors.fill: parent
-        color: root.cursor
+        color: root.lit
             ? (root.modelData.kind === "trash" ? Style.selectedAccentFill : root.focused ? Style.selectedFill : Style.normalFill)
             : "transparent"
     }
@@ -84,12 +89,25 @@ Item {
         opacity: Theme.washHover
     }
 
+    // The keyboard cursor's own frame: foreground, a hairline inside the row, clear of the rail's edge rule on its right.
     Rectangle {
         visible: root.cursor
+        width: parent.width - Theme.spacing.hairline - Theme.chromeControlInset
+        height: parent.height
+        color: "transparent"
+        border.width: Theme.spacing.hairline
+        border.color: Theme.color.foreground
+    }
+
+    Rectangle {
+        visible: root.lit
         width: Theme.spacing.hairline * 2
         height: parent.height
         color: Theme.color.accent
     }
+
+    // The TAGS section hands its rows their own swatch mark; every other row keeps the glyph.
+    property Component tagMark: null
 
     Loader {
         id: mark
@@ -98,7 +116,8 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         width: Theme.railIconSize
         height: Theme.railIconSize
-        sourceComponent: root.modelData.kind === "dropbox" ? dropboxMark : glyphMark
+        sourceComponent: root.modelData.kind === "dropbox" ? dropboxMark : root.tagMark !== null ? root.tagMark : glyphMark
+        onLoaded: if (root.tagMark !== null) item.entry = root.modelData
     }
 
     // ThemeRoles.html gives every rail label and glyph the foreground role, selected rows included:
@@ -107,7 +126,7 @@ Item {
         id: glyphMark
         Glyph {
             name: root.modelData.glyph
-            color: root.cursor && root.modelData.kind === "trash" ? Theme.color.accent : Theme.color.foreground
+            color: root.lit && root.modelData.kind === "trash" ? Theme.color.accent : Theme.color.foreground
         }
     }
 
@@ -125,20 +144,16 @@ Item {
         visible: !root.renaming
         anchors.left: mark.right
         anchors.leftMargin: Style.spacing.rowGap
-        // The numbers column bounds a label only on a row that draws a number; a row with no detail
-        // runs its label to the indicator slot, keeping one gap clear of the eject mark it may draw.
-        // Measured: a phone's label needs 126 px and the numbers column left it 110.
+        // The label ends one gap before any trailing number, square or mark.
         anchors.right: root.detail.length > 0 ? detailText.left : dot.left
-        anchors.rightMargin: root.detail.length > 0 || root.showsEject ? Style.spacing.rowGap : 0
+        anchors.rightMargin: root.keepsTrailingGap ? Style.spacing.rowGap : 0
         anchors.verticalCenter: parent.verticalCenter
         text: root.modelData.label
         color: root.modelData.error ? Theme.color.error : Theme.color.foreground
         font.family: Theme.font.family
         font.pixelSize: Theme.font.body
-        // SettingsRest rule 5: a share reads "minipc · nvme-share" and the tail is the half that names it, so a label too long for the rail loses its middle rather than the end that identifies it.
-        // Board rule 5: a rail label elides from the head, because the tail is the name that tells
-        // two places apart; the middle-elide this carried was the overseer's, and GM overruled it.
-        elide: Text.ElideLeft
+        // A label too long for the rail keeps its start and ends in an ellipsis.
+        elide: Text.ElideRight
         textFormat: Text.PlainText
     }
 
@@ -149,7 +164,7 @@ Item {
         anchors.left: mark.right
         anchors.leftMargin: Style.spacing.rowGap
         anchors.right: root.detail.length > 0 ? detailText.left : dot.left
-        anchors.rightMargin: root.detail.length > 0 || root.showsEject ? Style.spacing.rowGap : 0
+        anchors.rightMargin: root.keepsTrailingGap ? Style.spacing.rowGap : 0
         // The editor owns its height, one line box; the rail row centres it on whole pixels.
         y: Math.round((root.height - renameLoader.height) / 2)
         sourceComponent: RenameField {
@@ -168,11 +183,15 @@ Item {
     // RailEject: a mounted row draws the eject mark in place of the square.
     readonly property bool showsEject: Eject.releasable(root.modelData)
     readonly property real ejectMarkSize: Theme.font.caption
+    // The keyboard frame on the eject mark, read by tests/keyreach.qml.
+    readonly property Item markFrameItem: ejectLoader.item ? ejectLoader.item.frame : null
     // The rail's real trailing indicator slot, so ui/Ipc.qml measures this dot instead of recomputing it.
     readonly property Item indicatorSlot: dot
     readonly property Item detailItem: detailText
     readonly property Item labelItem: label
     readonly property bool indicatorVisible: root.showsDot
+    // One gap before any trailing number, square or mark; detail covers the Trash count's zero-width dot.
+    readonly property bool keepsTrailingGap: root.detail.length > 0 || dot.width > 0
 
     Text {
         id: detailText
@@ -209,7 +228,7 @@ Item {
             anchors.centerIn: parent
             width: root.dotSize
             height: root.dotSize
-            color: root.modelData.mounted ? Theme.color.executable : Theme.color.muted
+            color: root.modelData.mounted ? Theme.color.executable : Theme.color.mutedFrame
             opacity: root.modelData.mounted ? 1 : root.unmountedOpacity
         }
 
@@ -233,6 +252,7 @@ Item {
         id: ejectMark
         Item {
             property alias hit: hitBox
+            property alias frame: markFrame
             property alias hovered: hitHover.hovered
             width: root.ejectMarkSize
             height: root.ejectMarkSize
@@ -241,9 +261,18 @@ Item {
                 id: ink
                 anchors.centerIn: parent
                 name: "eject"
-                color: root.cursor || hitHover.hovered ? Theme.color.foreground : Theme.color.muted
+                color: root.cursor || hitHover.hovered || root.markFocused ? Theme.color.foreground : Theme.color.mutedFrame
                 width: root.ejectMarkSize
                 height: root.ejectMarkSize
+            }
+
+            Rectangle {
+                id: markFrame
+                anchors.fill: hitBox
+                color: "transparent"
+                border.width: Theme.spacing.hairline
+                border.color: Theme.color.foreground
+                visible: root.markFocused
             }
 
             Item {
@@ -253,7 +282,7 @@ Item {
                 x: ink.x + (ink.width - width) / 2
                 y: ink.y + (ink.height - height) / 2
                 Accessible.role: Accessible.Button
-                Accessible.name: (root.modelData.group === "device" ? "Eject " : "Unmount ") + root.modelData.label
+                Accessible.name: Format.fill(root.modelData.group === "device" ? root.ejectWords.eject : root.ejectWords.unmount, root.modelData.label)
                 Accessible.onPressAction: { if (!root.renaming) root.ejectRequested(root.index) }
                 HoverHandler { id: hitHover }
                 TapHandler {
@@ -316,8 +345,7 @@ Item {
                         startY = persistentTranslation.y
                         return
                     }
-                    var n = Math.max(1, root.lineCount)
-                    var to = TabMove.railReorder(persistentTranslation.y - startY, root.dragFrom, Theme.railRowHeight, n).to
+                    var to = TabMove.railReorder(persistentTranslation.y - startY, root.dragFrom, Theme.railRowHeight, root.lineCount).to
                     root.reorderAt(-1)
                     if (to !== root.dragFrom)
                         root.moved(to)

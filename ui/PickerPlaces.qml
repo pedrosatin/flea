@@ -19,7 +19,7 @@ Item {
     property color edge: Theme.color.surface
 
     signal chosen(string path)
-    signal networkCompleted(string requestId, string uri, bool success, string reason)
+    signal networkCompleted(string requestId, string uri, bool success, string reason, bool connectFailed)
 
     // SendPicker.html draws Recent above Home, and a save has no history to write into, so the one
     // mode that cannot use the location does not offer it.
@@ -33,7 +33,7 @@ Item {
     }]
     readonly property var placeEntries: (root.offerRecent ? root.recentRow : [])
         .concat(Places.storedEntries(Flea.Favourites.records, root.home), Places.homeEntries(root.home, root.dirsText, Icons.sidebarGlyphFor))
-    // Directive 55, GM relaying a user's report: a dialog that cannot reach a disk or a share is a
+    // Directive 55, from a user's report: a dialog that cannot reach a disk or a share is a
     // dialog that makes you type the path, so the chooser draws the window's own NETWORK and DEVICES
     // groups from the same listings. Rows only: nothing here trashes, ejects or renames.
     readonly property var entries: root.placeEntries.concat(network.entries, devices.entries, phones.entries)
@@ -81,7 +81,7 @@ Item {
         // index and modelData are required on ui/SidebarRow.qml itself, so the view fills them;
         // redeclaring them here left the delegate uninitialised and the rail drew nothing.
         delegate: Flea.SidebarRow {
-            cursor: rail.activeFocus ? index === rail.currentIndex : modelData.path === root.current
+            lit: rail.activeFocus ? index === rail.currentIndex : modelData.path === root.current
             focused: rail.activeFocus
             onActivated: function (at) { root.choose(at) }
         }
@@ -124,7 +124,7 @@ Item {
                 var path = decodeURIComponent(entry.path.substring(7))
                 if (path.charAt(0) !== "/" || path.indexOf("\0") >= 0) throw new Error("not a local file URI")
                 root.chosen(path)
-            } catch (error) { root.picker.say("This favorite has an invalid local file URI.", true) }
+            } catch (error) { root.picker.say("This favorite points to a location Flea cannot open.", true) }
         } else if (entry.path.indexOf("://") >= 0) {
             root.awaitingNetwork = true
             network.openShare(entry.path, false, entry.label, false)
@@ -168,7 +168,8 @@ Item {
     // pays the same five-second rhythm for them.
     Flea.NetworkMounts {
         id: network
-        onCompleted: function(requestId, uri, success, reason) { root.networkCompleted(requestId, uri, success, reason) }
+        savedFavourites: Flea.Favourites.records
+        onCompleted: function(requestId, uri, success, reason, connectFailed) { root.networkCompleted(requestId, uri, success, reason, connectFailed) }
         onOpened: function(path) { if (root.awaitingNetwork) root.chosen(path) }
         // A FUSE path that is a file: the chooser selects it, the way a favourite file resolves.
         onOpenFileRequested: function(path) { if (root.awaitingNetwork) root.chosen(path) }
@@ -186,6 +187,8 @@ Item {
         onOpened: function (path) { root.deviceOpened(path) }
         // A message carries no device, so it cannot end a wait: only the awaited device's own open does.
         onMessage: function (text, error) { root.picker.say(text, error) }
+        // The picker's one-line message has no detail view, so the headline stands alone.
+        onOperationResult: function (headline, detail, error) { root.picker.say(headline, error) }
     }
 
     // The phone rows the window draws, read off the same gio listing; their mount is the share leg.

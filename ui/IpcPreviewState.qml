@@ -30,6 +30,9 @@ QtObject {
             return { holding: false, capturing: false, fellBack: false, holds: 0, fallbacks: 0,
                      bursts: 0, heldFrames: 0, midFrames: 0, loadingFrames: 0, last: { ms: 0, end: "" } }
         }
+        function openState() {
+            return { revealed: false, revealedEarly: false, landed: false, lookEmptyFrames: 0, revealCaps: 0 }
+        }
         function surfaceItem() { return null }
         function mediaLoaded() { return false }
         function textShown() { return "" }
@@ -55,7 +58,7 @@ QtObject {
     function columnMarkdownView(): string {
         var column = root.pane.previewColumnItem
         var markdown = column ? column.markdown : null
-        return column && column.visible && markdown && markdown.active && markdown.contentReady ? markdown.view : ""
+        return column && column.visible && markdown && markdown.active && markdown.contentReady ? markdown.shownView : ""
     }
     function previewKind(): string { return root.look.kind }
     function previewState(): string { return root.look.status }
@@ -74,6 +77,18 @@ QtObject {
         }
         return out.join(",")
     }
+    // Sample output: "fence:rust", "list[run,fence]"; a fence shows its info tag and a quote or list its nested parts in brackets.
+    function kindOf(block: var): string {
+        var inner = block.parts === undefined ? [] : block.type === "list" ? [].concat.apply([], block.parts.filter(Boolean)) : block.parts
+        return inner.length > 0 ? block.type + "[" + inner.map(function (part) { return root.kindOf(part) }).join(",") + "]"
+            : block.type === "fence" && block.info ? "fence:" + block.info : block.type
+    }
+    // The top-level block kinds a Markdown pane built, as a JSON array; "" until its document is ready. column picks the preview column over Quick Look.
+    function previewBlockKinds(column: bool): string {
+        var c = root.pane.previewColumnItem
+        var m = column ? (c && c.visible ? c.markdown : null) : root.look.markdownItem
+        return m && m.contentReady && m.blockList !== undefined ? JSON.stringify(m.blockList.map(function (block) { return root.kindOf(block) })) : ""
+    }
     function previewPosition(): int { return root.look.position }
     function previewDuration(): int { return root.look.duration }
     // Fix round 1: what the strip actually draws, not a re-derived guess at its visible: expression.
@@ -90,10 +105,11 @@ QtObject {
             toolbar: overlay ? "" : root.fleaWindow.rectOf(p.pdfToolbarItem),
             zoom: overlay ? p.zoom : p.pdfZoom, scrollY: p.pdfScrollY, focused: p.activeFocus, control: p.pdfControlIndex,
             controls: p.pdfControls.map(function (control) { return { name: control.accessName, enabled: control.enabled,
-                visible: control.visible, centre: root.fleaWindow.centreOf(control) } }) })
+                visible: control.visible, centre: root.fleaWindow.centreOf(control),
+                hovered: control.hovered, pressed: control.pressed, ring: control.ringItem.visible } }) })
     }
     function previewExpanded(): string { var p = root.look.pdfItem; return p ? String(p.expanded) : "" }
-    function previewSwapState(): string { return JSON.stringify({ column: root.columns ? root.columns.swapState() : null, look: root.look.swapState(), lookVisible: root.look.visible }) }
+    function previewSwapState(): string { return JSON.stringify({ column: root.columns ? root.columns.swapState() : null, look: root.look.swapState(), lookOpen: root.look.openState(), lookVisible: root.look.visible }) }
     function previewSurfaceRect(): string { return root.fleaWindow.rectOf(root.look.surfaceItem()) }
     function previewPictureRect(): string { var p = root.look; if (!p) return ""; if (p.isImage) { var im = p.surfaceItem(); return im ? root.fleaWindow.rectOf(im.pictureItem) : "" } if (p.isMedia) { var me = p.surfaceItem(); return me ? root.fleaWindow.rectOf(me.contentItem) : "" } return "" }
     function previewMediaLoaded(): bool { return root.look.mediaLoaded() }

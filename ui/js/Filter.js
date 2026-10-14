@@ -5,6 +5,15 @@
 .import "Match.js" as Match
 .import "Thumbs.js" as Thumbs
 
+// The strip's two sentences and the no-match tile's heading, each filled by Format.fill.
+var WORDS = {
+    noMatchOne: "No match among 1 item",
+    noMatchMany: "No match among %1 items",
+    shown: "%1 of %2 shown",
+    shownOfFolder: "%1 of %2 shown · of %3 in this folder",
+    nothingMatched: "Nothing matched %1"
+}
+
 // The filter narrows the listing already on screen: no walk, no round trip, and every row it keeps
 // is one the backend has already sent. ui/js/Search.js is its bigger sibling, which walks the
 // subtree and replaces the listing; the design canvas draws the two as different things and this
@@ -57,14 +66,16 @@ function summary(list, loaded, total) {
     if (list === null) {
         return ""
     }
-    var head = Format.count(list.length) + " of " + Format.count(loaded) + " shown"
-    return total > loaded ? head + " · of " + Format.count(total) + " in this folder" : head
+    if (total > loaded) {
+        return Format.fill(WORDS.shownOfFolder, Format.count(list.length), Format.count(loaded), Format.count(total))
+    }
+    return Format.fill(WORDS.shown, Format.count(list.length), Format.count(loaded))
 }
 
 // States' no-match tile: the pane names the query back and says how many rows it tested, because
 // the query is up in a strip the reader may have looked away from.
 function noMatch(total) {
-    return total === 1 ? "1 row here, and not it" : Format.count(total) + " rows here, none of them"
+    return total === 1 ? WORDS.noMatchOne : Format.fill(WORDS.noMatchMany, Format.count(total))
 }
 
 // The rows drawn between two ends, which is not the range between them: a plain index range would
@@ -171,11 +182,13 @@ function close(pane) {
 function apply(pane, query) {
     var next = shown(pane.rows, pane.held, query)
     prune(pane, next)
+    if (query !== pane.filterQuery) pane.filterKeyAt = Date.now()
     pane.filterQuery = query
+    if (query.length > 0) pane.filterNarrowedAt = Date.now()
     // A cursor the filter just hid takes the first row still standing, so it is never off screen.
     if (next !== null && next.length > 0 && viewOf(next, pane.cursorIndex) < 0) {
         pane.cursorIndex = next[0]
-        pane.cursorSeq = (pane.cursorSeq || 0) + 1
+        pane.cursorSeq += 1
         pane.showRow(0)
     }
 }
@@ -215,7 +228,7 @@ function setCursorView(pane, view, context) {
     var to = Math.max(0, Math.min(pane.shownTotal - 1, view))
     pane.cursorIndex = at(pane.shown, to)
     // Every cursor setter bumps cursorSeq, so a plain move ends a Shift gesture.
-    pane.cursorSeq = (pane.cursorSeq || 0) + 1
+    pane.cursorSeq += 1
     pane.showRow(to, context)
 }
 
@@ -229,14 +242,28 @@ function clampCursor(pane, first, last) {
     var was = viewOf(pane.shown, pane.cursorIndex)
     var to = Math.max(first, Math.min(last, was))
     if (to !== was) {
+        var held = pulledFrom(pane)
+        var from = held >= 0 ? held : pane.cursorIndex
         pane.cursorIndex = at(pane.shown, to)
         pane.cursorSeq = (pane.cursorSeq || 0) + 1
+        pane.cursorPulled = { from: from, to: pane.cursorIndex, seq: pane.cursorSeq, version: pane.selectionVersion }
     }
+}
+
+// The row the cursor held before the wheel pulled it, while no move, mark or new listing came since (issue 286); else -1.
+function pulledFrom(pane) {
+    var pull = pane.cursorPulled
+    var current = pull && pull.seq === (pane.cursorSeq || 0) && pull.to === pane.cursorIndex
+        && pull.version === pane.selectionVersion
+    return current ? pull.from : -1
 }
 
 // The query line's own keys while it has the caret, the shape ui/js/Search.js typeKey uses for the
 // search's. Enter commits, escape abandons, backspace shortens, every printable character narrows.
 function typeKey(event, pane) {
+    // Ctrl+V and Shift+Insert type the clipboard's first line as one narrowing (issue 287).
+    if (Input.isPasteKey(event))
+        return Input.pasteInto(pane, function (text) { typed(pane, text) })
     if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
         commit(pane)
         return true

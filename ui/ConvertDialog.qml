@@ -2,6 +2,7 @@ import QtQuick
 import qs.Commons
 import "." as Flea
 import "js/Convert.js" as Convert
+import "js/Format.js" as Format
 
 // The one popup in the whole design. Every other operation answers in the status bar; this one asks two questions first, so it is the exception the operations design names rather than a pattern.
 Item {
@@ -29,9 +30,13 @@ Item {
     property string format: ""
     property bool strip: false
     property int cursor: 0
+    // Where a row or the ground last saw the pointer, -1 since opening, so a row built under a resting pointer never takes the cursor.
+    property point pointerGlobal: Qt.point(-1, -1)
 
     signal accepted(var source, string format, bool strip, int requestId)
 
+    // The card title, filled by Format.fill.
+    readonly property string titleWord: "Convert %1"
     readonly property var formats: Convert.FORMATS
     readonly property string outputPath: root.source ? Convert.destination(root.source, root.format) : ""
     readonly property bool editable: !root.busy && !root.unavailable
@@ -54,8 +59,13 @@ Item {
     readonly property var cardItem: card
 
     anchors.fill: parent
-    visible: root.opened
+    visible: root.opened || root.opacity > 0
+    // Closed means no input, even while the fade-out is still drawn.
+    enabled: root.opened
+    opacity: 0
     z: 2
+
+    Flea.Reveal { target: root; shown: root.opened; lift: card }
 
     // A codec this box converts to but the canvas does not name still needs a cap, so upper-casing
     // the extension is the fallback rather than an empty row.
@@ -72,6 +82,7 @@ Item {
         root.format = Convert.defaultFormat(root.name)
         root.strip = false
         root.cursor = root.formats.indexOf(root.format)
+        root.pointerGlobal = Qt.point(-1, -1)
         root.focusHolder = holder.listArea
         root.errorText = ""
         root.collision = false
@@ -168,8 +179,8 @@ Item {
             root.focusPart = 2
             cancelButton.forceActiveFocus()
             root.errorText = pending
-                ? "Backend stopped; conversion outcome unknown. Check the output."
-                : "Backend stopped; reopen Flea to convert."
+                ? "Flea stopped responding, so the conversion may not have finished. Check the converted file."
+                : "Flea stopped responding. Reopen Flea, then convert again."
         }
     }
 
@@ -180,9 +191,12 @@ Item {
         opacity: 0.5
 
         MouseArea {
+            id: ground
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
+            onEntered: root.pointerGlobal = ground.mapToItem(null, ground.mouseX, ground.mouseY)
+            onPositionChanged: function (mouse) { root.pointerGlobal = ground.mapToItem(null, mouse.x, mouse.y) }
             onClicked: root.close()
             onWheel: function (wheel) { wheel.accepted = true }
         }
@@ -197,31 +211,31 @@ Item {
         height: Theme.cardSpan(body.wanted + 2 * Theme.spacing.rowPaddingX, root.height - 2 * root.clampMargin)
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         radius: Style.cornerRadius
 
         // The strip toggle's handler takes a passive grab, so without this sink its press fell
         // through the card to the ground below, which closed the dialog on release.
         MouseArea {
+            id: cardSink
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
+            onEntered: root.pointerGlobal = cardSink.mapToItem(null, cardSink.mouseX, cardSink.mouseY)
+            onPositionChanged: function (mouse) { root.pointerGlobal = cardSink.mapToItem(null, mouse.x, mouse.y) }
             onClicked: {}
             onWheel: function (wheel) { wheel.accepted = true }
         }
 
-        Flea.CardScroll {
+        Flea.CardFrame {
             id: body
-            bleedY: Theme.ringClearance
+            bleedY: Theme.focusClearance
             anchors.fill: parent
-            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.ringClearance
-            anchors.bottomMargin: Theme.spacing.rowPaddingX - Theme.ringClearance
-
-        Column {
-            width: parent.width
+            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.focusClearance
+            anchors.bottomMargin: Theme.spacing.rowPaddingX - Theme.focusClearance
             spacing: Theme.spacing.gap / 2
 
-            Item {
+            title: Item {
                 id: title
                 width: parent.width
                 height: header.implicitHeight + Theme.spacing.gap
@@ -231,7 +245,7 @@ Item {
                     anchors.left: parent.left
                     anchors.right: parent.right
                     anchors.margins: Theme.spacing.rowPaddingX
-                    text: "Convert " + root.name
+                    text: Format.fill(root.titleWord, root.name)
                     elide: Text.ElideMiddle
                 }
 
@@ -239,131 +253,12 @@ Item {
                     anchors.bottom: parent.bottom
                     width: parent.width
                     height: Theme.spacing.hairline
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                     opacity: 0.4
                 }
             }
 
-            Repeater {
-                id: formatRows
-                model: root.formats
-                delegate: Flea.MenuRow {
-                    required property string modelData
-                    required property int index
-                    width: body.holderWidth
-                    enabled: root.editable
-                    entry: ({ label: root.formatLabel(modelData), action: modelData, glyph: "image",
-                        labelColor: Theme.color.foreground, disabled: !root.editable })
-                    picked: root.format === modelData
-                    current: root.focusPart === 0 && root.cursor === index
-                    Accessible.role: Accessible.RadioButton
-                    Accessible.name: root.formatLabel(modelData)
-                    Accessible.checkable: true
-                    Accessible.checked: root.format === modelData
-                    Keys.forwardTo: [keys]
-                    Accessible.onPressAction: root.chooseFormat(index)
-                    onPointerMoved: { root.focusPart = 0; root.cursor = index }
-                    onActivated: root.chooseFormat(index)
-                }
-            }
-
-            Rectangle {
-                width: parent.width
-                height: Theme.spacing.hairline
-                color: Theme.color.muted
-                opacity: 0.4
-            }
-
-            // Drawn to the cut: a 24-grid square with the check glyph inside it when it is ticked.
-            Item {
-                id: metadata
-                width: parent.width
-                height: Theme.rowHeight
-                enabled: root.editable
-                Accessible.role: Accessible.CheckBox
-                Accessible.name: "Remove metadata"
-                Accessible.checkable: true
-                Accessible.checked: root.strip
-                Keys.forwardTo: [keys]
-                Accessible.onPressAction: if (root.editable) root.strip = !root.strip
-
-                Item {
-                    id: box
-                    anchors.left: parent.left
-                    anchors.leftMargin: Theme.spacing.rowPaddingX
-                    anchors.verticalCenter: parent.verticalCenter
-                    width: ruleBox.implicitWidth
-                    height: ruleBox.implicitHeight
-
-                    Flea.CheckBox {
-                        id: ruleBox
-                        value: root.strip ? "on" : "off"
-                        focused: root.focusPart === 1
-                        available: root.editable
-                    }
-                }
-
-                Text {
-                    anchors.left: box.right
-                    anchors.leftMargin: Theme.spacing.gap
-                    anchors.verticalCenter: parent.verticalCenter
-                    // Unchecked by default: a user converting a photo does not expect metadata
-                    // silently dropped unless they asked for it.
-                    text: "Remove metadata"
-                    color: Theme.color.foreground
-                    font.family: Theme.font.family
-                    font.pixelSize: Theme.font.body
-                    textFormat: Text.PlainText
-                }
-
-                TapHandler {
-                    acceptedButtons: Qt.LeftButton
-                    gesturePolicy: TapHandler.ReleaseWithinBounds
-                    onTapped: if (root.editable) { root.focusPart = 1; root.strip = !root.strip; metadata.forceActiveFocus() }
-                }
-            }
-
-            Text {
-                id: output
-                x: Theme.spacing.rowPaddingX
-                width: parent.width - 2 * Theme.spacing.rowPaddingX
-                topPadding: 2 * Theme.spacing.hairline
-                bottomPadding: 2 * Theme.spacing.hairline
-                text: "Output: " + root.outputPath
-                color: Theme.color.foreground
-                font.family: Theme.font.family
-                font.pixelSize: Theme.font.caption
-                textFormat: Text.PlainText
-                wrapMode: Text.WrapAnywhere
-            }
-
-            Text {
-                x: Theme.spacing.rowPaddingX
-                width: parent.width - 2 * Theme.spacing.rowPaddingX
-                visible: root.errorText.length > 0
-                topPadding: 2 * Theme.spacing.hairline
-                bottomPadding: 2 * Theme.spacing.hairline
-                text: root.errorText
-                color: Theme.color.error
-                font { family: Theme.font.family; pixelSize: Theme.font.caption }
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-            }
-
-            Text {
-                x: Theme.spacing.rowPaddingX
-                width: parent.width - 2 * Theme.spacing.rowPaddingX
-                topPadding: 2 * Theme.spacing.hairline
-                bottomPadding: 2 * Theme.spacing.hairline
-                visible: root.collision
-                text: "Choose another format."
-                color: Theme.color.foreground
-                font { family: Theme.font.family; pixelSize: Theme.font.caption }
-                textFormat: Text.PlainText
-                wrapMode: Text.Wrap
-            }
-
-            Item {
+            buttons: Item {
                 width: parent.width
                 height: Theme.spacing.gap + Math.max(cancelButton.implicitHeight, convertButton.implicitHeight)
                 Row {
@@ -384,7 +279,7 @@ Item {
 
                     Flea.DialogButton {
                         id: convertButton
-                        label: root.busy ? "Converting..." : "Convert"
+                        label: "Convert"
                         primary: true
                         focused: root.focusPart === 3
                         available: root.canConvert
@@ -394,7 +289,133 @@ Item {
                     }
                 }
             }
-        }
+
+            Column {
+                width: parent.width
+                spacing: Theme.spacing.gap / 2
+
+                Repeater {
+                    id: formatRows
+                    model: root.formats
+                    delegate: Flea.MenuRow {
+                        required property string modelData
+                        required property int index
+                        width: body.holderWidth
+                        enabled: root.editable
+                        entry: ({ label: root.formatLabel(modelData), action: modelData, glyph: "image",
+                            labelColor: Theme.color.foreground, disabled: !root.editable })
+                        picked: root.format === modelData
+                        current: root.focusPart === 0 && root.cursor === index
+                        Accessible.role: Accessible.RadioButton
+                        Accessible.name: root.formatLabel(modelData)
+                        Accessible.checkable: true
+                        Accessible.checked: root.format === modelData
+                        Keys.forwardTo: [keys]
+                        Accessible.onPressAction: root.chooseFormat(index)
+                        lastPointerGlobal: root.pointerGlobal
+                        onPointerSeen: function (at) { root.pointerGlobal = at }
+                        onPointerMoved: { root.focusPart = 0; root.cursor = index }
+                        onActivated: root.chooseFormat(index)
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: Theme.spacing.hairline
+                    color: Theme.color.mutedFrame
+                    opacity: 0.4
+                }
+
+                // The rule's checkbox row; Space and a tap toggle it.
+                Item {
+                    id: metadata
+                    width: parent.width
+                    height: Theme.rowHeight
+                    enabled: root.editable
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: "Remove metadata"
+                    Accessible.checkable: true
+                    Accessible.checked: root.strip
+                    Keys.forwardTo: [keys]
+                    Accessible.onPressAction: if (root.editable) root.strip = !root.strip
+
+                    Item {
+                        id: box
+                        anchors.left: parent.left
+                        anchors.leftMargin: Theme.spacing.rowPaddingX
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: ruleBox.implicitWidth
+                        height: ruleBox.implicitHeight
+
+                        Flea.CheckBox {
+                            id: ruleBox
+                            value: root.strip ? "on" : "off"
+                            focused: root.focusPart === 1
+                            available: root.editable
+                        }
+                    }
+
+                    Text {
+                        anchors.left: box.right
+                        anchors.leftMargin: Theme.spacing.gap
+                        anchors.verticalCenter: parent.verticalCenter
+                        // Unchecked by default: a user converting a photo does not expect metadata
+                        // silently dropped unless they asked for it.
+                        text: "Remove metadata"
+                        color: Theme.color.foreground
+                        font.family: Theme.font.family
+                        font.pixelSize: Theme.font.body
+                        textFormat: Text.PlainText
+                    }
+
+                    TapHandler {
+                        acceptedButtons: Qt.LeftButton
+                        gesturePolicy: TapHandler.ReleaseWithinBounds
+                        onTapped: if (root.editable) { root.focusPart = 1; root.strip = !root.strip; metadata.forceActiveFocus() }
+                    }
+                }
+
+                Text {
+                    id: output
+                    x: Theme.spacing.rowPaddingX
+                    width: parent.width - 2 * Theme.spacing.rowPaddingX
+                    topPadding: 2 * Theme.spacing.hairline
+                    bottomPadding: 2 * Theme.spacing.hairline
+                    text: "Output: " + root.outputPath
+                    color: Theme.color.foreground
+                    font.family: Theme.font.family
+                    font.pixelSize: Theme.font.caption
+                    textFormat: Text.PlainText
+                    wrapMode: Text.WrapAnywhere
+                }
+
+                // The status slot is always laid out, two caption lines tall (the network slot's rowHeight) inside its padding, so rest, busy and a short error keep one card height; only a longer error grows it.
+                Text {
+                    x: Theme.spacing.rowPaddingX
+                    width: parent.width - 2 * Theme.spacing.rowPaddingX
+                    height: Math.max(Theme.rowHeight + topPadding + bottomPadding, implicitHeight)
+                    topPadding: 2 * Theme.spacing.hairline
+                    bottomPadding: 2 * Theme.spacing.hairline
+                    text: root.busy ? "Converting…" : root.errorText
+                    color: root.busy ? Theme.color.muted : Theme.color.errorOnSurface
+                    font { family: Theme.font.family; pixelSize: Theme.font.caption }
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                }
+
+                Text {
+                    x: Theme.spacing.rowPaddingX
+                    width: parent.width - 2 * Theme.spacing.rowPaddingX
+                    topPadding: 2 * Theme.spacing.hairline
+                    bottomPadding: 2 * Theme.spacing.hairline
+                    visible: root.collision
+                    text: "Choose another format."
+                    color: Theme.color.foreground
+                    font { family: Theme.font.family; pixelSize: Theme.font.caption }
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                }
+            }
         }
     }
 

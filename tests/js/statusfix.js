@@ -15,7 +15,7 @@ function run(check) {
     var look = sourceText("../../ui/Preview.qml")
     var image = sourceText("../../ui/PreviewImage.qml")
     check("Spinner builds only while busy", bar.indexOf("active: root.busy") >= 0, true)
-    check("undo texts stay empty unless split", bar.indexOf('root.undoSplit ? "z undoes" : ""') >= 0, true)
+    check("undo texts stay empty unless split", bar.indexOf('root.undoSplit ? Status.hintKey(Status.undoHint()) : ""') >= 0, true)
     check("hint reserves by advance", bar.indexOf("hintWidth: hintMetrics.advanceWidth") >= 0, true)
     check("esc keeps its order ahead of z", bar.indexOf("id: secondary") < bar.indexOf("id: undoDot"), true)
     check("click refuses through the shared gate", bar.indexOf("Focus.canUndo(root.pane") >= 0, true)
@@ -25,7 +25,7 @@ function run(check) {
           && sourceText("../../ui/js/Focus.js").indexOf("Search.TYPING") >= 0, true)
     check("busy mark sizes from the chrome token", bar.indexOf("Theme.chromeMarkSize") >= 0, true)
     check("Quick Look ground takes the wheel", look.indexOf("onWheel") >= 0, true)
-    check("afterAnimating stays live until ready lands after a release", swap.indexOf("(root.capturing || root.holding || root.dropping || !root.ready) ? root.Window.window : null") >= 0, true)
+    check("afterAnimating stays live until ready lands after a release", swap.indexOf("(root.capturing || root.holding || !root.ready) ? root.Window.window : null") >= 0, true)
     check("hold sink keeps Back for the window", swap.indexOf("Qt.AllButtons") < 0, true)
     check("Quick Look asks image meta only with a thumb held",
         look.indexOf('root.imageRow = root.isImage && (newThumb || "").length > 0') >= 0, true)

@@ -25,6 +25,7 @@ Item {
     property bool taildropInstalled: false
     property var localSend: ({ installed: false, peers: [], checking: false })
     property string taildropReason: ""
+    property string taildropCode: ""
     property bool providersRefreshing: false
     property bool refreshOwed: false
     property var lastProviderAnswer: null
@@ -32,12 +33,17 @@ Item {
     property var archiveFormats: []
     property bool canConvert: false
     property bool canExtract: false
+    // The cursor row's own name, which is what tells a disk image (lists only) from an archive.
+    property string archiveName: ""
     property bool clipboardAvailable: false
     property bool clipboardWatchFailed: false
     // Whether the cursor row is a file, an archive, an image; all decided client-side. Only a file row takes send peers.
     property bool rowIsFile: false
     property bool rowIsArchive: false
     property bool rowIsImage: false
+    // Flash to drive reads the name rather than the icon, and a zip's one member once named.
+    property string rowName: ""
+    property string flashZipMember: ""
     // MenuAdditions040: Show original is visible but only on a symlink.
     property bool rowIsSymlink: false
     // MenuAdditions040 callout 10: the two-byte shebang read of the cursor row at menu open.
@@ -55,6 +61,7 @@ Item {
     property string dropboxPath: ""
     property bool dropboxInstalled: false
     property string dropboxReason: ""
+    property string dropboxCode: ""
     // A row already inside the account directory offers a share link instead of another move.
     property bool rowInDropbox: false
     // False on a listing's empty space, where Menus.html's background column is what opens instead.
@@ -71,7 +78,9 @@ Item {
     property string lockedPath: ""
     property int lockedMode: 0
     readonly property bool forLocked: root.lockedPath.length > 0
-    property string selectionIdentity: ""
+    // The owner's menuSelectionIdentity(), read at open and at a choice only; none, as on the rail, reads "".
+    property var identitySource: null
+    function selectionIdentity() { return root.identitySource ? root.identitySource.menuSelectionIdentity() : "" }
     property string openedIdentity: ""
     // The owner intersects the live monitor work area with this application's viewport.
     property rect workArea: Qt.rect(0, 0, root.width, root.height)
@@ -112,13 +121,26 @@ Item {
     // A hidden row still opens its flyout from the action.
     property string loneFlyoutAction: ""
     readonly property bool submenuOpen: root.openSubmenuRow >= 0 || root.loneFlyoutAction.length > 0
-    onSubmenuOpenChanged: if (!root.submenuOpen) MenuRefresh.pressChanged(root, false)
+    // What a closing flyout keeps drawing while it fades out; ui/FlyoutFade.qml holds them at their last open values.
+    property var heldRows: []
+    property real heldOffset: 0
+    property string heldAction: ""
+    property var flyoutFade: null
+    function submenuAction() {
+        return root.loneFlyoutAction.length > 0 ? root.loneFlyoutAction
+             : root.entries[root.openSubmenuRow] ? root.entries[root.openSubmenuRow].action : ""
+    }
+    onSubmenuOpenChanged: if (!root.submenuOpen) MenuRefresh.pressChanged(root, false); else root.buildFlyoutFade()
+    // Built by the first flyout, so a menu that never opens one holds neither the fade nor the held values.
+    function buildFlyoutFade() {
+        if (root.flyoutFade === null)
+            root.flyoutFade = Qt.createComponent("FlyoutFade.qml").createObject(root, { menu: root })
+    }
     // The glyph every open flyout row draws, read back so a test can name it without OCR.
     function submenuGlyphs() {
         if (!root.submenuOpen)
             return ""
-        var mark = Menu.submenuGlyph(root.loneFlyoutAction.length > 0
-            ? root.loneFlyoutAction : root.entries[root.openSubmenuRow].action)
+        var mark = Menu.submenuGlyph(root.submenuAction())
         var out = []
         for (var i = 0; i < root.submenuEntries.length; i++) {
             // What the row draws, not what the flyout defaults to: an Open with row carries its own
@@ -138,14 +160,17 @@ Item {
 
     // The row list this menu currently offers; a test reads this back through shell.qml's IPC.
     property var entries: []
-    // True while a new list's rows build, so the card's fit reads none then and reads them once when they stand.
+    // While a card's rows build its fit reads none, then reads them once when they stand; a closed flyout holds nothing.
     property bool rowsBuilding: false
-    function setEntries(next) { root.rowsBuilding = true; try { root.entries = next } finally { root.rowsBuilding = false } }
+    property bool submenuBuilding: false
+    function setEntries(next, flyoutRow) { try { root.rowsBuilding = true; root.submenuBuilding = root.submenuOpen; root.entries = next; if (flyoutRow !== undefined) root.openSubmenuRow = flyoutRow } finally { root.rowsBuilding = false; root.submenuBuilding = false } }
     property bool canTrash: true
     // False in a read-only folder, off the listing's own w flag; true until the pane knows better.
     property bool dirWritable: true
     // A filesystem that holds no links offers no Paste as rows; true until the pane knows better.
     property bool canLink: true
+    // The Tags flyout's rows while a menu is live; null where tags cannot be stored, which drops the row.
+    property var tagSubmenu: null
     // Issue 179: the background menu's Sort by flyout offers its forget row only for this folder.
     property bool hasFolderSort: false
 
@@ -169,13 +194,15 @@ Item {
             rowInDropbox: root.rowInDropbox,
             dropboxPath: view.dropboxPath,
             dropboxInstalled: root.dropboxInstalled,
-            dropboxReason: root.dropboxReason,
+            dropboxReason: root.dropboxReason, dropboxCode: root.dropboxCode,
             taildropPeers: root.rowIsFile ? view.taildropPeers : [],
             taildropInstalled: root.taildropInstalled,
-            taildropReason: root.taildropReason,
+            taildropReason: root.taildropReason, taildropCode: root.taildropCode,
             taildropRefreshing: view.taildropRefreshing, dropboxRefreshing: view.dropboxRefreshing,
             archiveFormats: root.archiveFormats,
+            rowIsFile: root.rowIsFile,
             rowIsArchive: root.rowIsArchive,
+            archiveName: root.archiveName,
             rowIsImage: root.rowIsImage,
             canConvert: root.canConvert,
             canExtract: root.canExtract,
@@ -183,11 +210,13 @@ Item {
             clipboardWatchFailed: root.clipboardWatchFailed,
             canTrash: root.canTrash,
             canLink: root.canLink,
+            tagSubmenu: root.tagSubmenu,
             dirWritable: root.dirWritable,
             openWithApps: root.openWithApps,
             openWithLoaded: root.openWithLoaded,
             rowMode: root.rowMode, selectionCount: root.selectionCount,
             rowIsSymlink: root.rowIsSymlink, selectionModes: root.selectionModes,
+            rowName: root.rowName, flashZipMember: root.flashZipMember,
             hasShebang: root.rowHasShebang, cursorIsTarget: root.cursorIsTarget,
             scripts: Flea.Scripts.entries, localSendInstalled: root.localSend.installed, localSendPeers: root.localSend.peers, localSendChecking: view.localSendChecking,
             // The Menus settings section's stored set; ui/js/Menu.js applyHidden is what reads it.
@@ -221,8 +250,17 @@ Item {
     }
 
     anchors.fill: parent
-    visible: root.opened
+    // The frames fade out after opened flips (ui/Reveal.qml), so the menu stays drawn until both are gone and takes no input meanwhile.
+    visible: root.opened || frame.opacity > 0 || flyout.opacity > 0
+    enabled: root.opened
     z: 1
+
+    // Built by the first open, so a pane that never opens a menu holds no animation (the first frame's cost).
+    property var fade: null
+    onOpenedChanged: {
+        if (root.opened && root.fade === null)
+            root.fade = Qt.createComponent("Reveal.qml").createObject(root, { target: frame, shown: Qt.binding(function () { return root.opened }) })
+    }
 
     // Takes a point in scene coordinates and keeps the whole menu inside the pane it belongs to.
     function openAt(scenePoint) {
@@ -294,7 +332,7 @@ Item {
 
     // The scene point any row or the ground last saw, so a row tells a moving pointer from one it arrived under.
     property point pointerGlobal: Qt.point(-1, -1)
-    // Placing to its first frame's afterAnimating: Qt hovers what that frame shows, kept rows too, so a "move" then is the rest point.
+    // Placing to its first frame's afterAnimating: Qt hovers what that frame shows, kept rows too, so a "move" then is the rest point; Qt 6.12 can hover later, which ui/MenuRow.qml reads as rest.
     property bool pointerSettling: false
     Connections {
         target: root.pointerSettling ? root.Window.window : null
@@ -314,7 +352,7 @@ Item {
         root.placeX = point.x
         root.placeY = point.y
         root.setEntries(root.buildEntries())
-        root.openedIdentity = root.selectionIdentity
+        root.openedIdentity = root.selectionIdentity()
         root.loneFlyoutAction = ""
         scroll.contentY = 0
         scroll.resetSteps()
@@ -370,21 +408,23 @@ Item {
         var entry = root.entries[root.openSubmenuRow]
         var action = root.loneFlyoutAction || (entry ? entry.action : "")
         if (root.loneFlyoutAction.length > 0) {
-            var lonePick = Menu.loneChoice(root.loneFlyoutAction, id, root.forRail, root.forHeader, root.hasRow, root.openedIdentity, root.selectionIdentity)
+            var lonePick = Menu.loneChoice(root.loneFlyoutAction, id, root.forRail, root.forHeader, root.hasRow, root.openedIdentity, root.selectionIdentity())
             if (lonePick.kind !== "fire") {
                 root.refuseLone(lonePick.kind)
                 return
             }
         }
         if (!action || !root.validateChoice(action, id)) return
-        root.close()
+        // A Tags choice changes the boxes this flyout draws, so the menu stays up and the answer redraws them in place.
+        if (action !== "tags") root.close()
         root.chosen(action + ":" + id)
     }
 
     function openSubmenu(index) {
         root.loneFlyoutAction = ""
         if (!Menu.hasSubmenu(root.entries[index]) || root.entries[index].disabled === true) return
-        root.openSubmenuRow = index
+        root.submenuBuilding = true
+        try { root.openSubmenuRow = index } finally { root.submenuBuilding = false }
         root.submenuCursor = 0
         subScroll.contentY = 0
     }
@@ -406,8 +446,8 @@ Item {
             return true
         }
         if (pick.kind === "lone") {
-            root.openSubmenuRow = -1
-            root.loneFlyoutAction = action
+            root.submenuBuilding = true
+            try { root.openSubmenuRow = -1; root.loneFlyoutAction = action } finally { root.submenuBuilding = false }
             root.submenuCursor = 0
             subScroll.contentY = 0
             return true
@@ -424,7 +464,7 @@ Item {
     function refreshProviderRows() {
         if (!root.opened || root.forRail || root.forHeader || root.forLocked) return
         // Replacing a pressed delegate destroys its grab before release can activate it.
-        if (MenuRefresh.anyPressed(menuRows, subRows)) {
+        if (MenuRefresh.anyPressed(menuRows, root.submenuOpen ? subRows : null)) {
             root.refreshOwed = true
             return
         }
@@ -432,12 +472,7 @@ Item {
         var next = root.buildEntries()
         // An answer that changed nothing drawn leaves every row standing: no model reset, no cursor move.
         if (MenuRefresh.unchanged(root.entries, next)) return
-        var selection = MenuRefresh.refreshedCursor(root.entries, next, root.cursor, root.openSubmenuRow, root.submenuCursor)
-        root.setEntries(next)
-        root.cursor = selection.cursor
-        root.openSubmenuRow = selection.submenuRow
-        root.submenuCursor = selection.submenuCursor
-        Qt.callLater(function() { if (root.opened) scroll.reveal(menuRows.itemAt(root.cursor)) })
+        MenuRefresh.apply(root, next)
     }
     // A finished refresh: its answer is what later opens draw while their own refresh runs behind them, see ui/js/MenuRefresh.js.
     function providersSettled() {
@@ -454,7 +489,7 @@ Item {
     // Rebuild only to validate; rows stay fixed while the menu is open under the pointer.
     function validateChoice(action, subId, includeHidden) {
         var identityChanged = !root.forRail && !root.forHeader && root.hasRow
-                              && root.openedIdentity !== root.selectionIdentity
+                              && root.openedIdentity !== root.selectionIdentity()
         root.preparing = true
         var live = root.buildEntries(subId && Menu.flyoutEntries(action).length ? action : "", includeHidden)
         root.preparing = false
@@ -507,6 +542,7 @@ Item {
 
     Rectangle {
         id: frame
+        opacity: 0
         // Theme.menuWidth, or the widest row's own width when a label and its hint need more, never past the work area.
         width: Math.max(0, Math.min(root.workArea.width, root.rowsBuilding ? Theme.menuWidth : Math.max(Theme.menuWidth, root.widestRow(rows))))
         onWidthChanged: if (root.opened) root.clampFrame()
@@ -517,7 +553,7 @@ Item {
         onHeightChanged: if (root.opened) root.clampFrame()
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         // Mirrors hyprland decoration:rounding, same as NetworkDialog; 0 on a stock box stays square.
         radius: Style.cornerRadius
 
@@ -526,11 +562,12 @@ Item {
 
         Flea.CardScroll {
             id: scroll
-            // A menu steps the highlight, never pixel scrolls: one row a notch, one row per
-            // row height of gained touchpad travel, and reveal() follows. No bar, no lane.
+            // A menu steps the highlight, never pixel scrolls: one row a notch, one row per row height of touchpad travel. No bar, no lane.
             highlightSteps: true
             stepBy: function (delta) { root.stepMain(delta) }
             revealClearY: root.fadeReach
+            // A rebuilt model keeps the flyout's row, else the cursor's, in view.
+            onContentHeightChanged: if (root.opened) scroll.reveal(menuRows.itemAt(root.openSubmenuRow >= 0 ? root.openSubmenuRow : root.cursor))
             anchors.fill: parent
             anchors.topMargin: Theme.spacing.rowPaddingY
             anchors.bottomMargin: Theme.spacing.rowPaddingY
@@ -582,21 +619,25 @@ Item {
         }
     }
 
-    // The flyout: a second frame beside whichever row opened it, only while one has.
+    // The flyout: a second frame beside whichever row opened it, only while one has, at least its parent's width.
     Rectangle {
         id: flyout
-        visible: root.submenuOpen
+        visible: root.submenuOpen || flyout.opacity > 0
+        enabled: root.submenuOpen
+        opacity: 0
         x: frame.x + frame.width + width <= root.workArea.x + root.workArea.width
            ? frame.x + frame.width : Math.max(root.workArea.x, frame.x - width)
         // peers.y already carries the inset, so the flyout frame itself stays on the row grid.
         y: Math.max(root.workArea.y + root.workAreaInset,
-                    Math.min(frame.y + root.submenuOffset(), root.workArea.y + root.workArea.height - root.workAreaInset - height))
-        width: Math.max(0, Math.min(Math.max(Theme.menuWidth, root.widestRow(peers)), root.workArea.width))
+                    Math.min(frame.y + root.heldOffset, root.workArea.y + root.workArea.height - root.workAreaInset - height))
+        // Its own read, so a change of the parent's width does not read every peer's width again.
+        readonly property real widestPeer: root.submenuBuilding ? 0 : root.widestRow(peers)
+        width: Math.max(0, Math.min(Math.max(frame.width, Theme.menuWidth, flyout.widestPeer), root.workArea.width))
         height: Math.max(0, Math.min(peers.implicitHeight + 2 * Theme.spacing.rowPaddingY,
                                     root.workArea.height - 2 * root.workAreaInset))
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         radius: Style.cornerRadius
 
         // The flyout takes its dead presses the same way.
@@ -617,7 +658,7 @@ Item {
 
             Repeater {
                 id: subRows
-                model: root.submenuEntries
+                model: root.heldRows
                 delegate: Flea.MenuRow {
                     id: subRow
                     required property var modelData
@@ -636,9 +677,9 @@ Item {
                                   : subRow.modelData.keyHint !== undefined && ViewState.keyHints
                                   ? subRow.modelData.keyHint : undefined,
                               icon: subRow.modelData.icon,
+                              tagRow: subRow.modelData.tagRow,
                               glyph: subRow.modelData.glyph !== undefined ? subRow.modelData.glyph
-                                   : Menu.submenuGlyph(root.loneFlyoutAction.length > 0
-                                       ? root.loneFlyoutAction : root.entries[root.openSubmenuRow].action) })
+                                   : Menu.submenuGlyph(root.heldAction) })
                     current: root.submenuCursor === subRow.index
                     onPressedChanged: MenuRefresh.pressChanged(root, subRow.pressed)
                     // A flyout opened by key can land under the resting pointer too, so it reads the same point.
@@ -718,6 +759,8 @@ Item {
                         if (leaves[l].id === action) { root.chooseSub(leaves[l].id); return }
                     }
                 }
+                // 1 to 7 toggle the Tags flyout row that carries the digit, like a click.
+                if (opener && opener.action === "tags" && /^tag[1-7]$/.test(action)) { root.chooseSub(root.submenuEntries[Number(action.charAt(3)) - 1].id); return }
             }
             if (action === "open" || action === "preview") {
                 if (root.submenuOpen) {

@@ -41,12 +41,12 @@ function pane(path) {
     p.searchFrom = ""
     p.searchScanned = 0
     p.cancelled = []
-    p.swap = { hold: function (ask) { p.holds.push("hold"); return false } }
+    p.swap = { stopWaiting: function () {}, hold: function (ask) { p.holds.push("hold"); return false } }
     p.backend = {
         sortBy: "name",
         sortDesc: false,
         listPaths: function (paths, first) { p.listed.push(paths.join(",") + "|" + first) },
-        searchcancel: function () { p.cancelled.push("search") }
+        searchClose: function () { p.cancelled.push("searchclose") }
     }
     // Nav.forget's own members, spelled the way ui/js/Nav.js writes them.
     p.clearSelection = function () {}
@@ -54,7 +54,8 @@ function pane(path) {
     p.thumbState = {}
     p.dirSizeState = {}
     // Mirrors ui/Pane.qml openWithoutHistory: every navigation leaves Recent.
-    p.openWithoutHistory = function (next) {
+    p.openWithoutHistory = function (next, options) {
+        p.superseded = !!options && options.supersede === true
         p.recentMode = ""
         p.recentFrom = ""
         p.recentPaths = []
@@ -112,12 +113,23 @@ function run(check) {
     check("and the mode stands", standing.recentMode, "results")
     check("and the base is asked for those paths", standing.listed.join(","), "/home/gm/a.txt,/home/gm/b.txt|200")
     check("and the disk beside the counts is unknown", standing.fsName + "|" + standing.fsFree, "|0")
+    check("and that empty slot is an answer, not a wait", standing.fsAnswered, true)
     check("and Used describes the history's own newest-first order", standing.backend.sortBy + "|" + standing.backend.sortDesc, "mtime|true")
 
-    // A second open while one lands replaces nothing and says so, the way a navigation does.
+    // A second open while one lands takes its place, the way a navigation does.
     RecentMode.run(standing, ["/home/gm/c.txt"])
-    check("an open while one lands is refused", standing.said.join(","), "A directory is already loading.")
-    check("and keeps the first open's paths", standing.listed.length, 1)
+    check("an open while one lands is taken, not refused", standing.said.join(","), "")
+    check("and asks for the second open's paths behind the first", standing.listed.join(";"), "/home/gm/a.txt,/home/gm/b.txt|200;/home/gm/c.txt|200")
+    check("and keeps the way back to where it stood", standing.recentFrom, "/home/gm/Work")
+
+    // A tab switch left its cursor and order for a landing that the history takes the place of.
+    var switched = pane("/home/gm/Work")
+    switched.listInFlight = true
+    switched.tabs = { pendingCursor: 40, pendingCursorName: "x", pendingLocatePath: "/p", pendingSortBy: "size", pendingSortDesc: true }
+    RecentMode.run(switched, ["/home/gm/a.txt"])
+    var owes = switched.tabs
+    check("an open over a tab switch's listing clears what the switch owed",
+          [owes.pendingCursor, owes.pendingCursorName, owes.pendingLocatePath, owes.pendingSortBy, owes.pendingSortDesc].join("|"), "-1||||false")
 
     // A history replaces the standing listing, so a running walk is cancelled.
     var walking = pane("/home/gm/Work")
@@ -125,7 +137,7 @@ function run(check) {
     walking.searchRunning = true
     walking.viewMode = "grid"
     RecentMode.run(walking, ["/home/gm/a.txt"])
-    check("a walk is cancelled before the history answers", walking.cancelled.join(","), "search")
+    check("a live session is closed before the history answers", walking.cancelled.join(","), "searchclose")
     check("and its mode is cleared", walking.searchMode + "|" + walking.searchRunning, "|false")
 
     // Leaving Recent re-lists the folder it was opened over, pushing no history entry.
@@ -160,7 +172,7 @@ function run(check) {
     // A held open keeps its rows, an unheld one clears them for the listing behind it.
     var held = pane("/home/gm/Work")
     held.rows = [{ n: "home/gm/a.txt", d: false }]
-    held.swap = { hold: function () { held.holds.push("hold"); return true } }
+    held.swap = { stopWaiting: function () {}, hold: function () { held.holds.push("hold"); return true } }
     RecentMode.run(held, ["/home/gm/a.txt"])
     check("a held open keeps its rows", held.rows.length, 1)
     var unheld = pane("/home/gm/Work")
@@ -196,14 +208,14 @@ function run(check) {
     check("a reveal while one lands is refused", busy.said.join(","), "A directory is already loading.")
     check("and keeps the mode, the way back, and opens nothing",
           busy.recentMode + "|" + busy.recentFrom + "|" + busy.opened.length, "results|/home/gm/Work|0")
-    // Escape while a listing lands refuses before it clears the way back.
+    // Escape while a listing lands takes the way back as the newest request.
     var loading = pane("/home/gm/Work")
     RecentMode.run(loading, ["/home/gm/a.txt"])
     loading.opened = []
     RecentMode.close(loading)
-    check("a close while one lands is refused", loading.said.join(","), "A directory is already loading.")
-    check("and keeps the way back", loading.recentFrom, "/home/gm/Work")
-    check("and opens nothing", loading.opened.length, 0)
+    check("a close while one lands is taken, not refused", loading.said.join(","), "")
+    check("and spends the way back", loading.recentFrom + "|" + loading.recentMode, "|")
+    check("and asks for the folder it was opened over, as a navigation", loading.opened.join(",") + "|" + loading.superseded, "/home/gm/Work|true")
 
     // A tab switch drops the overlay the way close does, keeping the folder's order.
     var switching = pane("/home/gm/Work")
@@ -253,13 +265,13 @@ function run(check) {
         var history = { recentMode: "results", said: "" }
         history.message = function (text) { history.said = text }
         check("it refuses in Recent", RecentMode.refusePaste(history), true)
-        check("and says why", history.said, "This listing is a history, and cannot take a paste.")
+        check("and says why", history.said, "Recent cannot take a paste. Open a folder first")
         var browsing = { recentMode: "", said: "" }
         browsing.message = function (text) { browsing.said = text }
         check("and stays silent off Recent", RecentMode.refusePaste(browsing), false)
     } else {
         check("it refuses in Recent", "missing", true)
-        check("and says why", "missing", "This listing is a history, and cannot take a paste.")
+        check("and says why", "missing", "Recent cannot take a paste. Open a folder first")
         check("and stays silent off Recent", "missing", false)
     }
     // A hop out of Recent without close still hands the standing order back.

@@ -5,7 +5,7 @@ use crate::backend::thumbs::JOB_TIMEOUT;
 use std::ffi::{c_void, CStr};
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::raw::{c_char, c_int, c_long};
+use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::os::unix::process::ExitStatusExt;
 use std::time::Instant;
 
@@ -222,21 +222,21 @@ type Create = unsafe extern "C" fn() -> *mut VideoThumbnailer;
 type SetSize = unsafe extern "C" fn(*mut VideoThumbnailer, c_int, c_int) -> c_int;
 type CreateImageData = unsafe extern "C" fn() -> *mut ImageData;
 type ToBuffer = unsafe extern "C" fn(*mut VideoThumbnailer, *const c_char, *mut ImageData) -> c_int;
+type ForceCpuCount = unsafe extern "C" fn(c_int);
 
 // std already links the system libc, so every symbol is declared here rather than taking a crate.
 extern "C" {
     fn dlopen(file: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn prctl(option: c_int, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> c_int;
+    fn prctl(option: c_int, ...) -> c_int;
     fn setrlimit(resource: c_int, limit: *const RLimit) -> c_int;
     fn syscall(number: c_long, ...) -> c_long;
     fn fork() -> c_int;
     fn _exit(code: c_int) -> !;
-    fn kill(pid: c_int, sig: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
     fn pidfd_open(pid: c_int, flags: u32) -> c_int;
     fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
-    fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int;
+    fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn dup2(old: c_int, new: c_int) -> c_int;
     fn close_range(first: u32, last: u32, flags: c_int) -> c_int;
 }
@@ -260,6 +260,10 @@ impl Decoder {
                 let found = dlsym(library, symbol.as_ptr());
                 (!found.is_null()).then_some(found)
             };
+            // One libav thread per video: the scale filter sizes its pool from av_cpu_count().
+            if let Some(force) = entry(c"av_cpu_force_count") {
+                std::mem::transmute::<*mut c_void, ForceCpuCount>(force)(1);
+            }
             Some(Decoder {
                 create: std::mem::transmute::<*mut c_void, Create>(entry(c"video_thumbnailer_create")?),
                 set_size: std::mem::transmute::<*mut c_void, SetSize>(entry(c"video_thumbnailer_set_size")?),
@@ -310,7 +314,7 @@ fn lock_down(abi: i64) -> Option<()> {
     let scoped = if abi >= LANDLOCK_SCOPE_SIGNAL_ABI { LANDLOCK_SCOPE_SIGNAL } else { 0 };
     let attr = RulesetAttr { handled_access_fs: LANDLOCK_WRITE_RIGHTS, handled_access_net: 0, scoped };
     unsafe {
-        if prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+        if prctl(PR_SET_NO_NEW_PRIVS, 1 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) != 0 {
             return None;
         }
         let ruleset = syscall(SYS_LANDLOCK_CREATE_RULESET, &attr as *const RulesetAttr, std::mem::size_of::<RulesetAttr>(), 0u32);
@@ -359,7 +363,7 @@ fn call_filter() -> Option<Vec<SockFilter>> {
 fn install_call_filter() -> Option<()> {
     let program = call_filter()?;
     let filter = SockFprog { len: u16::try_from(program.len()).ok()?, filter: program.as_ptr() };
-    (unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter as *const SockFprog as u64, 0, 0) } == 0).then_some(())
+    (unsafe { prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER as c_ulong, &filter as *const SockFprog as c_ulong, 0 as c_ulong, 0 as c_ulong) } == 0).then_some(())
 }
 
 // The child's whole descriptor table becomes /dev/null on 0 to 2, the input on 3 and the output on 4.
@@ -413,7 +417,7 @@ struct Running {
 // Reaps one child and answers its job; a child killed by a signal, the deadline's included, ran on the file and failed.
 fn finish(job: Running, past_deadline: bool) {
     if past_deadline {
-        unsafe { kill(job.pid, SIGKILL) };
+        let _ = crate::procsignal::signal_process(job.pid, SIGKILL);
     }
     let mut status: c_int = 0;
     let verdict = if unsafe { waitpid(job.pid, &mut status, 0) } != job.pid {
@@ -455,7 +459,7 @@ fn start(message: fdpass::Received, decoder: &Decoder, abi: i64, running: &mut V
     let raw = unsafe { pidfd_open(pid, 0) };
     if raw < 0 {
         // corner: with no descriptor there is no deadline to enforce, so the child is ended now and judges nothing.
-        unsafe { kill(pid, SIGKILL) };
+        let _ = crate::procsignal::signal_process(pid, SIGKILL);
         let mut status: c_int = 0;
         unsafe { waitpid(pid, &mut status, 0) };
         let _ = fdpass::send_byte(&reply, NOT_STARTED);
@@ -518,7 +522,7 @@ fn serve(requests: &OwnedFd, decoder: &Decoder, abi: i64) -> i32 {
 // The whole process: stdin is the request socket, and the first byte says whether this worker can serve.
 pub fn run() -> i32 {
     let requests = unsafe { OwnedFd::from_raw_fd(0) };
-    unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    unsafe { prctl(PR_SET_DUMPABLE, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong, 0 as c_ulong) };
     let Some(decoder) = Decoder::load(SONAME) else {
         let _ = fdpass::send_byte(&requests, NO_LIBRARY);
         return 1;
@@ -532,6 +536,10 @@ pub fn run() -> i32 {
     }
     serve(&requests, &decoder, abi)
 }
+
+#[cfg(test)]
+#[path = "thumbworker_threads_tests.rs"]
+mod threads_tests;
 
 #[cfg(test)]
 mod tests {
@@ -612,7 +620,7 @@ mod tests {
         if pid == 0 {
             match ends {
                 Ends::Exits(code) => unsafe { _exit(*code) },
-                Ends::Dies => unsafe { kill(getpid(), SIGKILL) },
+                Ends::Dies => drop(crate::procsignal::signal_process(unsafe { getpid() }, SIGKILL)),
                 Ends::Hangs => loop {
                     unsafe { pause() };
                 },
@@ -849,7 +857,7 @@ mod tests {
         };
         let writable = |path: &str| std::fs::OpenOptions::new().write(true).open(path).is_ok();
         let wrote_before = writable(&format!("/proc/self/fd/{}", reader));
-        let signalled_before = unsafe { kill(getppid(), 0) } == 0;
+        let signalled_before = crate::procsignal::signal_process(unsafe { getppid() }, 0).is_ok();
         let mode = std::fs::metadata(&victim).map(|m| m.permissions().mode() & MODE_BITS).unwrap_or(0);
         let chmod_before = unsafe { fchmod(reader, mode) } == 0;
         let times_before = unsafe { futimens(reader, &KEEP_TIMES) } == 0;
@@ -868,7 +876,7 @@ mod tests {
         let ioctl_errno = errno_of(unsafe { ioctl(INPUT_FD, FS_IOC_GETFLAGS, &mut flags) });
         let fork_errno = forked_and_reaped();
         let thread = std::thread::Builder::new().spawn(|| true).map(|handle| handle.join().unwrap_or(false)).unwrap_or(false);
-        let open: Vec<c_int> = (0..FD_CEILING).filter(|fd| unsafe { fcntl(*fd, F_GETFD, 0) } >= 0).collect();
+        let open: Vec<c_int> = (0..FD_CEILING).filter(|fd| unsafe { fcntl(*fd, F_GETFD, 0 as c_int) } >= 0).collect();
         let nulls = (0..3).all(|fd| target(fd) == "/dev/null");
         let input_on_3 = target(INPUT_FD).ends_with("/victim.mp4");
         let facts = format!(
@@ -881,7 +889,7 @@ mod tests {
             writable(&victim),
             std::fs::File::open("/proc/self/fd/3").is_ok(),
             signalled_before,
-            unsafe { kill(getppid(), 0) } == 0,
+            crate::procsignal::signal_process(unsafe { getppid() }, 0).is_ok(),
             chmod_before,
             chmod,
             times_before,

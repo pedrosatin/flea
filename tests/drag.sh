@@ -234,7 +234,7 @@ PY
 }
 
 cleanup() {
-  local status=$? drained=true
+  local status=$? drained=true journal found
   trap - EXIT
   if [ "$button_down" = true ]; then
     ydotool key 1:1 1:0 >/dev/null 2>&1 || { bad "cleanup could not cancel the held drag"; status=1; }
@@ -264,6 +264,17 @@ cleanup() {
     fi
   fi
   if [ "$drained" = true ]; then
+    # The operator's own journal entries are allowed; paths from this run are not.
+    journal="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/flea/undo-journal"
+    if [ -f "$journal" ]; then
+      found=0
+      grep -qF -- "$SB" "$journal" 2>/dev/null || found=$?
+      case $found in
+        0) bad "run leaked sandbox paths into the operator journal $journal from $SB"; status=1 ;;
+        1) ;;
+        *) bad "could not read the operator journal $journal to check it for sandbox paths from $SB"; status=1 ;;
+      esac
+    fi
     sandbox_remove "$SB" 2>/dev/null
     # R7's tmpfs root has its own mktemp and marker, checked again before deletion.
     case "${XDEV:-}" in /dev/shm/flea-drag-xdev-*) FIXTURE_ROOT=/dev/shm sandbox_remove "$XDEV" ;; esac
@@ -276,6 +287,11 @@ trap cleanup EXIT
 
 # ---------------------------------------------------------------- fixture
 sandbox_make "$SB"
+# The session runtime dir stays real for the compositor, so the journal needs its own knob.
+UNDO_DIR=$SB/flea-undo
+mkdir -p "$UNDO_DIR" || die "the suite undo dir could not be created at $UNDO_DIR"
+chmod 0700 "$UNDO_DIR" || die "the suite undo dir could not be locked down"
+export FLEA_UNDO_DIR="$UNDO_DIR"
 export XDG_CONFIG_HOME="$HOMEDIR/.config" XDG_STATE_HOME="$HOMEDIR/.local/state"
 export XDG_DATA_HOME="$HOMEDIR/.local/share" XDG_CACHE_HOME="$HOMEDIR/.cache"
 mkdir -p "$XDG_CONFIG_HOME" "$XDG_STATE_HOME/omarchy" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$HOMEDIR/aaa" "$HOMEDIR/bbb"
@@ -417,10 +433,10 @@ r5_wait_listing() {
 
 # Read the same target-owned activity as expect_feedback before releasing the held drag.
 r5_wait_feedback() {
-  local attempt state owner="$HOMEDIR/bbb" line="Move 1 item to $HOMEDIR/bbb · ctrl at lift copies"
+  local attempt state owner="$HOMEDIR/bbb" line="Move 1 item to $HOMEDIR/bbb · Ctrl copies, Shift moves"
   for ((attempt=1; attempt<=r5_poll_attempts; attempt++)); do
     state=$(ipc statusActivityState) || { r5_evidence; die "R5 drag activity observer failed"; }
-    # Sample input: {"activities":[{"running":false,"ownerPath":"/run/home/bbb","text":"Move 1 item to /run/home/bbb · ctrl at lift copies"}]}.
+    # Sample input: {"activities":[{"running":false,"ownerPath":"/run/home/bbb","text":"Move 1 item to /run/home/bbb · Ctrl copies, Shift moves"}]}.
     if jq -e --arg owner "$owner" --arg line "$line" '
         [.activities[] | select(.running | not) | {ownerPath,text}] ==
         [{ownerPath:$owner,text:$line}]' <<< "$state" >/dev/null; then
@@ -691,7 +707,7 @@ press; sleep 0.3
 glide_to "$bx" "$by"; sleep 0.8
 MID=$(ipc stickyMessage)
 release; sleep 0.6
-check "the line names the folder under the pointer" "$MID" "Move 1 item to bbb · ctrl at lift copies"
+check "the line names the folder under the pointer" "$MID" "Move 1 item to bbb · Ctrl copies, Shift moves"
 
 # ---------------------------------------------------------------- R1
 echo
@@ -731,7 +747,7 @@ r5_press_settle_seconds=0.3
 r5_drop_settle_seconds=0.6
 r5_data_device_lines=15
 r5_floor_point=""
-# GM's ruling. The second tab is walked into bbb through the path bar, the first tab is shown again,
+# The rest-to-select rule. The second tab is walked into bbb through the path bar, the first tab is shown again,
 # then r1a.txt is lifted, rested on the second tab past ui/TabBar.qml's hoverSwitchMs, and released
 # on the empty floor under the rows. The marker resolves the drop by path, because after the switch
 # the row indices name bbb's own rows; a same-filesystem move is what a plain drag means.
@@ -1151,7 +1167,7 @@ dual_drag_diagnostic() {
 
 visit_targets() {
   local destination="$1" verb="$2" suffix=""
-  [[ "$verb" != Move ]] || suffix=' · ctrl at lift copies'
+  [[ "$verb" != Move ]] || suffix=' · Ctrl copies, Shift moves'
   glide_to "$folder_x" "$folder_y"
   expect_feedback "$destination" "$verb 2 items to folder$suffix"
   glide_to "$floor_x" "$floor_y"
@@ -1255,7 +1271,7 @@ read -r px py <<< "$point"
 omarchy-drive click "$((WX + px))" "$((WY + py))" left >/dev/null || die "dual control activation failed"
 for direction in left right; do
   side=$(ipc dualState | jq -er '.focused') || die "dual focus is unavailable"
-  [[ "$side" == 0 ]] || native_key -k Tab
+  [[ "$side" == 0 ]] || native_key -M shift -k Tab -m shift
   navigate "$left"
   native_key -k Tab
   navigate "$right"
@@ -1266,11 +1282,11 @@ for direction in left right; do
     source="$left"; destination="$right"; name=feedback-left; verb=Copy
     dual_destination_side=1
     dual_target_points saved-before
-    native_key -k Tab
+    native_key -M shift -k Tab -m shift
   else
     source="$right"; destination="$left"; name=feedback-right; verb=Move
     dual_destination_side=0
-    native_key -k Tab
+    native_key -M shift -k Tab -m shift
     dual_target_points saved-before
     native_key -k Tab
   fi

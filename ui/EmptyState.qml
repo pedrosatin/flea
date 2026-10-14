@@ -18,9 +18,8 @@ Item {
     // Sentence case, matching the OEM's activePhrases; caption.text below uppercases at render, like PanelHero, not in the source.
     readonly property var messages: [
         "Nothing here yet",
-        "A very tidy directory",
+        "A very tidy folder",
         "Not a file in sight",
-        "This folder keeps its secrets",
         "Quiet in here",
         "No clutter to report",
         "Waiting for something to land",
@@ -28,10 +27,22 @@ Item {
     ]
     // The OEM phraseTimer's own interval, tailscale's and airpods' Panel.qml.
     readonly property int rotateMs: 2800
-    // PanelHero's own secondary ink: Qt.darker(foreground, 1.4), not the row's muted role.
-    readonly property color dim: Qt.darker(Theme.color.foreground, 1.4)
+    // PanelHero's own secondary ink, the metadata role, not the row's muted one.
+    readonly property color dim: Theme.color.metadata
     // A data-held folder skips this for one landing, so it draws whole like the picture hold did.
     property bool animateEntrance: true
+
+    // The widest the hero draws, the longest rotating phrase included, so ui/PaneStates.qml places it once per state.
+    readonly property real naturalWidth: Math.max(root.hint.length > 0 ? hintText.implicitWidth : 0,
+        root.caption.length > 0 ? caption.implicitWidth : root.widestPhrase(phraseFace.font))
+
+    FontMetrics { id: phraseFace; font: caption.font }
+    // face is read only so a font change re-measures, as GridTile's caption marks do.
+    function widestPhrase(face) {
+        return root.messages.reduce(function (widest, phrase) {
+            return Math.max(widest, phraseFace.advanceWidth(phrase.toUpperCase()))
+        }, 0)
+    }
 
     // Entrance only: the caller (shell.qml) cuts visible straight to false on the way out, so
     // this only ever animates the appear direction, never a disappearance.
@@ -72,7 +83,7 @@ Item {
             width: Theme.stateMarkSize
             height: Theme.stateMarkSize
             name: root.mark
-            color: root.dim
+            color: Theme.color.metadataFrame
         }
 
         Text {
@@ -88,6 +99,7 @@ Item {
         }
 
         Text {
+            id: hintText
             visible: root.hint.length > 0
             anchors.horizontalCenter: parent.horizontalCenter
             text: root.hint
@@ -98,21 +110,28 @@ Item {
         }
     }
 
+    // Three beats per appearance, then the third phrase and the drawn mark rest (GM's ruling); a rotation kept a core 12% busy.
+    readonly property int beatLimit: 3
+    property int beats: 0
+    // Rest is no beat left with the fade stopped and the mark drawn whole; reduced motion and a fixed caption keep no beat, so the fade and the opacity gate those.
+    readonly property bool atRest: Theme.reducedMotion || (!fade.running && root.opacity === 1 && (root.caption.length > 0 || (root.beats >= root.beatLimit && heroMark.settled)))
+    onVisibleChanged: root.beats = 0
+
     // root.visible mirrors the caller's listingState === "empty" gate, so the rotation timer stops once a real listing arrives.
     Timer {
         interval: root.rotateMs
-        running: root.visible && root.caption.length === 0 && !Theme.reducedMotion
+        running: root.visible && root.caption.length === 0 && !Theme.reducedMotion && root.beats < root.beatLimit
         repeat: true
         // One beat for both, per the operator: the mark repaints as the sentence changes.
-        onTriggered: { fade.restart(); heroMark.replay() }
+        onTriggered: { root.beats += 1; fade.restart(); heroMark.replay() }
     }
 
-    // The OEM's phraseSwap SequentialAnimation (tailscale's and airpods' Panel.qml): fade out, swap the index, fade in.
+    // The OEM's phraseSwap order (tailscale's and airpods' Panel.qml): fade out, swap the index, fade in, on Flea's OutCubic and Motion durations.
     SequentialAnimation {
         id: fade
-        PropertyAnimation { target: caption; property: "opacity"; to: 0.0; duration: 180; easing.type: Easing.OutQuad }
+        PropertyAnimation { target: caption; property: "opacity"; to: 0.0; duration: Motion.durMs.close; easing.type: Easing.OutCubic }
         ScriptAction { script: root.messageIndex = (root.messageIndex + 1) % root.messages.length }
-        PropertyAnimation { target: caption; property: "opacity"; to: 1.0; duration: 260; easing.type: Easing.InQuad }
+        PropertyAnimation { target: caption; property: "opacity"; to: 1.0; duration: Motion.durMs.open; easing.type: Easing.OutCubic }
     }
     Connections {
         target: Theme

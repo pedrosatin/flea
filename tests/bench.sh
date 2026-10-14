@@ -147,6 +147,8 @@ bench_header=$(sed -n 's/^echo "\(id,run,[^"]*\)".*/\1/p' "$repo/tools/flea-fiel
 declare -A CELL
 emit_row() {
   local out="" name
+  # The report counts only write_clean 1 rows, so a fixture row is a counted run unless it says otherwise.
+  CELL[write_clean]=${CELL[write_clean]-1}
   while IFS= read -r name; do
     out="${out:+$out,}${CELL[$name]:--}"
   done < <(printf '%s\n' "$bench_header" | tr ',' '\n')
@@ -191,7 +193,7 @@ holds "an entrant the cache never saw makes no format claim" "strata: nothing re
 lacks "and is never recorded as having produced nothing" "strata produced nothing" "$man"
 holds "a TUI is not given a format line it cannot earn" "yazi: a TUI previews the cursor file" "$man"
 holds "every unranked row is repeated as a refusal" "strata run 1: unranked" "$man"
-holds "including the TUI bracket's" "yazi run 1: n/a: tui in kitty" "$man"
+holds "including the TUI group's" "yazi run 1: n/a: tui in kitty" "$man"
 holds "and a ten-times work gap refuses the comparison outright" "differ in thumbnail work by 21x" "$man"
 lacks "so the manifest never calls that run comparable" "every row in this run is comparable" "$man"
 holds "an entrant with no preview feature is stated, not left as a sentinel" "xplr: no image preview feature" "$man"
@@ -202,6 +204,56 @@ check "closing against a missing run is refused" 1 $?
 "$tool" "$man" close "$csv" >/dev/null 2>&1
 check "closing an already-closed manifest is refused" 1 $?
 check "and it still carries exactly one close section" 1 "$(grep -c '^## Run close' "$man")"
+# An unset or missing FLEA_QMLCACHE reads absent in the close section, never a 0.
+nocache_man="$scratch/nocache.manifest.md"
+printf '%s\n' "flea|gui|qs" "dolphin|gui|dolphin" "definitely-not-a-file-manager|gui|definitely-not-a-file-manager" \
+  "strata|gui|strata" "yazi|tui|yazi" "xplr|tui|xplr" \
+  | EXPECT_FILES="$payload" "$tool" "$nocache_man" "$fixture" >/dev/null 2>&1
+env -u FLEA_QMLCACHE "$tool" "$nocache_man" close "$csv" >/dev/null 2>&1
+check "a close with no cache variable still closes" 0 $?
+holds "an unset FLEA_QMLCACHE reads absent, never 0" "tested Flea's own QML cache at end: absent entries in an unset path" "$nocache_man"
+missing_man="$scratch/missingcache.manifest.md"
+printf '%s\n' "flea|gui|qs" "dolphin|gui|dolphin" "definitely-not-a-file-manager|gui|definitely-not-a-file-manager" \
+  "strata|gui|strata" "yazi|tui|yazi" "xplr|tui|xplr" \
+  | EXPECT_FILES="$payload" "$tool" "$missing_man" "$fixture" >/dev/null 2>&1
+FLEA_QMLCACHE="$scratch/no-such-dir" "$tool" "$missing_man" close "$csv" >/dev/null 2>&1
+check "a close with a missing cache dir still closes" 0 $?
+holds "a missing cache dir reads absent too" "tested Flea's own QML cache at end: absent entries in $scratch/no-such-dir" "$missing_man"
+
+# The anchor and TUI arms, each recorded from its own repo rather than the package.
+command -v git >/dev/null 2>&1 || { echo "FAIL git is required for the anchor manifest checks"; fail=1; }
+flea_repo="$scratch/flea-repo"
+anchor_repo="$scratch/anchor-repo"
+mkdir -p "$flea_repo" "$anchor_repo"
+# Fixture repos read no operator config, so a signing or hook setting cannot fail their commits.
+fixture_git() { GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c user.email=t@t -c user.name=t "$@"; }
+fixture_git -C "$flea_repo" init -q
+fixture_git -C "$anchor_repo" init -q
+printf 'x\n' > "$flea_repo/f" && printf 'x\n' > "$anchor_repo/f"
+fixture_git -C "$flea_repo" add f
+fixture_git -C "$flea_repo" commit -qm init
+fixture_git -C "$anchor_repo" add f
+fixture_git -C "$anchor_repo" commit -qm init
+fixture_git -C "$anchor_repo" tag v9.9.9
+flea_sha=$(git -C "$flea_repo" rev-parse --short HEAD)
+anchor_sha=$(git -C "$anchor_repo" rev-parse --short HEAD)
+anchor_man="$scratch/anchor.manifest.md"
+printf '%s\n' "flea-tui|tui|flea" "flea-anchor|gui|qs" \
+  | FLEA_REPO="$flea_repo" ANCHOR_REPO="$anchor_repo" "$tool" "$anchor_man" "$fixture" >/dev/null 2>&1
+check "a manifest run with anchor arms writes" 0 $?
+holds "flea-tui names its own repo sha, untagged" "^flea-tui .*source $flea_sha untagged (clean)" "$anchor_man"
+holds "flea-anchor names the anchor repo sha and its tag" "^flea-anchor .*source $anchor_sha v9.9.9 (clean)" "$anchor_man"
+noanchor_man="$scratch/noanchor.manifest.md"
+printf '%s\n' "flea-anchor|gui|qs" \
+  | FLEA_REPO="$flea_repo" env -u ANCHOR_REPO "$tool" "$noanchor_man" "$fixture" >/dev/null 2>&1
+check "a manifest run with no anchor repo writes" 0 $?
+holds "and the anchor arm reads absent without one" "^flea-anchor .*source absent absent (absent)" "$noanchor_man"
+badrepo_man="$scratch/badrepo.manifest.md"
+mkdir -p "$scratch/not-a-repo"
+printf '%s\n' "flea|gui|qs" \
+  | GIT_CEILING_DIRECTORIES="$scratch" FLEA_REPO="$scratch/not-a-repo" "$tool" "$badrepo_man" "$fixture" >/dev/null 2>&1
+check "a manifest run with an unreadable repo writes" 0 $?
+holds "and the arm reads unreadable rather than clean" "^flea .*source unreadable unreadable (unreadable)" "$badrepo_man"
 
 # ---------------------------------------------------------------- tools/flea-bench-report
 # The report renders the work column that carried the wrong claim. A cache count that saw nothing
@@ -215,6 +267,59 @@ lacks "and an unseen entrant is never called a zero" "| 0 thumbnails |" "$report
 holds "it reads not measured instead" "strata.*not measured" "$report_out"
 holds "and the refusal names the instrument, not the entrant" "nothing reached the thumbnail cache" "$report_out"
 lacks "the old claim about the entrant's ability is gone" "drew no thumbnails" "$report_out"
+holds "the report heads the GUI section group" "## GUI group" "$report_out"
+holds "and the TUI section too" "## TUI group" "$report_out"
+lacks "the old GUI bracket heading is gone" "## GUI bracket" "$report_out"
+lacks "and the old TUI bracket heading too" "## TUI bracket" "$report_out"
+# The chart's eyebrow names the section the same way; the SVG is written before any PNG step, so it is read either way.
+mkdir -p "$scratch/chart"
+if ! "$repo/tools/flea-bench-chart" "$scratch/chart" >/dev/null 2>"$scratch/chart.err" && [ ! -s "$scratch/chart/bench-scale.svg" ]; then
+  echo "FAIL tools/flea-bench-chart wrote no bench-scale.svg into $scratch/chart:"; sed 's/^/  /' "$scratch/chart.err"; fail=1
+fi
+holds "the chart eyebrow names the GUI group" "FIELD BENCH, GUI GROUP" "$scratch/chart/bench-scale.svg"
+lacks "and never the old GUI bracket" "GUI BRACKET" "$scratch/chart/bench-scale.svg"
+# The chart finds GUI cells by header name, so a moved column keeps the numbers.
+reorder_orig="$scratch/reorder-orig.md"
+"$repo/tools/flea-bench-report" "$repo/docs/bench/scale-rc-2026.csv" > "$reorder_orig" 2>/dev/null
+check "a reorderable GUI report runs" 0 $?
+reordered="$scratch/reordered.md"
+python3 - "$reorder_orig" "$reordered" <<'EOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+lines = open(src, encoding="utf-8").read().splitlines()
+out = []
+for line in lines:
+    if line.startswith("|"):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 3:
+            cells[1], cells[2] = cells[2], cells[1]
+        line = "| " + " | ".join(cells) + " |"
+    out.append(line)
+open(dst, "w", encoding="utf-8").write("\n".join(out) + "\n")
+EOF
+check "a reordered GUI table is still writable" 0 $?
+python3 - "$repo/tools/flea-bench-chart" "$reorder_orig" "$reordered" <<'EOF'
+import sys
+chart, orig, new = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(chart, encoding="utf-8").read().splitlines()
+src = [l for l in src if l.strip() != "main()"]
+ns = {}
+exec(compile("\n".join(src), chart, "exec"), ns)
+parse = ns["parse_gui"]
+def sig(md):
+    rows, un = parse(md)
+    r = sorted((x["name"], x["first"], x["settled"], x["work"], x["mem"], x["cpu"], x["runs"]) for x in rows)
+    u = sorted((x["name"], x["settled"], x["work"]) for x in un)
+    return (r, u)
+try:
+    a = sig(open(orig, encoding="utf-8").read())
+    b = sig(open(new, encoding="utf-8").read())
+except SystemExit as e:
+    print("chart refused a GUI table: %s" % e.code)
+    sys.exit(1)
+sys.exit(0 if a == b and a[0] else 1)
+EOF
+check "the chart reads a reordered GUI table the same way" 0 $?
 # A verdict holding a comma shifts every column right of it, and the failure then surfaces against
 # whichever column the shifted row lands in rather than against the verdict that caused it.
 comma_csv="$scratch/comma.csv"
@@ -223,6 +328,20 @@ cp "$man" "${comma_csv%.csv}.manifest.md"
 "$repo/tools/flea-bench-report" "$comma_csv" >/dev/null 2>"$scratch/comma.err"
 check "a comma inside a verdict is refused" 1 $?
 holds "and the refusal names the field that holds it" "so a field holds a comma" "$scratch/comma.err"
+# A dirty row's comma sits in ranked, so the raw check names it only while ranked comes before write_clean.
+ranked_at=$(printf '%s\n' "$bench_header" | tr ',' '\n' | grep -n '^ranked$' | cut -d: -f1)
+clean_at=$(printf '%s\n' "$bench_header" | tr ',' '\n' | grep -n '^write_clean$' | cut -d: -f1)
+[ "${ranked_at:-0}" -ge 1 ] && [ "${ranked_at:-0}" -lt "${clean_at:-0}" ]
+check "the bench header still orders ranked before write_clean" 0 $?
+dirtycomma_csv="$scratch/dirtycomma.csv"
+cp "$csv" "$dirtycomma_csv"
+CELL=([id]=flea [run]=2 [thumbs_n]=36 [thumbs_by_format]="jpg=2;png=0;txt=0;none=0;unknown=0" [ranked]="unranked: writes in flight, dirty" [preview_ms]=- [write_clean]=0)
+emit_row >> "$dirtycomma_csv"
+cp "$man" "${dirtycomma_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$dirtycomma_csv" >/dev/null 2>"$scratch/dirtycomma.err"
+check "a comma in a dirty row the guard would drop is refused" 1 $?
+holds "and the dirty refusal names the field that holds it" "so a field holds a comma" "$scratch/dirtycomma.err"
+holds "and the dirty refusal is the raw check naming the row" "flea's row has" "$scratch/dirtycomma.err"
 
 # The two CSVs this repo ships. Their values are not asserted here, only that the report can read
 # them: rows have been spliced into these by hand and a lost column is the failure that produces.
@@ -350,11 +469,169 @@ bash -n "$bench"
 check "the bench parses" 0 $?
 check "ONLY=flea-tui resolves to the flea kill row" "flea" "$(kill_comms_for flea-tui | tr '\n' ' ' | sed 's/ $//')"
 case $rows in
-  *"flea-tui|tui|"*) echo "ok   the flea-tui entrant rides the TUI bracket" ;;
+  *"flea-tui|tui|"*) echo "ok   the flea-tui entrant rides the TUI group" ;;
   *) echo "FAIL the flea-tui entrant is missing from the bench table"; fail=1 ;;
 esac
 eval "$(sed -n '/^settle_gap_for() {/,/^}/p' "$bench")"
 check "the settle gap defaults to 500 on a local fixture" 500 "$(settle_gap_for /home/flea-sandbox/flea-bench-btrfs)"
 check "and to 2000 on a gvfs fixture" 2000 "$(settle_gap_for /run/user/1000/gvfs/smb-share:server=nas,share=data)"
+
+# cpu_sys_s is the run tree plus each mount daemon's own delta during it.
+eval "$(sed -n '/^mount_ticks_start() {/,/^}/p; /^mount_ticks_delta() {/,/^}/p; /^sys_seconds() {/,/^}/p' "$bench")"
+declare -A FAKE_TICKS=([50001]=100 [50002]=50)
+cpu_ticks() {
+  local pid=$1
+  [ -n "${FAKE_TICKS[$pid]:-}" ] || return 1
+  CPU_TICKS=${FAKE_TICKS[$pid]}
+  CPU_TREE_TICKS=$(( CPU_TICKS * 3 ))
+}
+MOUNT_PIDS=(50001 50002)
+mount_ticks_start
+check "each daemon baseline records its own ticks" "100" "${MOUNT_START[50001]}"
+check "and the second daemon too" "50" "${MOUNT_START[50002]}"
+FAKE_TICKS=([50001]=140 [50002]=80)
+mount_ticks_delta; rc=$?
+check "start and settle sum each daemon's own delta" "0" "$rc"
+check "forty ticks on one daemon and thirty on the other" "70" "$MOUNT_DTICKS"
+check "sys_seconds adds the daemon delta" "1.92" "$(sys_seconds 1.42 50 100)"
+check "sys_seconds equals tree with no daemons" "1.42" "$(sys_seconds 1.42 0 100)"
+FAKE_TICKS=([50001]=100 [50002]=50)
+mount_ticks_start
+unset 'FAKE_TICKS[50002]'
+mount_ticks_delta; rc=$?
+check "a daemon that exits mid-run fails the row" "1" "$rc"
+check "and names the lost daemon" "50002" "$MOUNT_LOST"
+FAKE_TICKS=([50001]=100 [50002]=50)
+mount_ticks_start
+FAKE_TICKS=([50001]=90 [50002]=50)
+mount_ticks_delta; rc=$?
+check "a daemon whose ticks go backwards fails the row" "1" "$rc"
+check "and names the reused pid" "50001" "$MOUNT_LOST"
+FAKE_TICKS=([50001]=100)
+mount_ticks_start
+FAKE_TICKS=([50001]=100 [50002]=500)
+mount_ticks_delta; rc=$?
+check "a daemon unreadable at launch fails the row" "1" "$rc"
+check "and names the daemon that had no baseline" "50002" "$MOUNT_LOST"
+MOUNT_PIDS=()
+mount_ticks_start
+mount_ticks_delta; rc=$?
+check "no mount daemons deltas to zero" "0" "$MOUNT_DTICKS"
+check "and an empty daemon set never fails" "0" "$rc"
+# Header and row are pinned whole, so a column moved or dropped in either one fails here.
+# Sample input, one run_one line: echo "id,run,mapped_ms,settled_ms,..." (the header, quoted).
+header_line=$(sed -n 's/^echo "\(id,run,[^"]*\)".*/\1/p' "$bench")
+check "the CSV header names every column in order" "id,run,mapped_ms,settled_ms,pss_kb,cpu_s,child_pss_kb,thumbs_n,pss_anon_kb,uss_kb,drm_kb,thumbs_by_dir,cpu_tree_s,thumbs_by_format,ranked,preview_ms,cpu_reaped_s,cpu_sys_s,dirty_wb_kb,pgpgout_pre_kb,pgpgout_launch_kb,write_clean,rerun,first_rows_ms" "$header_line"
+row_line=$(grep '^  printf .%s,%s' "$bench" | head -1)
+row_specs=$(printf '%s\n' "$row_line" | grep -o '%s' | wc -l)
+check "run_one's row carries one %s per header column" "$(printf '%s\n' "$header_line" | tr ',' '\n' | wc -l)" "$row_specs"
+# Sample input, one run_one line: printf '%s,%s...\\n...' "$id" "$RUN_INDEX" ... (the row, quoted).
+row_args=$(printf '%s\n' "$row_line" | sed 's/^.*\\n. //')
+check "run_one's row prints the header's columns in its order" '"$id" "$RUN_INDEX" "$mapped" "$settled" "$best_pss" "$cpu_s" "$child_pss" "$thumbs_n" "$best_anon" "$best_uss" "$DRM_KB" "$thumbs_dirs" "$cpu_tree_s" "$thumbs_fmt" "$ranked" "$preview_ms" "$cpu_reaped_s" "$cpu_sys_s" "$WG_DIRTY_WB_KB" "$WG_PGPGOUT_PRE_KB" "$WG_PGPGOUT_LAUNCH_KB" "$WG_CLEAN" "$RERUN_N" "$first_rows"' "$row_args"
+
+# ---------------------------------------------------------------- report Version column
+# Every versioned table names the version beside the app, read off the manifest line only.
+ver_csv="$scratch/ver.csv"
+{
+  printf '%s\n' "$bench_header"
+  CELL=([id]=flea [run]=1 [mapped_ms]=754 [settled_ms]=1227 [pss_kb]=105779 [cpu_tree_s]=0.75 [thumbs_n]=36 [thumbs_by_format]="jpg=2;png=0;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=nautilus [run]=1 [mapped_ms]=907 [settled_ms]=2311 [pss_kb]=341791 [cpu_tree_s]=19.26 [thumbs_n]=790 [thumbs_by_format]="jpg=2;png=1;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=strata [run]=1 [mapped_ms]=608 [settled_ms]=3201 [pss_kb]=356233 [cpu_tree_s]=22.92 [thumbs_n]=41 [thumbs_by_format]="jpg=2;png=1;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=yazi [run]=1 [mapped_ms]=112 [settled_ms]=340 [pss_kb]=41200 [cpu_tree_s]=0.44 [thumbs_n]=n/a [thumbs_by_format]=n/a [ranked]="n/a: tui in kitty" [preview_ms]=745)
+  emit_row
+  CELL=([id]=thunar [run]=1 [mapped_ms]=640 [settled_ms]=1500 [pss_kb]=90000 [cpu_tree_s]=1.10 [thumbs_n]=52 [thumbs_by_format]="jpg=2;png=0;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=nemo [run]=1 [mapped_ms]=700 [settled_ms]=1600 [pss_kb]=95000 [cpu_tree_s]=1.20 [thumbs_n]=48 [thumbs_by_format]="jpg=2;png=0;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=flea-tui [run]=1 [mapped_ms]=120 [settled_ms]=350 [pss_kb]=42000 [cpu_tree_s]=0.50 [thumbs_n]=n/a [thumbs_by_format]=n/a [ranked]="n/a: tui in kitty" [preview_ms]=750)
+  emit_row
+  CELL=([id]=flea-anchor [run]=1 [mapped_ms]=660 [settled_ms]=1700 [pss_kb]=98000 [cpu_tree_s]=1.30 [thumbs_n]=55 [thumbs_by_format]="jpg=2;png=1;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=dolphin [run]=1 [mapped_ms]=720 [settled_ms]=1800 [pss_kb]=99000 [cpu_tree_s]=1.40 [thumbs_n]=60 [thumbs_by_format]="jpg=2;png=1;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+  CELL=([id]=polo [run]=1 [mapped_ms]=740 [settled_ms]=1900 [pss_kb]=100000 [cpu_tree_s]=1.50 [thumbs_n]=62 [thumbs_by_format]="jpg=2;png=0;txt=0;none=0;unknown=0" [ranked]=yes [preview_ms]=-)
+  emit_row
+} > "$ver_csv"
+ver_man="${ver_csv%.csv}.manifest.md"
+sed -e 's/^flea[[:space:]][[:space:]]*gui[[:space:]].*/flea       gui  source 1bd18d9 (clean), release binary built 2026-09-23T00:14:24-04:00, 2706072 bytes/' \
+    -e '/^flea[[:space:]][[:space:]]*gui[[:space:]]/a nautilus   gui  nautilus 50.3.1-1' \
+    -e '/^dolphin[[:space:]][[:space:]]*gui[[:space:]]/d' -e '/^definitely-not-a-file-manager[[:space:]][[:space:]]*gui[[:space:]]/d' \
+    -e 's/^strata[[:space:]][[:space:]]*gui[[:space:]].*/strata     gui  source v0.19.0 committed 2026-09-18, built locally from this checkout/' \
+    -e 's/^yazi[[:space:]][[:space:]]*tui[[:space:]].*/yazi       tui  yazi 26.9.1-2/' -e '/^xplr[[:space:]][[:space:]]*tui[[:space:]]/d' \
+    "$man" > "$ver_man"
+printf '%-10s %-4s %s\n' "thunar" "gui" "NOT INSTALLED" >> "$ver_man"
+printf '%-10s %-4s unpackaged at %s, built %s\n' "nemo" "gui" "/usr/bin/nemo" "2026-09-23T00:14:24-04:00" >> "$ver_man"
+printf '%-10s %-4s source %s %s (%s), release binary built %s, %s bytes\n' "flea-tui" "tui" "9f2c4a1" "untagged" "DIRTY" "2026-09-23T00:14:24-04:00" "2706072" >> "$ver_man"
+printf '%-10s %-4s source %s %s (%s), release binary built %s, %s bytes\n' "flea-anchor" "gui" "absent" "absent" "absent" "absent" "0" >> "$ver_man"
+printf '%-10s %-4s source %s %s (%s), release binary built %s, %s bytes\n' "dolphin" "gui" "unreadable" "unreadable" "unreadable" "unreadable" "0" >> "$ver_man"
+printf '%-10s %-4s %s\n' "polo" "gui" "polo 2.0-1" >> "$ver_man"
+ver_out="$scratch/ver.md"
+"$repo/tools/flea-bench-report" "$ver_csv" > "$ver_out" 2>"$scratch/ver.err"
+check "the versioned report runs" 0 $?
+# Each table is cut at its own header, since the progress table repeats the same cells.
+gui_tbl="$scratch/ver-gui.md"
+tui_tbl="$scratch/ver-tui.md"
+prog_tbl="$scratch/ver-prog.md"
+sed -n '/^| entrant | version | first window | settled listing | work done | memory/,/^$/p' "$ver_out" > "$gui_tbl"
+sed -n '/^| entrant | version | first window | settled listing | time to first preview/,/^$/p' "$ver_out" > "$tui_tbl"
+sed -n '/^| entrant | version | thumbnails | by format/,/^$/p' "$ver_out" > "$prog_tbl"
+holds "the GUI table heads its version column" '| entrant | version | first window |' "$gui_tbl"
+holds "a packaged entrant's row carries its package version" '`nautilus` | 50.3.1-1 |' "$gui_tbl"
+holds "flea's row carries its short source ref" '`flea` | 1bd18d9 |' "$gui_tbl"
+holds "strata's row carries its tag" '`strata` | v0.19.0 |' "$gui_tbl"
+holds "an absent source reads absent" '`flea-anchor` | absent |' "$gui_tbl"
+holds "an unreadable source reads unreadable" '`dolphin` | unreadable |' "$gui_tbl"
+holds "an uninstalled package reads NOT INSTALLED" '`thunar` | NOT INSTALLED |' "$gui_tbl"
+holds "an unpackaged binary reads unpackaged" '`nemo` | unpackaged |' "$gui_tbl"
+holds "a second package version reads whole" '`polo` | 2.0-1 |' "$gui_tbl"
+holds "the TUI table heads its version column" '| entrant | version | first window | settled listing | time to first preview |' "$tui_tbl"
+holds "the TUI row carries its package version" '`yazi` | 26.9.1-2 |' "$tui_tbl"
+holds "a dirty source reads with its mark" '`flea-tui` | 9f2c4a1 (dirty) |' "$tui_tbl"
+holds "the progress table heads its version column" '| entrant | version | thumbnails | by format, run 1 |' "$prog_tbl"
+holds "and flea's progress row carries it" '`flea` | 1bd18d9 | 36 |' "$prog_tbl"
+# A deleted entrant line stops the report at the kind guard, never as a blank cell.
+nover_csv="$scratch/nover.csv"
+cp "$ver_csv" "$nover_csv"
+grep -v '^strata[[:space:]][[:space:]]*gui[[:space:]]' "$ver_man" > "${nover_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$nover_csv" >"$scratch/nover.md" 2>"$scratch/nover.err"
+check "a manifest missing one entrant line is refused" 1 $?
+holds "and the refusal names the entrant" "the manifest gives no gui or tui kind for entrant 'strata'" "$scratch/nover.err"
+# A present but unparseable line dies in short_version with its own message, never at the kind guard.
+badver_csv="$scratch/badver.csv"
+cp "$ver_csv" "$badver_csv"
+sed 's/^strata[[:space:]].*/strata     gui  frobnicate/' "$ver_man" > "${badver_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$badver_csv" >"$scratch/badver.md" 2>"$scratch/badver.err"
+check "an unparseable entrant line is refused" 1 $?
+holds "and the refusal names the version line" "the manifest version line for entrant 'strata' is unparseable" "$scratch/badver.err"
+# A package line with more than one version word is refused with the version line message.
+polover_csv="$scratch/polover.csv"
+cp "$ver_csv" "$polover_csv"
+sed 's/^polo[[:space:]].*/polo       gui  polo 2.0 rc1/' "$ver_man" > "${polover_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$polover_csv" >"$scratch/polover.md" 2>"$scratch/polover.err"
+check "a three-word package line is refused" 1 $?
+holds "and names the entrant's version line" "the manifest version line for entrant 'polo' is unparseable" "$scratch/polover.err"
+# A source line without parentheses is refused rather than read as clean.
+noparen_csv="$scratch/noparen.csv"
+cp "$ver_csv" "$noparen_csv"
+sed 's/^polo[[:space:]].*/polo       gui  source abc1234 untagged clean, release binary built 2026-09-23T00:14:24-04:00, 2706072 bytes/' "$ver_man" > "${noparen_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$noparen_csv" >"$scratch/noparen.md" 2>"$scratch/noparen.err"
+check "a source line without parentheses is refused" 1 $?
+holds "and names the entrant's version line" "the manifest version line for entrant 'polo' is unparseable" "$scratch/noparen.err"
+# A dirty word outside the writer's set is refused rather than printed.
+baddirty_csv="$scratch/baddirty.csv"
+cp "$ver_csv" "$baddirty_csv"
+sed 's/^polo[[:space:]].*/polo       gui  source abc1234 untagged (STALE), release binary built 2026-09-23T00:14:24-04:00, 2706072 bytes/' "$ver_man" > "${baddirty_csv%.csv}.manifest.md"
+"$repo/tools/flea-bench-report" "$baddirty_csv" >"$scratch/baddirty.md" 2>"$scratch/baddirty.err"
+check "an unknown dirty word is refused" 1 $?
+holds "and names the entrant's version line" "the manifest version line for entrant 'polo' is unparseable" "$scratch/baddirty.err"
+
+# The selftest log stays on disk so a red check still names its labels.
+"$repo/tools/flea-bench-readme" selftest >"$scratch/readme-selftest.log" 2>&1
+selftest_rc=$?
+if [ "$selftest_rc" -ne 0 ]; then cat "$scratch/readme-selftest.log"; fi
+check "the readme section generator selftest passes" 0 $selftest_rc
 
 exit $fail

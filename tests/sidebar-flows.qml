@@ -3,8 +3,11 @@ import QtQuick
 import QtTest
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 import "flea" as Flea
+import "flea/js/Filter.js" as Filter
 import "flea/js/Format.js" as Format
+import "flea/js/Search.js" as Search
 import "sidebar-flows-extra.js" as Extra
 
 // The real pane owns every tested property. TestEvent delivers keys to its real focused item.
@@ -16,14 +19,21 @@ ShellRoot {
     property int failures: 0
     property int stage: 0
     property double started: 0
+    readonly property int settleGraceMs: 5000
     property bool executing: false
     property int beforeLists: 0
     property int reloadStage: 0
     property var reloadNotice: ({ from: -1, total: 0 })
     property var observedMessages: []
     property bool mutationDone: false
+    property bool trashCountWas: false
+    property bool driveSizeWas: false
     property string cursorBeforeRail: ""
     property double clickedAt: 0
+    property int tagGenBefore: 0
+    property int railHome: -1
+    property int railRecent: -1
+    property int railTrash: -1
 
     function check(name, actual, expected) {
         checks++
@@ -43,6 +53,21 @@ ShellRoot {
         pane.listArea.forceActiveFocus()
         driver.keyClick(key, modifiers || Qt.NoModifier, -1)
     }
+    function tagRow() { return pane.sidebar.entries.findIndex(function(e) { return e.kind === "tag" && e.tag === "Red" }) }
+    // The Red rail row, activated through the sidebar's own route into TagState.openTag.
+    function walkTag() {
+        root.tagGenBefore = pane.searchGen
+        pane.sidebar.activate(root.tagRow())
+    }
+    function tagWalked() { return pane.searchMode === "results" && pane.searchQuery === "tag:Red" && !pane.searchRunning }
+    // The walk is Home's own: the pane stands in a folder of 5 rows, and only Home reaches the 40 files of Downloads (tests/sidebar-flows.sh).
+    function tagChecks(label, queries) {
+        check(label + ": the pane shows results", pane.searchMode, "results")
+        check(label + ": the query is the tag", pane.searchQuery, "tag:Red")
+        check(label + ": the walk is Home's, not the folder's", pane.searchHere, false)
+        check(label + ": the queries sent", pane.searchGen - root.tagGenBefore, queries)
+        check(label + ": the walk scanned Home", pane.searchScanned > 40, true)
+    }
     function sheet() { return pane.keymapSheet.item }
     function openSheet() { root.press(Qt.Key_Question); return root.sheet() }
     function click(item, x, y, button) {
@@ -59,10 +84,10 @@ ShellRoot {
         var point = row.mapFromItem(null, centre[0], centre[1])
         root.click(row, point.x, point.y)
     }
-    function ipc() {
+    function ipc(whole) {
         for (var i = 0; i < body.data.length; i++)
-            if (String(body.data[i]).indexOf("Ipc_") === 0) return body.data[i].seam
-        throw new Error("WindowBody has no IPC seam")
+            if (String(body.data[i].item).indexOf("Ipc_") === 0) return whole ? body.data[i].item : body.data[i].item.seam
+        return null  // the seam is built after the first listing, and it is the item a Loader of the body holds
     }
     function find(item, type) {
         if (String(item).indexOf(type + "_") === 0) return item
@@ -81,6 +106,97 @@ ShellRoot {
         Flea.WindowBody { id: body; host: window }
         Item { anchors.fill: parent; TestEvent { id: driver } }
     }
+    // Rail square-row gap probes, one SidebarRow per trailing-slot shape; the label's ink ends at its anchor edge.
+    Item {
+        id: railGap
+        width: 240
+        height: 4 * Flea.Theme.railRowHeight
+        Flea.SidebarRow {
+            id: probeSquare
+            width: parent.width
+            height: Flea.Theme.railRowHeight
+            index: 0
+            modelData: ({ label: "Archive", path: "", group: "network", kind: "share", uri: "smb://example.com/data", mounted: false, glyph: "server" })
+        }
+        Flea.SidebarRow {
+            id: probeMark
+            y: Flea.Theme.railRowHeight
+            width: parent.width
+            height: Flea.Theme.railRowHeight
+            index: 1
+            modelData: ({ label: "NAS", path: "", group: "network", kind: "share", uri: "smb://example.com/data", mounted: true, glyph: "server" })
+        }
+        Flea.SidebarRow {
+            id: probeNumber
+            y: 2 * Flea.Theme.railRowHeight
+            width: parent.width
+            height: Flea.Theme.railRowHeight
+            index: 2
+            modelData: ({ label: "Trash", path: "trash:///", group: "trash", kind: "trash", glyph: "trash", count: 3 })
+        }
+        Flea.SidebarRow {
+            id: probeEmpty
+            y: 3 * Flea.Theme.railRowHeight
+            width: parent.width
+            height: Flea.Theme.railRowHeight
+            index: 3
+            modelData: ({ label: "Home", path: "/home", group: "home", kind: "home", glyph: "house" })
+        }
+    }
+    // What a rail row draws: the lit fill, the lit accent edge and the keyboard cursor's own frame, read from the tree.
+    function railLook(row) {
+        var look = { fill: false, edge: false, frame: false }
+        for (var i = 0; i < row.children.length; i++) {
+            var c = row.children[i]
+            if (c.color === undefined || c.border === undefined || !c.visible) continue
+            if (c.color.a === 0) look.frame = look.frame || (c.width < row.width && c.height === row.height)
+            else if (c.width === Flea.Theme.spacing.hairline * 2) look.edge = true
+            else if (c.width === row.width && c.opacity === 1) look.fill = true
+        }
+        return look
+    }
+    // Which rail rows draw the lit look and which the cursor frame, by entry index.
+    function railLit() { return root.railIndices("fill") }
+    function railIndices(what) {
+        var out = []
+        for (var i = 0; i < pane.sidebar.entries.length; i++) {
+            var row = pane.sidebar.railItemFor(i)
+            if (row && root.railLook(row)[what]) out.push(i)
+        }
+        return out
+    }
+    // The gap from the label's end to what bounds it: the detail number when one stands, else the slot.
+    function railLabelGap(row) {
+        var target = row.detail.length > 0 ? row.detailItem : row.indicatorSlot
+        return target.x - (row.labelItem.x + row.labelItem.width)
+    }
+    // One probe row per trailing shape the rail draws, pinned to the board's absolute edges (sidebar-flows-extra.js).
+    Column {
+        id: railBoard
+        width: 240
+        Repeater {
+            id: railBoardRows
+            model: Extra.RAIL_BOARD
+            Flea.SidebarRow { }
+        }
+    }
+    function railBoardReady() {
+        var rows = railBoardRows
+        for (var i = 0; i < rows.count; i++)
+            if ((Extra.RAIL_BOARD[i].want === "number" || Extra.RAIL_BOARD[i].want === "count") !== (rows.itemAt(i).detail.length > 0)) return false
+        return rows.count === Extra.RAIL_BOARD.length
+    }
+    function railBoardChecks() {
+        for (var i = 0; i < railBoardRows.count; i++) {
+            var row = railBoardRows.itemAt(i), kind = Extra.RAIL_BOARD[i]
+            var edges = Extra.railBoardEdges(row, kind.want, Style.spacing.rowPaddingX, Style.spacing.rowGap, Flea.Theme.font.caption, Flea.Theme.railIconSize)
+            check("rail-board: " + kind.name + " starts its label after the mark", row.labelItem.x, edges.left)
+            check("rail-board: " + kind.name + " ends its label on the board's edge", row.labelItem.x + row.labelItem.width, edges.right)
+            check("rail-board: " + kind.name + " elides at the end of its label", row.labelItem.elide, Text.ElideRight)
+        }
+    }
+    // The drive sizes land after the Trash count and a poll, the way a reply lands in the real rail.
+    Timer { id: lateSizes; interval: 250; onTriggered: Flea.ViewState.changeLeaf("places", { driveSize: true }) }
     Connections {
         target: root.pane
         // keyClick can deliver rows before returning, so record arming when it happens.
@@ -95,7 +211,7 @@ ShellRoot {
 
     readonly property var steps: [
         function () {
-            if (!ready(fixture) || pane.total !== 4 || pane.sidebar === null) return false
+            if (!ready(fixture) || pane.total !== 4 || pane.sidebar === null || root.ipc() === null) return false
             check("fresh Recent is off", pane.sidebar.recentEntries.length, 0)
             check("fresh Escape-up is off", pane.escapeUp, false)
             check("fresh opening is double click", pane.singleClick, false)
@@ -191,6 +307,71 @@ ShellRoot {
         },
         function () {
             if (!ready(fixture)) return false
+            Flea.ViewState.changeLeaf("places", { showTags: true })
+            pane.tags().take([{ n: "tagged.txt", tg: ["Red"] }], true)
+            return true
+        },
+        function () {
+            if (root.tagRow() < 0) return false
+            Filter.start(pane)
+            Filter.typed(pane, "a")
+            check("control: the filter stands before the tag row", pane.filterQuery, "a")
+            root.walkTag()
+            return true
+        },
+        function () {
+            if (!root.tagWalked()) return false
+            root.tagChecks("tag-filter", 1)
+            check("tag-filter: the filter is closed", [pane.filterTyping, pane.filterQuery], [false, ""])
+            root.press(Qt.Key_Escape)
+            return true
+        },
+        function () {
+            if (!ready(fixture) || pane.searchMode !== "") return false
+            pane.sidebar.activate(pane.sidebar.entries.findIndex(function(e) { return e.kind === "recent" }))
+            return true
+        },
+        function () {
+            if (pane.recentMode !== "results" || pane.listInFlight || root.tagRow() < 0) return false
+            root.walkTag()
+            return true
+        },
+        function () {
+            if (!root.tagWalked()) return false
+            // Leaving Recent for the folder asks its rows once with an empty query, then the tag query follows.
+            root.tagChecks("tag-recent", 2)
+            check("tag-recent: Recent is left", pane.recentMode, "")
+            root.press(Qt.Key_Escape)
+            return true
+        },
+        function () {
+            if (!ready(fixture) || pane.searchMode !== "") return false
+            root.press(Qt.Key_F)
+            pane.listArea.forceActiveFocus()
+            driver.keyClickChar("a", Qt.NoModifier, -1)
+            root.press(Qt.Key_Tab)
+            root.press(Qt.Key_Return)
+            check("control: a folder-scope search stands in results", [pane.searchMode, pane.searchQuery, pane.searchHere], ["results", "a", true])
+            root.walkTag()
+            return true
+        },
+        function () {
+            if (!root.tagWalked()) return false
+            root.tagChecks("tag-results", 1)
+            // A direct call, because a key press spins the event loop and the folder could land before the checks.
+            Search.abort(pane)
+            check("control: the exit is out, the folder not yet landed", pane.searchLeaving, true)
+            Filter.start(pane)
+            Filter.typed(pane, "a")
+            check("control: a filter stands while the exit is out", pane.filterQuery, "a")
+            root.walkTag()
+            check("tag-leaving: the filter is not closed for a search the exit refuses", [pane.filterTyping, pane.filterQuery], [true, "a"])
+            check("tag-leaving: no query is sent", pane.searchGen - root.tagGenBefore, 0)
+            return true
+        },
+        function () {
+            if (!ready(fixture)) return false
+            Filter.close(pane)
             root.pick("a.txt")
             pane.trash.open()
             return true
@@ -250,6 +431,71 @@ ShellRoot {
             check("autohide-click: rail consumes its click without selecting the covered row", pane.cursorRow.n, root.cursorBeforeRail)
             Flea.ViewState.changeLeaf("places", {autoHide: false})
             pane.open(fixture)
+            return true
+        },
+        function () {
+            if (!ready(fixture) || !pane.sidebar) return false
+            var rail = pane.sidebar
+            pane.focusView = "list"
+            root.railHome = rail.entries.findIndex(function (e) { return e.kind === "home" })
+            root.railRecent = rail.entries.findIndex(function (e) { return e.kind === "recent" })
+            root.railTrash = rail.entries.findIndex(function (e) { return e.kind === "trash" })
+            check("lit-place: the rail lights Home in a folder under it", rail.litIndex, root.railHome)
+            check("lit-place: the rail rows draw the lit look on Home only, and the IPC Trash row is not current", [root.railLit(), root.ipc(true).trashRail().current], [[root.railHome], false])
+            check("lit-place: an unfocused rail draws no cursor frame", root.railIndices("frame"), [])
+            rail.activate(root.railRecent)
+            check("lit-place: the request moves the cursor and not the lit place", [rail.cursorIndex, rail.litIndex], [root.railRecent, root.railHome])
+            return true
+        },
+        function () {
+            if (pane.recentMode !== "results" || pane.listInFlight) return false
+            var rail = pane.sidebar
+            check("lit-place: the landed Recent listing lights the Recent row", rail.litIndex, root.railRecent)
+            check("lit-place: the rows follow the lit place", root.railLit(), [root.railRecent])
+            rail.cursorIndex = root.railHome
+            pane.focusView = "rail"
+            check("lit-place: a focused rail draws the cursor frame on the cursor row, apart from the lit one", [root.railIndices("frame"), root.railLit()], [[root.railHome], [root.railRecent]])
+            rail.cursorIndex = root.railTrash
+            check("lit-place: the cursor on Trash, not lit, draws its frame and the IPC does not read it as current", [root.railIndices("frame"), root.railLit(), root.ipc(true).trashRail().current], [[root.railTrash], [root.railRecent], false])
+            rail.cursorIndex = root.railRecent
+            check("lit-place: the cursor on the lit row draws both", [root.railIndices("frame"), root.railLit()], [[root.railRecent], [root.railRecent]])
+            // A real press through the rail's PointHandler, released past the drag threshold so the row's tap never fires.
+            var litRow = rail.railItemFor(root.railRecent)
+            driver.mousePress(litRow, litRow.width / 2, litRow.height / 2, Qt.LeftButton, Qt.NoModifier, 1)
+            check("lit-place: a pointer press on the focused rail hides the frame and keeps the lit place", [rail.pointerFocus, root.railIndices("frame"), root.railLit()], [true, [], [root.railRecent]])
+            driver.mouseMove(litRow, litRow.width * 3, litRow.height / 2, 1, Qt.LeftButton, Qt.NoModifier)
+            driver.mouseRelease(litRow, litRow.width * 3, litRow.height / 2, Qt.LeftButton, Qt.NoModifier, 1)
+            rail.pointerFocus = false
+            // Trash always offers its menu, where Home's rows sit behind the Places menu switch.
+            rail.openRailMenu(root.railTrash, Qt.point(40, 80))
+            check("lit-place: a rail menu open on a row draws no frame there", [rail.menu.opened, rail.cursorIndex, root.railIndices("frame")], [true, root.railTrash, []])
+            rail.menu.close()
+            check("lit-place: closing the menu gives the focused rail its frame back on the menu's row", root.railIndices("frame"), [root.railTrash])
+            pane.focusView = "list"
+            check("lit-place: giving the rail's focus up takes the frame away and leaves the lit place", [root.railIndices("frame"), root.railLit()], [[], [root.railRecent]])
+            pane.closeRecent()
+            return true
+        },
+        function () {
+            if (!ready(fixture)) return false
+            check("lit-place: leaving Recent lights the folder's row again", pane.sidebar.litIndex, root.railHome)
+            pane.trash.open()
+            return true
+        },
+        function () {
+            if (!pane.trash.opened) return false
+            check("lit-place: an open Trash lights the Trash row alone, and the IPC reads it as current with the list holding focus", [pane.sidebar.litIndex, root.railLit(), root.ipc(true).trashRail().current], [root.railTrash, [root.railTrash], true])
+            pane.sidebar.cursorIndex = root.railHome
+            pane.focusView = "rail"
+            check("lit-place: an open Trash with the rail cursor off it is still current over the IPC", [root.railIndices("frame"), root.railLit(), root.ipc(true).trashRail().current], [[root.railHome], [root.railTrash], true])
+            pane.focusView = "list"
+            pane.trash.close()
+            return true
+        },
+        function () {
+            if (!ready(fixture)) return false
+            check("lit-place: closing Trash lights the folder's row again", pane.sidebar.litIndex, root.railHome)
+            pane.listArea.forceActiveFocus()
             return true
         },
         function () {
@@ -344,7 +590,47 @@ ShellRoot {
             check("single-click: one grid tap opens its folder", pane.path, fixture + "/sub")
             return true
         }
-    ].concat(Extra.steps(root, pane, Flea.ViewState, Flea.Theme))
+    ].concat(Extra.steps(root, pane, Flea.ViewState, Flea.Theme), [
+        function () {
+            root.trashCountWas = (Flea.ViewState.state.places || {}).trashCount === true
+            root.driveSizeWas = (Flea.ViewState.state.places || {}).driveSize === true
+            Flea.ViewState.changeLeaf("places", { trashCount: true, driveSize: false })
+            return true
+        },
+        function () {
+            var waiting = Extra.railBoardWaiting(railBoardRows, railBoard.width)
+            if (waiting !== Extra.FIRST_SIZE_ROW && Date.now() - root.started < root.settleGraceMs) return false
+            check("rail-board: before the sizes land the board waits on a drive size", waiting, Extra.FIRST_SIZE_ROW)
+            check("rail-board: before the sizes land the first drive size row draws no detail", Extra.firstSizeDetail(railBoardRows), "")
+            lateSizes.start()
+            return true
+        },
+        function () {
+            var waiting = probeNumber.detail !== "3" ? "the number probe" : Extra.railBoardWaiting(railBoardRows, railBoard.width)
+            if (waiting !== "" && Date.now() - root.started < root.settleGraceMs) return false
+            check("rail-board: no row still waits on its width or detail", waiting, "")
+            if (waiting === "") Extra.railBoardChecks(root, railBoardRows, Style.spacing.rowPaddingX, Style.spacing.rowGap, Flea.Theme.font.caption, Flea.Theme.railIconSize)
+            var gap = Style.spacing.rowGap
+            check("control: the square probe reserves its slot", probeSquare.indicatorSlot.width > 0, true)
+            check("control: the mark probe reserves its slot", probeMark.indicatorSlot.width > 0, true)
+            check("control: the empty probe reserves no slot", probeEmpty.indicatorSlot.width, 0)
+            check("rail-gap: a square row keeps one gap before the slot", root.railLabelGap(probeSquare), gap)
+            check("rail-gap: a mark row keeps one gap before the slot", root.railLabelGap(probeMark), gap)
+            check("rail-gap: a number row keeps one gap before its number", root.railLabelGap(probeNumber), gap)
+            check("rail-gap: an empty row keeps no gap", root.railLabelGap(probeEmpty), 0)
+            probeSquare.renaming = true
+            return true
+        },
+        function () {
+            if (!probeSquare.editorShown) return false
+            var editor = probeSquare.editorField.parent
+            check("rail-gap: the rename editor keeps one gap on a square row",
+                probeSquare.indicatorSlot.x - (editor.x + editor.width), Style.spacing.rowGap)
+            probeSquare.renaming = false
+            Flea.ViewState.changeLeaf("places", { trashCount: root.trashCountWas, driveSize: root.driveSizeWas })
+            return true
+        }
+    ])
     function reloadChecks(mode) {
         if (pane.viewMode !== mode || !ready(fixture)) return false
         if (root.reloadStage === 0) {

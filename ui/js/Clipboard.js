@@ -1,6 +1,14 @@
 .pragma library
 
 .import "ClipMarks.js" as ClipMarks
+.import "Menu.js" as Menu
+.import "Format.js" as Format
+
+// Whole sentences with "%1" for a value, filled by fill so each translates as one.
+var WORDS = {
+    setFailed: "Copied in this window only: %1",
+    clearFailed: "Could not clear the system clipboard: %1"
+}
 
 function empty() { return { paths: [], moving: false, token: "" } }
 function state() {
@@ -68,7 +76,7 @@ function receive(pane, message) {
         var entry = take(s.sets, pane.backend)
         if (!entry) return
         if (!message.ok) {
-            entry.pane.message("Copied in this window only: " + message.error, true)
+            entry.pane.message(Format.fill(WORDS.setFailed, message.error), true)
         } else {
             // Both panes can echo any earlier owner after a later set has answered.
             if (message.token) s.ownTokens[message.token] = true
@@ -102,7 +110,7 @@ function receive(pane, message) {
         }
         waiting.ready()
     } else if (message.op === "clear" && message.ok === false) {
-        pane.message("Could not clear the system clipboard: " + message.error, true)
+        pane.message(Format.fill(WORDS.clearFailed, message.error), true)
     }
 }
 
@@ -123,6 +131,17 @@ function read(pane, ready) {
     pane.backend.send({ c: "clipGet" })
 }
 
+var IMAGE_NAME = "Pasted image %1 at %2.png"
+function two(n) {
+    return (n < 10 ? "0" : "") + n
+}
+// Sample input: new Date(2026, 8, 23, 10, 14, 32) -> "Pasted image 2026-09-23 at 10.14.32.png".
+function imageName(at) {
+    var date = at.getFullYear() + "-" + two(at.getMonth() + 1) + "-" + two(at.getDate())
+    var time = two(at.getHours()) + "." + two(at.getMinutes()) + "." + two(at.getSeconds())
+    return IMAGE_NAME.replace("%1", date).replace("%2", time)
+}
+
 // All paste verbs read the same file selection, including the no-watcher fallback.
 function paste(pane, linkKind, forceMove) {
     var dest = pane.path
@@ -133,11 +152,16 @@ function paste(pane, linkKind, forceMove) {
         }
         var clip = pane.clipboard
         var sources = clip.paths
-        if (sources.length === 0) {
-            pane.message("There is nothing to paste; y copies and x cuts.", false)
+        if (sources.length === 0 && !linkKind) {
+            // No paths: the backend pastes an image as a stamped file, or answers its own sentence.
+            pane.backend.send({ c: "pasteimage", dest: dest, name: imageName(new Date()) })
             return
         }
-        pane.collide.ask({ c: linkKind ? "link" : "transfer",
+        if (sources.length === 0) {
+            pane.message(Menu.EMPTY_CLIPBOARD, false)
+            return
+        }
+        pane.asks().ask({ c: linkKind ? "link" : "transfer",
             op: linkKind || (forceMove || clip.moving ? "move" : "copy"), paths: sources, dest: dest },
             null, !linkKind && clip.moving)
     }

@@ -17,6 +17,23 @@ function displayState(textSize, baseSize, monitorScale) {
              monitorScale: monitorScale === undefined ? 1 : monitorScale, cornerRadius: 8 }
 }
 
+// Runs body with the rows for the given actions taken out of the generated tables, then puts them back where they were.
+function withoutKeys(actions, body) {
+    var tables = [Keymap.PRESET_KEYS, Keymap.SHARED_KEYS], held = []
+    for (var t = 0; t < tables.length; t++) {
+        for (var i = tables[t].length - 1; i >= 0; i--) {
+            if (actions.indexOf(tables[t][i].action) >= 0) held.push({ table: tables[t], at: i, row: tables[t].splice(i, 1)[0] })
+        }
+    }
+    Keymap.setPreset(Keymap.preset)
+    try {
+        body()
+    } finally {
+        for (var h = held.length - 1; h >= 0; h--) held[h].table.splice(held[h].at, 0, held[h].row)
+        Keymap.setPreset(Keymap.preset)
+    }
+}
+
 function kinds(rows) {
     return rows.map(function (row) { return row.kind }).join("|")
 }
@@ -45,9 +62,9 @@ function runRows(check) {
     // An Omarchy size that is not one of the seven still marks a stop, the nearest one.
     var between = Settings.rows("display", displayState(TextSize.follow(), 13))
     check("a size between two stops marks the nearer one", between[2].index, 3)
-    // HANDOFF rule 8: one short line, which at this panel's width is 47 characters, measured.
-    check("the hint is down to the two chords, on one line", display[3].label,
-          "Ctrl+Shift +/- walks them, Ctrl+Shift+0 follows.")
+    // The keys come from the running preset, spelled as a chord; the default preset binds these three.
+    check("the hint names the keys that step through the stops and the one that follows Omarchy", display[3].label,
+          "Ctrl+Shift++ and Ctrl+Shift+- step through them; Ctrl+Shift+0 follows Omarchy again.")
     // And Effective stays, because in Follow it is the size running and the ruler's mark is not.
     check("Effective reports the size actually running", display[4].label + "|" + display[4].value + "|" + display[4].role,
           "Effective|14 px|live")
@@ -60,7 +77,7 @@ function runRows(check) {
     check("and an unanswered query says so rather than claiming 1x",
           Settings.rows("display", displayState(TextSize.follow(), 14, 0))[6].value, "not reported")
     check("its hint is the board's own sentence, so no reader expects a control",
-          display[7].label, "Flea follows the compositor value and does not step or cycle it.")
+          display[7].label, "Flea follows Hyprland's scale and does not change it.")
     check("the board icon override defaults off", display[9].id + "|" + display[9].on, "display.hyprlandIcons|false")
 
     // Switching to Override adds the stop row, and nothing else about the section moves.
@@ -94,9 +111,9 @@ function runRows(check) {
     check("the current menu controls include Permissions, Update Flea and the retained hints preference",
           menus.filter(function (r) { return r.kind === "check" })
                .map(function (r) { return r.id }).join(","),
-          "cut,copy,paste,duplicate,rename,trash,delete,openwith,openTerminal,moveto,copyto,properties,permissions,makeExecutable,copyAs,showOriginal,shelf,compress,extract,convert,taildrop,localsend,dropbox,sharelink,runScript,placeMenu,updateFlea,extThumbs,pasteAs,invertSelection,keyHints")
-    // The one check that is not a menu action: it says how every row is drawn, not whether it is. GM's ruling of 2026-09-10 turns it off by default, with the rail's own detail rows, and src/uischema.rs stores that default, so an absent preference reads off and not on.
-    check("the hints row defaults off, as GM ruled over the boards",
+          "cut,copy,paste,duplicate,rename,trash,delete,openwith,run,openAsText,openTerminal,moveto,copyto,properties,permissions,makeExecutable,copyAs,showOriginal,tags,shelf,compress,extract,convert,flashDrive,taildrop,localsend,dropbox,sharelink,runScript,placeMenu,updateFlea,extThumbs,pasteAs,invertSelection,keyHints")
+    // The one check that is not a menu action: it says how every row is drawn, not whether it is. Since 2026-09-10 it is off by default, with the rail's own detail rows, and src/uischema.rs stores that default, so an absent preference reads off and not on.
+    check("the hints row defaults off, as ruled over the boards",
           find(menus, "keyHints").label + "|" + find(menus, "keyHints").on,
           "Show keyboard hints|false")
     check("and it reads the value it is given",
@@ -183,8 +200,33 @@ function runPresets(check) {
         }
     }
     check("preset check denominator covers all effective bindings", total > 100, true)
+    // A key the preset leaves unbound is named by no hint: the hint is left out and never drawn empty or with a hole in its sentence.
+    var running = Keymap.preset, hollow = []
+    try {
+        for (var h = 0; h < Settings.PRESETS.length; h++) {
+            Keymap.setPreset(Settings.PRESETS[h])
+            var drawn = Settings.rows("display", displayState(TextSize.follow(), 14)).concat(Settings.rows("keys", { preset: Settings.PRESETS[h] }),
+                Settings.rows("preview", { data: { preview: { loadOn: "manual" } } }))
+            var bare = drawn.filter(function (r) { return r.kind === "hint" && (String(r.label).trim().length === 0 || /^ | {2}/.test(r.label)) })
+            if (bare.length > 0 || /^ | {2}/.test(TextSize.announce({ mode: 16 }, 14))) hollow.push(Settings.PRESETS[h])
+        }
+    } finally {
+        Keymap.setPreset(running)
+    }
+    check("no preset draws an empty hint row or a sentence with a key missing from it", hollow.join(","), "")
+    // Every shipped preset binds the four actions, so the omitting branches only run on a table that leaves them unbound; the control first shows the bound rows draw both hints.
+    var hintCount = function (test) { return Settings.rows("display", displayState(TextSize.follow(), 14)).concat(Settings.rows("preview", { data: { preview: { loadOn: "manual" } } })).filter(function (r) { return r.kind === "hint" && test.test(String(r.label)) }).length }
+    check("with the keys bound both hints draw, so the zeros below are not vacuous", Math.min(hintCount(/step through them/), hintCount(/loads the current selection/)) >= 1, true)
+    withoutKeys(["textSizeUp", "textSizeDown", "textSizeReset", "loadPreview"], function () {
+        check("an unbound text size key leaves its hint out of Display", hintCount(/step through them/), 0)
+        check("an unbound load key leaves its hint out of Preview", hintCount(/loads the current selection/), 0)
+        check("no hint left on those panes is empty or holed", hintCount(/^\s*$|^ | {2}| [.,;]/), 0)
+        check("an override with no reset key announces the size alone", TextSize.announce({ mode: 16 }, 14), "Text size 16px")
+    })
     var menuRows = Settings.menuRows([], true)
-    check("SettingsMenus contains exactly 30 action switches", menuRows.filter(function (r) { return r.kind === "check" && r.id !== "keyHints" }).length, 30)
+    check("SettingsMenus contains exactly 34 action switches", menuRows.filter(function (r) { return r.kind === "check" && r.id !== "keyHints" }).length, 34)
+    // The board's Tags row is one of those switches.
+    check("the added switch is the Tags menu row", find(menuRows, "tags").label, "Tags")
     check("Delete permanently is visually destructive", find(menuRows, "delete").role, "error")
     check("Delete permanently explains its default", find(menuRows, "delete").value, "off by default")
 }
@@ -209,13 +251,13 @@ function runCompletionRows(check) {
     check("a sibling named like home is outside it", find(homed, "favourite:3").display, "/home/gmx/s")
     check("no home published shows the stored path", find(Settings.rows("places", { data: { places: { favourites: [{ label: "P", path: "/home/gm/P" }] } } }), "favourite:0").display, "/home/gm/P")
     check("optional rail details default off", [find(places, "places.driveSize").on, find(places, "places.trashCount").on].join(","), "false,false")
-    // GM's 0.3.3 ruling: unmounted drives ship on, and an off the file stored is still the operator's.
+    // Decided in 0.3.3: unmounted drives ship on, and an off the file stored is still the operator's.
     check("Show unmounted drives defaults on and a stored off reads off", [find(places, "places.showUnmounted").on,
           find(Settings.rows("places", { data: { places: { showUnmounted: false } } }), "places.showUnmounted").on].join(","), "true,false")
     // Sidebar040: Recent is a Built in row like Home and Trash, and it ships off.
     check("Recent ships off and a stored on reads back on", [find(places, "places.showRecent").label + "|" + find(places, "places.showRecent").on,
           find(Settings.rows("places", { data: { places: { showRecent: true } } }), "places.showRecent").on].join(","), "Recent|false,true")
-    check("the Rail controls follow the ruled order", places.slice(-7, -2).map(function (row) { return row.label }).join("|"), "Show Trash count|Show unmounted drives|Auto-hide sidebar|Show sidebar|Sidebar width")
+    check("the Rail controls follow the ruled order", places.slice(-7, -2).map(function (row) { return row.label }).join("|"), "Show unmounted drives|Show tags|Auto-hide sidebar|Show sidebar|Sidebar width")
     // Directive 74: two handles on one remembered state, so the row reads the word ctrl-b writes.
     check("Show sidebar is checked while the rail is shown", find(places, "places.rail").on, true)
     check("and auto-hide ships off, so nothing hides itself", find(places, "places.autoHide").on, false)
@@ -226,7 +268,7 @@ function runCompletionRows(check) {
           [find(hiding, "places.rail").available, Settings.focusable(find(hiding, "places.rail"))].join("|"), "false|false")
     check("and it is a control again with auto-hide off",
           [find(places, "places.rail").available, Settings.focusable(find(places, "places.rail"))].join("|"), "true|true")
-    // The 30 day sweep's own row, at the foot of Places under its own eyebrow. Off unless ui.json says otherwise, which is the whole of GM's opt-in ruling as the panel sees it.
+    // The 30 day sweep's own row, at the foot of Places under its own eyebrow. Off unless ui.json says otherwise, which is the whole of the opt-in behavior as the panel sees it.
     check("Places ends with the Trash group and its one row",
           places.slice(-2).map(function (row) { return row.label }).join("|"),
           "Trash|Empty after 30 days")

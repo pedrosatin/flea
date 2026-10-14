@@ -38,6 +38,8 @@ thread_local! {
     static HOLD_WAVES: Cell<bool> = const { Cell::new(false) };
     // Descriptors still held or unjoined where an operation reports, None until read.
     static AT_REPORT: Cell<Option<usize>> = const { Cell::new(None) };
+    // How many touch calls named a directory, flushed or not: the merge layer must add none of its own.
+    static TOUCH_CALLS: Cell<usize> = const { Cell::new(0) };
 }
 
 // errno 22 means no range writeback, not a lost byte; errno 5 is a drive refusing bytes.
@@ -142,6 +144,10 @@ pub(crate) fn batch_syncfs_for(dest: &Path, body: &str, durable: bool, rclone: b
     }
 }
 
+fn rclone_in(dest: &Path, body: &str) -> bool {
+    crate::backend::mountinfo::mount_entry_in(dest, body).is_some_and(|e| fstype_is_rclone(&e.fstype))
+}
+
 // The done line's own words for a folder the drive would not confirm, printable as-is.
 pub const DIR_UNCONFIRMED: &str = "copied, but the drive did not confirm the folder";
 
@@ -219,6 +225,8 @@ pub struct Durability {
     pub rclone: bool,
     pub file_failed: bool,
     pub batch_syncfs: bool,
+    // True when the card's Rename answer covers this FAT destination, so a tree writes each UTF-8 name below the top as fatnames::sanitize gives it and any other name as it is.
+    pub rename_fat: bool,
     // A failed settle stays failed, so later confirms keep every source.
     unsettled: bool,
     held: Vec<std::fs::File>,
@@ -240,13 +248,14 @@ impl Durability {
 
     // Sample input: Some("... vfat /dev/sda1 ...") batches a durable dest, None never does without a mount table.
     fn begin_from(dest: &Path, mountinfo: Option<&str>) -> Durability {
-        let rclone = dest_is_rclone(dest);
+        let real = mountinfo.map_or_else(|| dest.to_path_buf(), |body| crate::backend::extclass::resolved_in(dest, body));
+        let rclone = mountinfo.map_or_else(|| dest_is_rclone(dest), |body| rclone_in(dest, body) || rclone_in(&real, body));
         let durable = !rclone && dest_is_durable(dest);
         let batch_syncfs = match mountinfo {
-            Some(body) => batch_syncfs_for(dest, body, durable, rclone),
+            Some(body) => batch_syncfs_for(dest, body, durable, rclone) || batch_syncfs_for(&real, body, durable, rclone),
             None => false,
         };
-        Durability { durable, rclone, file_failed: false, batch_syncfs, unsettled: false, held: Vec::new(),
+        Durability { durable, rclone, file_failed: false, batch_syncfs, rename_fat: false, unsettled: false, held: Vec::new(),
             wave: Wave::default(), touched: HashSet::new(), last: None }
     }
 
@@ -351,6 +360,8 @@ impl Durability {
 
     // One entry per directory however many files land in it, covering a tree that revisits a parent.
     pub fn touch(&mut self, dir: &Path) {
+        #[cfg(test)]
+        TOUCH_CALLS.with(|v| v.set(v.get() + 1));
         if !self.durable {
             return;
         }
@@ -637,6 +648,7 @@ fn confirm_finish(id: usize, tx: &std::sync::mpsc::Sender<crate::backend::opsreq
 pub fn test_reset() {
     FORCE.with(|v| v.borrow_mut().clear());
     FAKE_MOUNTINFO.with(|v| *v.borrow_mut() = None);
+    crate::backend::extclass::test_reset_link_reads();
     FAIL_FILE.with(|v| v.set(false));
     FAIL_DIR.with(|v| v.set(false));
     FILE_FLUSHES.with(|v| v.set(0));
@@ -652,6 +664,7 @@ pub fn test_reset() {
     ORDER_LOG.with(|v| v.borrow_mut().clear());
     HOLD_WAVES.with(|v| v.set(false));
     AT_REPORT.with(|v| v.set(None));
+    TOUCH_CALLS.with(|v| v.set(0));
 }
 
 #[cfg(test)]
@@ -744,6 +757,12 @@ pub fn test_set_fail_range_write(fail: bool) {
 #[cfg(test)]
 pub fn test_set_fail_range_wait(errno: i32) {
     FAIL_RANGE_WAIT.with(|v| v.set(errno));
+}
+
+// Test builds only: how many touch calls named a directory, flushed or not.
+#[cfg(test)]
+pub fn test_touch_calls() -> usize {
+    TOUCH_CALLS.with(|v| v.get())
 }
 
 #[cfg(test)]

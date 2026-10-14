@@ -28,6 +28,11 @@ read_seam() {
 # Style resolves the font family through fc-match after startup, so a read that lands before it
 # answers reports the alias; five short waits cover that without ever excusing a missing font.
 seam=$(read_seam)
+# The seam is built after the first listing, so a read just after launch can find no target yet.
+for _attempt in $(seq 1 50); do
+  case $seam in *baseSize=*) break ;; esac
+  sleep 0.2; seam=$(read_seam)
+done
 for _attempt in 1 2 3 4 5; do
   case $seam in
     family=monospace*) sleep 0.2; seam=$(read_seam) ;;
@@ -101,9 +106,9 @@ cornerRadius|$rounding|hyprctl getoption decoration:rounding, read live above
 previewFraction|0.82|Flea constant, Quick-Look sized inset
 gridIconSize|46|2 x 23
 gridMinCellWidth|146|space(125), GridView.dc.html's five-column reference viewport over five tiles
-settingsPanelWidth|630|round(space(480) x 9/8), GM's roomier SettingsView board
+settingsPanelWidth|630|round(space(480) x 9/8), the roomier SettingsView board
 settingsRailWidth|169|630 - 459 - 2 outer hairlines, SettingsView rule 1
-settingsPaneWidth|459|round(space(350) x 9/8), GM's roomier Settings pane
+settingsPaneWidth|459|round(space(350) x 9/8), the roomier Settings pane
 settingsRailPaddingY|10|10 x 13 / 13, the inset Settings.dc.html gives the rail column above its first row"
 
 checked=0

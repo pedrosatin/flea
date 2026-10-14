@@ -53,13 +53,13 @@ else
     bad "the offer must read $expected_seq, got: $offer_seq"
 fi
 
-# FileDrag and Drag.js offer uri-list; DropInto and RowDrag consume it, with no other ui users.
+# FileDrag and Drag.js offer uri-list; DropInto, RowDrag and the grid's one shared area consume it, with no other ui users.
 uri_files=$(while IFS= read -r f; do
     code_of "$f" | grep -H --label="$f" 'text/uri-list'
 done < <(find ui -type f \( -name '*.qml' -o -name '*.js' \)) | cut -d: -f1 | sort -u)
-expected_uri_files=$(printf '%s\n' ui/DropInto.qml ui/FileDrag.qml ui/RowDrag.qml ui/js/Drag.js | sort -u)
+expected_uri_files=$(printf '%s\n' ui/DropInto.qml ui/FileDrag.qml ui/GridArea.qml ui/RowDrag.qml ui/js/Drag.js | sort -u)
 if [[ "$uri_files" == "$expected_uri_files" ]]; then
-    ok "uri-list is confined to the file payload producers and their two receivers"
+    ok "uri-list is confined to the file payload producers and their three receivers"
 else
     bad "unexpected text/uri-list files: $uri_files"
 fi
@@ -98,8 +98,8 @@ floor_probe_seconds=15
 floor_output=$(env QML_XHR_ALLOW_FILE_READ=1 QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_FORCE_STDERR_LOGGING=1 \
     timeout "$floor_probe_seconds" qml6 tests/dragwire-floor.qml 2>&1)
 floor_status=$?
-if [[ "$floor_status" == 0 ]] && grep -q 'floor drops: 21 checks, 0 failed' <<< "$floor_output"; then
-    ok "list, grid and columns floors refuse held listings and target the shown directory after settlement"
+if [[ "$floor_status" == 0 ]] && grep -q 'floor drops: 56 checks, 0 failed' <<< "$floor_output"; then
+    ok "list, grid and columns floors refuse held listings, target the shown directory after settlement and follow the held keys"
 else
     bad "floor drops failed (status=$floor_status): $floor_output"
 fi

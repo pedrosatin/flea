@@ -1,5 +1,6 @@
 .import "../../ui/js/Tabs.js" as Tabs
 .import "tabsfixture.js" as Fixture
+.import "../../ui/js/Swap.js" as Swap
 
 // What a tab switch restores and what it must re-list: issues 91 and 93, nixfred. The stub pane
 // is tests/js/tabsfixture.js, shared with tests/js/tabs.js.
@@ -10,6 +11,7 @@ function run(check) {
     // scope used to look like the one switch that re-lists nothing: the new tab showed search rows.
     var scoped = Fixture.pane("/home/gm")
     scoped.searchMode = "results"
+    scoped.searchQuery = "gm"
     scoped.searchFrom = "/home/gm"
     Tabs.openNew(scoped)
     check("a tab opened onto the scope its search walked lists it again",
@@ -19,6 +21,7 @@ function run(check) {
     Tabs.openNew(switching)
     switching.listed = []
     switching.searchMode = "results"
+    switching.searchQuery = "gm"
     switching.searchFrom = "/home/gm"
     Tabs.selectAt(switching, 0)
     check("switching to a tab standing on that scope lists it again",
@@ -28,6 +31,7 @@ function run(check) {
     Tabs.openNew(closing)
     closing.listed = []
     closing.searchMode = "results"
+    closing.searchQuery = "gm"
     closing.searchFrom = "/home/gm"
     Tabs.closeAt(closing, 1)
     check("closing a searching tab onto one on that scope lists it again",
@@ -123,4 +127,56 @@ function run(check) {
     Tabs.applyPending(already)
     check("so a later user sort survives the reply that answers it",
           already.sorted.length + "|" + already.backend.sortBy + ":" + already.backend.sortDesc, "0|size:true")
+
+    // A listing past its deadline is let go by the tab operation that lists and left standing by one that lists nothing.
+    function waitingTabs() {
+        var w = Fixture.pane("/home/gm")
+        Tabs.openNew(w)
+        w.path = "/home/gm/Work"
+        w.listed = []
+        w.listInFlight = true
+        w.listingState = "waiting"
+        w.stateMessage = "That folder is not responding."
+        return w
+    }
+    function wait(w) { return w.listInFlight + "|" + w.listingState + "|" + w.said.length }
+    var picked = waitingTabs()
+    Tabs.selectAt(picked, 0)
+    check("switching tabs past the wait lists the tab's folder", picked.listed.join(",") + "|" + wait(picked), "/home/gm|false|loading|0")
+    var current = waitingTabs()
+    Tabs.selectAt(current, 1)
+    check("selecting the current tab lists nothing and keeps the wait", current.listed.length + "|" + wait(current), "0|true|waiting|0")
+    var alike = waitingTabs()
+    alike.tabs.items[0].path = "/home/gm/Work"
+    Tabs.selectAt(alike, 0)
+    check("a tab on the folder being shown still lists, the held listing is not its answer", alike.listed.join(",") + "|" + wait(alike), "/home/gm/Work|false|loading|0")
+    var opened = waitingTabs()
+    Tabs.openNew(opened)
+    check("a new tab past the wait lists its folder", opened.listed.join(",") + "|" + Tabs.count(opened) + "|" + wait(opened), "/home/gm/Work|3|false|loading|0")
+    var dropped = waitingTabs()
+    Tabs.closeAt(dropped, 0)
+    check("closing a hidden tab lists nothing and keeps the wait", dropped.listed.length + "|" + Tabs.count(dropped) + "|" + wait(dropped), "0|1|true|waiting|0")
+    var closed = waitingTabs()
+    Tabs.closeAt(closed, 1)
+    check("closing the current tab lists the one it lands on", closed.listed.join(",") + "|" + wait(closed), "/home/gm|false|loading|0")
+    var moved = waitingTabs()
+    Tabs.move(moved, 0, 1)
+    check("reordering lists nothing and keeps the wait",
+          moved.tabs.items.map(function (tab) { return tab.path }).join(",") + "|" + moved.listed.length + "|" + wait(moved), "/home/gm/Work,/home/gm|0|true|waiting|0")
+    var received = waitingTabs()
+    check("a waiting pane takes a dropped tab", Tabs.canReceive(received), true)
+    check("and lists its folder", Tabs.receiveTab(received, JSON.stringify(["222", "tok", "/tmp/r", "list", ""]), 1) + "|" + received.listed.join(",") + "|" + wait(received), "true|/tmp/r|false|loading|0")
+    var sent = waitingTabs()
+    check("a tab moved out of a waiting pane closes", Tabs.closeTabAfterMove(sent, 0) + "|" + Tabs.count(sent) + "|" + wait(sent), "closed|1|true|waiting|0")
+    var direct = Fixture.pane("/tmp/one")
+    Tabs.openNew(direct)
+    direct.listingPath = direct.path = "/tmp/two"
+    direct.listInFlight = true
+    direct.superseded = false
+    Tabs.closeAt(direct, 1)
+    check("a direct close while loading closes the tab, refusing nothing", Tabs.count(direct) + "|" + direct.said.join(""), "1|")
+    check("and the surviving tab is current, listed over the one out", Tabs.currentIndex(direct) + "|" + direct.path + "|" + direct.superseded, "0|/tmp/one|true")
+    // The path the fixture's openWithoutHistory received from Tabs.closeAt, not the listingPath the stub wrote.
+    var asked = direct.listed[direct.listed.length - 1]
+    check("and the closed tab's late listed line is dropped, the surviving tab's is not", asked + "|" + Swap.onListed({}, true, "/tmp/two", asked, false) + "|" + (Swap.onListed({}, true, "/tmp/one", asked, false) !== Swap.DROP), "/tmp/one|" + Swap.DROP + "|true")
 }

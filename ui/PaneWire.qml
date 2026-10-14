@@ -4,7 +4,10 @@ import "js/DirSizes.js" as DirSizes
 import "js/DragOut.js" as DragOut
 import "js/Errors.js" as Errors
 import "js/Anchor.js" as Anchor
+import "js/Archive.js" as Archive
+import "js/BackReturn.js" as BackReturn
 import "js/Nav.js" as Nav
+import "js/Format.js" as Format
 import "js/Ops.js" as Ops
 import "js/Clipboard.js" as Clipboard
 import "js/Permissions.js" as Permissions
@@ -13,7 +16,6 @@ import "js/Search.js" as Search
 import "js/SlowOp.js" as SlowOp
 import "js/Swap.js" as Swap
 import "js/Tabs.js" as Tabs
-import "js/Thumbs.js" as Thumbs
 import "js/ExtThumbs.js" as ExtThumbs
 import "js/Transfer.js" as Transfer
 
@@ -27,17 +29,18 @@ Item {
 
     // The listing's floor as a drop target, under the rows: a drop past the last row, or one a file
     // row refused, lands in the directory being shown. Declared first in ui/Pane.qml, so it sits below.
-    // Columns owns its narrower active floor; a search listing's path is the walk scope, not a row's home.
+    // Columns owns its narrower active floor; a search listing's base is the walk scope.
     // Recent stands on the root, so its floor takes no drop: a row's own folder still does.
     Flea.DropInto {
         x: root.pane ? root.pane.listSlot.x : 0
         y: root.pane ? root.pane.listSlot.y : 0
         width: root.pane ? root.pane.listSlot.width : 0
         height: root.pane ? root.pane.listSlot.height : 0
-        enabled: root.pane !== null && !root.pane.trash.opened && root.pane.searchMode === ""
+        enabled: root.pane !== null && !root.pane.trash.opened && !root.pane.flashActive && root.pane.searchMode === ""
                  && root.pane.recentMode === ""
                  && (root.pane.viewMode === "list" || root.pane.viewMode === "grid")
         pane: root.pane
+        scrolls: true
         dest: root.pane ? root.pane.dropPath : ""
         refuseLoading: DragOut.refuseLoading(root.pane && root.pane.listInFlight, false, false)
         // Unknown until the listed reply lands, because dirDev is still the directory being left.
@@ -55,6 +58,8 @@ Item {
     property string retryFolder: ""
     property string retryListing: ""
     property string retrySelectionText: ""
+    // The selection identity the retry line was written for: the line goes when the identity moves off it.
+    property string retrySelectionIdentity: ""
     // One burst of writes is one re-read: the timer absorbs later notifications instead of being
     // restarted by them, so a directory under continuous change settles rather than never firing.
     readonly property int watchMs: 400
@@ -78,7 +83,10 @@ Item {
         onFailed: function (path) { pane.message("No application on this system opened that file.", true) }
         onIsDirectory: function (path) { pane.open(path) }
         onTerminalBusy: function (path) { pane.message("Still opening the last terminal; try again in a moment.", false) }
-        onTerminalFailed: function (path) { pane.message("No terminal on this system opened that directory.", true) }
+        onTerminalFailed: function (path) { pane.message("No terminal on this system opened that folder.", true) }
+        // The run card's own answers: a program asks once on its raw ask line, and a file no application claims asks Open with.
+        onAskRunRaw: function (path, text) { pane.askRunCard({ path: path, raw: text }) }
+        onAskOpenWith: function (path) { pane.showOpenWith(path) }
     }
 
     Flea.ShareLink {
@@ -112,6 +120,18 @@ Item {
         onTriggered: root.reread()
     }
 
+    // Ok item lines wait here and join the card at the next other line or this beat, so a run of small files writes it once; a failure never waits.
+    property var heldItems: []
+    readonly property int heldItemBeatMs: 100
+    Timer { id: heldItemBeat; interval: root.heldItemBeatMs; onTriggered: root.flushItems() }
+    function flushItems() {
+        heldItemBeat.stop()
+        if (root.heldItems.length === 0) return
+        root.pane.transfer = Transfer.itemsDone(root.pane.transfer, root.heldItems)
+        root.heldItems = []
+        root.pane.sticky(Ops.progressLine(root.pane.transfer))
+    }
+
     // A debt owed for the directory the pane has left is not owed by the one it arrived in: without
     // this, a change in A held back by a selection is paid by a full re-list of B.
     Connections {
@@ -123,14 +143,16 @@ Item {
             root.retryId = 0
             root.retryPaths = []
         }
-        function onMenuSelectionIdentityChanged() { root.retrySelectionText = "" }
+        function onMenuSelectionInputsChanged() {
+            if (root.retrySelectionText && root.pane.menuSelectionIdentity() !== root.retrySelectionIdentity) root.retrySelectionText = ""
+        }
         function onListInFlightChanged() { if (!pane.listInFlight) root.locateRetry() }
     }
 
     function locateRetry() {
         if (!root.retryId || root.retryListing || pane.listInFlight || pane.searchRunning) return
         if (pane.path !== root.retryFolder) { root.retryId = 0; root.retryPaths = []; return }
-        root.retryListing = pane.menuSelectionIdentity
+        root.retryListing = pane.menuSelectionIdentity()
         pane.backend.send({c: "locate", paths: root.retryPaths, transferId: root.retryId})
     }
 
@@ -165,10 +187,11 @@ Item {
     Connections {
         target: pane.backend
 
-        function onListed(total, readMs, sortMs, path, changed) { swap.takeListed(total, readMs, sortMs, path, changed) }
-        function onRows(start, items, ms, kinds, listing) { swap.takeRows(start, items, kinds, listing) }
+        function onListed(total, readMs, sortMs, path, changed, gen) { swap.takeListed(total, readMs, sortMs, path, changed, gen) }
+        function onRows(start, items, ms, kinds, listing, gen) { swap.takeRows(start, items, kinds, listing, gen) }
 
         function onLocated(message) {
+            if (BackReturn.takeLocated(pane, message)) return
             Tabs.locatedCursor(pane, message)
             var taken = Anchor.takeLocated(root.pane, root.anchor, message, Theme.fileRowHeight)
             if (taken.handled) {
@@ -179,7 +202,7 @@ Item {
             root.retryId = 0
             root.retryPaths = []
             if (message.directory !== pane.path || pane.path !== root.retryFolder
-                    || root.retryListing !== pane.menuSelectionIdentity || pane.listInFlight) return
+                    || root.retryListing !== pane.menuSelectionIdentity() || pane.listInFlight) return
             if (!message.ok) { pane.message(message.error, true); return }
             var matches = message.matches || []
             if (!matches.length) return
@@ -187,48 +210,23 @@ Item {
             for (var i = 0; i < matches.length; i++) pane.selection.toggle(matches[i].index)
             pane.selectionVersion++
             pane.setCursor(matches[0].index)
+            root.retrySelectionIdentity = root.pane.menuSelectionIdentity()
             root.retrySelectionText = Ops.retrySelectionLine(matches)
         }
 
-        // Sample input: {"t":"searching","n":812,"scanned":41200,"ms":300.114}
-        function onSearching(total, scanned, ms) {
-            if (pane.searchMode !== Search.RESULTS) {
-                return
-            }
-            pane.total = total
-            pane.searchScanned = scanned
-            pane.searchMs = ms
-            pane.listingState = Search.listingState(pane, total)
-            // Unlike list, a search rides no first screenful along: the count grows, so the window is asked for as it does.
-            pane.listArea.restartCoalesce()
-            pane.listArea.restartSettle()
-        }
-
-        // Sample input: {"t":"searched","n":14673,"scanned":284446,"ms":229.008,"cancelled":false}
-        function onSearched(total, scanned, ms, cancelled) {
-            if (pane.searchMode !== Search.RESULTS) {
-                return
-            }
-            pane.searchRunning = false
-            pane.searchCancelled = cancelled
-            pane.total = total
-            pane.searchScanned = scanned
-            pane.searchMs = ms
-            pane.listingState = Search.listingState(pane, total)
-            // The rows were ranked immediately before this line, so the window on screen is in
-            // discovery order and every index in it now names another file. A coalesce would not
-            // fix that: it asks for a window only on drift, and a full held one drifts on neither edge.
-            Search.ranked(pane)
-            pane.listArea.restartSettle()
+        // Sample input: {"t":"searched","n":14673,"scanned":284446,"ms":229.008,"cancelled":false,"gen":3,"walking":false}
+        // The answered counts land for the newest sent generation with the first window already in place.
+        function onSearched(total, scanned, ms, cancelled, gen, walking) {
+            Search.searched(pane, total, scanned, ms, cancelled, gen, walking)
         }
 
         // Sample input: {"t":"unmounted","path":"/media/stick","parent":"/media"}
-        // The open mount went away, so the pane moves to the nearest existing parent.
+        // The open mount went away, so the pane moves up to its nearest existing parent.
         function onUnmounted(path, parent) {
             if (path !== pane.path && !pane.path.startsWith(path + "/"))
                 return
             pane.openWithoutHistory(parent)
-            pane.message("The mount went away, so this folder is no longer available.", false)
+            pane.message("That drive or share was disconnected, so this folder is no longer available", false)
         }
 
         // Sample input: {"t":"changed","path":"/home/gm/Downloads"}
@@ -248,14 +246,10 @@ Item {
         function onThumbed(row, file) {
             if (pane.listInFlight)
                 return
-            if (file === "" && pane.thumbState.file[row] === Thumbs.CACHE_ASKED
-                    && (!pane.storageKnown || !ExtThumbs.cacheOnly(pane.storageClass, ViewState.preview))) {
-                pane.thumbState = Thumbs.miss(pane.thumbState, row, true, pane.thumbCap)
-                // A lost prefetch is visible work again, so the settled view re-plans it in full, never as a prefetch.
-                // The re-plan never prefetches, so this cannot ask twice in one rest.
-                if (pane.listArea) pane.listArea.restartSettle()
-            } else
-                pane.thumbState = Thumbs.remember(pane.thumbState, row, file, pane.thumbCap)
+            var next = ExtThumbs.thumbReply(pane.thumbState, row, file, pane.thumbCap, pane.storageKnown, pane.storageClass, ViewState.preview)
+            pane.thumbState = next.state
+            // A lost prefetch is visible work again: the settled view re-plans it in full and never as a prefetch, so it asks once per rest.
+            if (next.missed && pane.listArea) pane.listArea.restartSettle()
         }
 
         // The Make executable row's own probe, answered off the loop; the pane keeps only its newest id.
@@ -271,6 +265,7 @@ Item {
         // The verb comes off the wire, never off the clipboard: paste spends a cut before this line
         // arrives, and a Dropbox move never touches the clipboard at all.
         function onTransferStarted(id, n, moving, extract) {
+            root.heldItems = []
             root.retryId = 0
             root.retryPaths = []
             root.retrySelectionText = ""
@@ -284,6 +279,7 @@ Item {
             if (id !== pane.transfer.id) {
                 return
             }
+            root.flushItems()
             // Reassigned rather than mutated in place: an in-place write re-evaluates no binding,
             // so the card would never see a sample. The bytes and the total ride along with it.
             // The writing phase names the drive instead of a file: every file is already complete,
@@ -300,6 +296,8 @@ Item {
             if (id !== pane.transfer.id) {
                 return
             }
+            if (ok) { root.heldItems.push({ index: index, name: name }); if (!heldItemBeat.running) heldItemBeat.start(); return }
+            root.flushItems()
             var firstFailure = !ok && err !== "cancelled" && !pane.transfer.failureReported
             pane.transfer = Object.assign(Transfer.itemDone(pane.transfer, index, name),
                                           { failureReported: pane.transfer.failureReported || firstFailure })
@@ -308,12 +306,17 @@ Item {
             pane.sticky(Ops.progressLine(pane.transfer))
         }
 
-        // Sample input: {"t":"transferdone","id":12,"ok":1,"failed":1,"skipped":0,"cancelled":false}
-        function onTransferDone(id, ok, failed, skipped, cancelled, retryPaths, durable, note) {
+        // Sample input: {"t":"transferdone","id":12,"ok":1,"failed":1,"skipped":0,"cancelled":false,"durable":false,"note":""}
+        // Sample input: {"t":"transferdone","id":12,"ok":1,"failed":0,"skipped":0,"cancelled":false,"durable":false,"note":"","merged":212,"keptBoth":3,"into":"trip"}
+        function onTransferDone(id, ok, failed, skipped, cancelled, retryPaths, durable, note, merged, keptBoth, into) {
             if (id !== pane.transfer.id) {
                 return
             }
-            var line = Ops.transferDone(pane.transfer, ok, failed, skipped, cancelled, durable, note)
+            root.flushItems()
+            // A merge carries into on its own line; every other transfer keeps today's line.
+            var line = into && pane.collide ? pane.collide.doneLine(pane.transfer,
+                { into: into, merged: merged, keptBoth: keptBoth, ok: ok, failed: failed, skipped: skipped, cancelled: cancelled, durable: durable, note: note })
+                : Ops.transferDone(pane.transfer, ok, failed, skipped, cancelled, durable, note)
             var unreportedFailure = failed > 1 || (failed > 0 && !pane.transfer.failureReported)
             pane.transfer = Ops.emptyTransfer()
             pane.sticky("")
@@ -353,7 +356,9 @@ Item {
 
         // A remote write past its deadline: information only, so the request stays open
         // for the late reply, which closes it exactly as an in-time reply would.
-        function onSlowOp(op, path, msg) { SlowOp.show(pane, msg) }
+        function onSlowOp(op, path, msg) { pane.message(msg, false) }
+        // One line for the whole batch, and one undo reverses every rename it made.
+        function onBulkRenamed(ok) { pane.bulkRenamed(ok) }
 
         // Sample input: {"t":"made","ok":true,"path":"/home/gm/Pictures/New Folder"}
         // The same refresh onRenamed does, which is also what puts the order back to name ascending
@@ -365,7 +370,7 @@ Item {
         }
 
         function onDuplicated(ok, path) {
-            pane.message("Duplicated to " + Ops.leaf(path) + Status.UNDO_HINT, false)
+            pane.message(Format.fill(Ops.WORDS.duplicated, Ops.leaf(path)) + Status.undoHint(), false)
             pane.refresh(path)
         }
 
@@ -385,7 +390,7 @@ Item {
             if (!pane.linkTargetPendingId || id !== pane.linkTargetPendingId) return
             pane.linkTargetPendingId = 0
             if (directory.length === 0 || (name.length === 0 && directory !== "/")) {
-                pane.message("That link points nowhere to reveal.", true)
+                pane.message("That link points to an item that no longer exists.", true)
                 return
             }
             pane.pendingSelect = name.length === 0 ? "" : directory === "/" ? "/" + name : directory + "/" + name
@@ -395,7 +400,7 @@ Item {
         function onUndone(op, ok) {
             pane.sticky("")
             pane.message(Ops.undone(op), false)
-            pane.refresh("", op === "permissions")
+            pane.refresh("", op === "permissions" || op === "settags")
         }
 
         // MenuAdditions040 callout 10: Make executable reuses permissions batch; only this pane's pending id is answered here.
@@ -404,7 +409,7 @@ Item {
             if (!pane.makeExecPendingId || !message || message.id !== pending || message.op !== "applyMany") return
             pane.makeExecPendingId = 0
             if (message.ok === true) {
-                pane.message("Made it executable." + Status.UNDO_HINT, false)
+                pane.message(Status.withUndo("Made it executable."), false)
                 pane.refresh("")
             } else {
                 pane.message(message.error && message.error.length > 0 ? message.error : "That file could not be made executable.", true)
@@ -420,16 +425,21 @@ Item {
         function onRedone(op, ok) {
             pane.transfer = Ops.emptyTransfer()
             pane.sticky("")
-            pane.message("Redid the " + op + Status.UNDO_HINT, false)
-            pane.refresh("", op === "permissions")
+            pane.message(Ops.redone(op) + Status.undoHint(), false)
+            pane.refresh("", op === "permissions" || op === "settags")
         }
 
-        // A success nobody could check must not read as one that was checked, so the unverified
-        // extract says so in the same slot rather than in a dialog.
-        function onArchiveDone(id, ok, verified, err) {
+        // An unverified extract says so in the status slot, an encrypted archive opens the extract card, and any other failure messages.
+        function onArchiveDone(id, ok, verified, err, path, dest) {
             if (pane.transfer.extract === true && pane.transfer.id === id)
                 pane.transfer = Ops.emptyTransfer()
             pane.sticky("")
+            var action = Archive.doneAction(ok, err)
+            if (action !== "") {
+                pane.extractPasswordRequested(path, dest, action === "wrong" ? err : "")
+                pane.refresh("")
+                return
+            }
             pane.message(ok ? Ops.archiveDoneLine(verified) : err === "cancelled" ? "Extraction cancelled." : Errors.sentence("archive", err), !ok && err !== "cancelled")
             pane.refresh("")
         }
@@ -437,7 +447,7 @@ Item {
         function onConvertDone(id, ok, path, err, requestId, source, collision) {
             if (requestId && (!pane.convertSource || pane.convertSource.requestId !== requestId || pane.convertSource.path !== source)) return
             pane.sticky("")
-            pane.message(ok ? "Converted to " + Ops.leaf(path) + "." : collision ? err : Errors.sentence("convert", err), !ok)
+            pane.message(ok ? Format.fill(Ops.WORDS.convertedTo, Ops.leaf(path)) : collision ? err : Errors.sentence("convert", err), !ok)
             if (ok) {
                 if (pane.searchMode === Search.RESULTS) root.stale = true
                 else pane.refresh(path)
@@ -446,12 +456,16 @@ Item {
 
         // The backend statfs's its own base, which only moves when a listing succeeds, and Nav.js moves pane.path before one does: a failed hop's figures are of the directory we never left, while a failed refresh's are still of what is on screen.
         // Recent spans mounts and asks for no figures of its own, so a late answer for its base is refused with the stale ones.
-        function onFsInfo(fs, free, path, storageClass) {
-            var ours = (path.length === 0 || path === pane.path) && pane.recentMode.length === 0
-            pane.fsName = ours ? fs : ""; pane.fsFree = ours ? free : 0
+        function onFsInfo(fs, free, path, storageClass, tagable, systemVolume) {
+            // The line follows its listing's, but a loading mark makes the rows wait, so pane.path still names the folder left while the listing out is the one this line answers.
+            var ours = (path.length === 0 || path === root.pane.path || (root.pane.listInFlight && path === root.pane.listingPath)) && root.pane.recentMode.length === 0
+            root.pane.fsName = ours ? fs : ""; root.pane.fsFree = ours ? free : 0
+            if (ours || !root.pane.listInFlight) root.pane.fsAnswered = true
             if (ours) {
                 pane.storageClass = storageClass || ""
+                pane.systemVolume = systemVolume === true
                 pane.storageKnown = true
+                pane.canTag = tagable === true
                 // The verdict follows the directory, so a class switch later compares
                 // against this listing's own gate rather than the one navigated from.
                 pane.extVerdict = ExtThumbs.verdict(pane.storageClass, ViewState.preview)
@@ -488,16 +502,16 @@ Item {
                 pane.renameRequest = null
                 pane.renameKeepsPointerRow = false
                 if (terminal) {
-                    text = "Backend stopped; rename outcome unknown."
+                    text = "Flea stopped responding, so the rename may not have finished. Check the name."
                 } else if (where === "rename-kept" || where === "rename-stranded" || (where === "journal" && input === request.destination)) {
                     // A destination-side journal failure happens after the filesystem rename succeeded.
                     pane.renamingIndex = -1
-                    if (where === "journal") text = Errors.capitalised("renamed, but Undo was not recorded: " + message)
+                    if (where === "journal") text = "Renamed, but undo cannot reverse this rename."
                     pane.message(text, true)
                     root.refreshRename(request, pointer ? "" : (where === "journal" ? request.destination : ""), pointer)
                     return
                 } else {
-                    var reason = Errors.exists(message) ? Ops.leaf(request.destination) + " already exists." : Errors.capitalised(message)
+                    var reason = Errors.exists(message) ? Format.fill(Ops.WORDS.alreadyExists, Ops.leaf(request.destination)) : Errors.capitalised(message)
                     // Grid closing review G1: with no live editor to show it, the
                     // refusal goes to the status bar and the edit closes.
                     Ops.refuseRename(pane, reason)
@@ -511,9 +525,11 @@ Item {
                 pane.message(text, false)
                 return
             }
+            // Rows parked for a Back's locate land at the top on every failure that reaches here but a stale one, so that listing still ends.
+            var parkedLanded = where !== "stale" && pane.swap.landParked()
             // The rows a request named were another numbering's, so only that request ended, see src/backend/rowguard.rs.
             // A paths failure clears its claim either way. Leaving it set blocks the next copy.
-            var listingEnded = Swap.failListing(pane, where)
+            var listingEnded = (terminal || !parkedLanded) && Swap.failListing(pane, where, input)
             if (input === "paths") {
                 var claim = pane.pathsPending
                 if (claim && claim.kind === "drag") {
@@ -564,7 +580,7 @@ Item {
                 pane.listingState = Errors.listingState(where, message)
                 pane.lockedMode = mode; pane.stateMessage = text
             }
-            pane.message(text, true)  // GM's ruling: the centre lane carries the refusal, both StatusBar lanes
+            pane.message(text, true)  // The rule: the centre lane carries the refusal, both StatusBar lanes
             // The names on disk changed in a way no reply listed (a kept copy, or a twin left under its temp), so re-read the listing and select nothing.
             if (where === "rename-kept" || where === "rename-stranded")
                 pane.refresh("")

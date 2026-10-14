@@ -28,19 +28,22 @@
 Flea combines a Rust backend with a Quickshell interface that follows your Omarchy theme.
 Large directories stay responsive: the window loads rows and requests thumbnails as you need them.
 
-- **Three views.** List, columns and grid, with tabs and natural filename sorting.
-- **Quick Look.** Press Space for images, PDFs, text, media and archive contents.
-- **File operations.** Copy, move, rename, trash, compress and extract, with an undo journal.
+- **Four views.** List, columns, grid and two panes side by side, with tabs and natural filename sorting.
+- **Quick Look.** Press Space for images, PDFs, text, media, 3D model thumbnails and archive contents.
+- **File operations.** Copy, move, rename, trash, compress and extract, with an undo journal. Rename several files in one card. Pasting a folder onto one with the same name merges them, and undo reverts the merge. Opening a script, a program or an AppImage asks first: Run, Run in terminal or Open as text. Properties counts a folder's size and items.
+- **Tags.** Seven tags in your theme's colours, set with `T` and the keys 1 to 7, listed in the sidebar and found with `tag:red`.
+- **Search.** Ranked results replace the listing as you type. Esc returns to the folder and the cursor; Enter keeps the results.
 - **Network and sharing.** SMB, SFTP, FTPS, WebDAV, NFS, Dropbox and Taildrop.
-- **Devices.** USB drives, phones and cameras over MTP, PTP and AFC, mounted from the rail.
+- **Devices.** USB drives, phones and cameras over MTP, PTP and AFC, mounted from the rail. An encrypted drive unlocks from its rail row and locks again when you unmount it.
+- **Disk images.** Write an ISO or IMG to a USB drive, plain, compressed or inside a zip; Flea reads every byte back to verify it.
 - **Desktop integration.** Default file manager, “Show in folder” and Open/Save dialogs.
 - **Your settings.** Omarchy text sizes, configurable menus and Default, Vim, Mac or Windows keys.
 
-An iPhone lists once it has been unlocked and trusted on this machine: AFC needs the pairing record
-that leaves behind, not an unlocked screen every time. Pairing also puts the phone on its tethering
-USB configuration, so iOS shows Personal Hotspot as active while it is plugged in, and Flea never
-uses it. If this machine should never route through the phone, tell NetworkManager so with a
-`conf.d` drop-in carrying `unmanaged-devices=driver:ipheth`; that is your call, not the package's.
+A menu row that cannot act says why beside its label (offline, signed out, no devices), and muted
+text keeps a 4.5:1 contrast against its background.
+
+An iPhone appears once it has been unlocked and trusted on this machine. AFC then uses the pairing
+record, so the screen does not need unlocking each time.
 
 ## Install
 
@@ -51,8 +54,8 @@ Install Flea and make it your default file manager, file chooser and the app ope
 omarchy pkg aur add flea-bin && flea --default
 ```
 
-`flea-bin` is the tagged release, prebuilt for x86_64 and aarch64, and it reaches you minutes after it
-ships. To let Omarchy's own repository review, build and sign it instead, a day or more behind:
+`flea-bin` is the tagged release, prebuilt for x86_64 and aarch64 and available minutes after each tag.
+Omarchy's own repository reviews, builds and signs `flea`, a day or more later:
 
 ```bash
 omarchy pkg add flea && flea --default
@@ -60,10 +63,9 @@ omarchy pkg add flea && flea --default
 
 Install one of the two, never both.
 
-Run it at a terminal inside your session: `flea --default` restarts xdg-desktop-portal itself there,
-so file dialogs follow at once. To only try Flea, run the install alone and leave your defaults as
-they are; `flea --default off` hands everything back later, and Settings, About can switch it either
-way.
+Run `flea --default` in a terminal inside your session: it restarts xdg-desktop-portal, so file
+dialogs switch at once. To try Flea without changing your defaults, run only the install.
+`flea --default off` undoes it, and Settings, About switches either way.
 
 Update through Omarchy:
 
@@ -71,15 +73,11 @@ Update through Omarchy:
 omarchy update
 ```
 
-Already on `flea` from Omarchy's repository? Switch to `flea-bin` with the interactive command and
-answer `y` when pacman asks to remove `flea`:
+To switch from `flea` to `flea-bin`, run this and answer `y` when pacman asks to remove `flea`:
 
 ```bash
 yay -S flea-bin
 ```
-
-`omarchy pkg aur add flea-bin` cannot make that swap: it passes `--noconfirm`, which takes each prompt's
-default, and pacman's "Remove flea?" defaults to No.
 
 <details>
 <summary>File chooser only, development package and removal</summary>
@@ -114,99 +112,129 @@ If you previously pinned another directory handler, restore that handler explici
 ## Views
 
 **List** for file details. **Grid** for photos and clips. **Columns** for browsing folders with a preview beside them.
+**Two panes** show two folders side by side (`Ctrl+4`). Drag the divider to resize them, double-click it to make them equal, and Flea remembers the split. An optional setting remembers List, Columns or Grid for each folder.
 
 <p align="center">
   <img src="docs/images/grid.png" width="49%" alt="Grid view with image and video thumbnails">
   <img src="docs/images/list.png" width="49%" alt="Columns view with the preview column, file details and the iPhone on the Devices rail">
 </p>
 
-**Space** opens Quick Look from any view. Page through a PDF, play media or inspect an archive.
+**Space** opens Quick Look from any view. Page through a PDF, play media or inspect an archive. `+` and `-` zoom an image, `0` returns it to fit, and media has a volume track beside its seek bar. Archive contents list for 7z, ISO images and packages, and a password archive asks for its password.
 
 <p align="center">
   <img src="docs/images/pdf.png" alt="PDF preview with page navigation">
 </p>
 
-**The shelf** lives in the Omarchy bar: send files there from any menu, drag them out into any app, pin the ones you keep coming back to. **Phones** are Devices rows over MTP, AFC and PTP.
+**The shelf** sits in the Omarchy bar: send files to it from any menu, drag them out into any app, and pin the ones you reuse. **Phones** are Devices rows over MTP, AFC and PTP.
 
-**Dragging** moves when the source and the destination are on the same device, and copies when they are on different devices. Hold Ctrl to copy anyway. Hold Shift to move anyway. Hold Ctrl with Shift to link instead, through the Paste as links card. Those keys are read when the drag starts; once the drag is up, a key pressed after that cannot change it. A plain drag into another app offers copy alone, as the file addresses and the plain paths. Ctrl at the lift offers copy alone, Shift offers move alone, and Ctrl with Shift offers a link alone, so that app cannot pick another verb. That app moves, copies or links the files itself. Flea does not also delete them, because the acceptance arrives before the other app has finished reading the addresses, and deleting then would put the files in Trash. The copy-only offer is the one a browser uploader takes; offering move is what made Chromium refuse the drag. The target has to be on screen before you lift; a terminal gets the path. Switching workspace mid-drag ends it, because Hyprland releases every mouse button on a workspace change, so bring the target workspace up first. See "A drag does not survive a workspace switch" in `AGENTS.md`.
+**Dragging** moves within one device and copies between devices. Hold Ctrl to copy, Shift to move, or Ctrl with Shift to link through the Paste as links card; Flea reads these keys when the drag starts. A drag into another app offers copy, or move with Shift, or a link with Ctrl and Shift, and that app does the work: Flea deletes nothing afterwards. A terminal gets the path.
 
 <p align="center">
   <img src="docs/images/shelf.png" width="49%" alt="The shelf card open over Flea, with thumbnails, pins and the last three screenshots">
   <img src="docs/images/iphone.png" width="49%" alt="An iPhone camera roll browsed over AFC, with HEIC thumbnails and a preview">
 </p>
 
+**Background opacity** comes from a theme's `shell.toml`, or from `~/.config/omarchy/shell.toml` for every theme:
+
+```toml
+[flea]
+background-alpha = 0.34
+```
+
+Values run from 0 to 1, and the default is 1. The listing, the rail and the bars let the desktop through at that value; text, icons, thumbnails, menus, dialogs and Quick Look stay opaque. With Auto-hide sidebar on, the rail stays opaque, because it opens over the listing.
+
 ## Performance
 
-Measured on **23 September 2026**, using the **0.3.3** source tree.
-Cold caches, three runs per app, medians below. Seven GUI apps on the same Omarchy machine.
+Measured on **12 October 2026**, using the **0.3.10** source tree.
+Cold caches, 3 runs per app, medians below. 7 GUI apps on the same machine.
 
-Flea's memory does not grow with the directory: first at 100,000 entries, mid-field at 2,000.
-At 100,000 files Flea's window used 71.9 MiB against Strata's 107.8 MiB, the next lightest; on
-2,000 media files it used 83.0 MiB, fifth of seven.
+### Speed
 
-### 100,000 files
+#### btrfs, 100000 visible entries, filesystem btrfs
 
-Flea led every column of this run. Its first window now arrives with the listing already drawn;
-0.3.2's arrived empty, at 277 ms.
+| File manager | Version | First window | Settled |
+|---|---|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 505 ms | 1.00 s |
+| Dolphin | 26.08.2-1 | 752 ms | 5.07 s |
+| Nautilus | 51.0.1-2 | 921 ms | 6.59 s |
+| Nemo | 6.6.4-1 | 857 ms | 21.78 s |
+| PCManFM | 1.4.0-2 | 448 ms | 33.54 s |
+| Strata | v1.0.0 | 588 ms | 1.84 s |
+| Thunar | 4.20.10-1 | 518 ms | 19.45 s |
 
-| File manager | First window | Settled | Window PSS | CPU |
-|---|---:|---:|---:|---:|
-| **Flea** | 409 ms | 0.92 s | 71.9 MiB | 0.65 s |
-| Strata | 588 ms | 3.26 s | 107.8 MiB | 3.13 s |
-| Dolphin | 735 ms | 5.39 s | 203.0 MiB | 9.26 s |
-| Thunar | 583 ms | 23.10 s | 347.4 MiB | 22.92 s |
-| Nemo | 824 ms | 23.30 s | 459.8 MiB | 26.80 s |
-| PCManFM | 480 ms | 36.54 s | 109.9 MiB | 25.40 s |
-| Nautilus | 866 ms | 84.03 s | 333.8 MiB | 19.03 s |
+#### btrfs, 1700 visible entries, filesystem btrfs
 
-### 2,000 mixed files
+| File manager | Version | First window | Settled | Thumbnails |
+|---|---|---:|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 541 ms | 1.83 s | 43 |
+| Dolphin | 26.08.2-1 | 733 ms | 13.18 s | 500 |
+| Nautilus | 51.0.1-2 | 876 ms | 18.19 s | 641 |
+| Nemo | 6.6.4-1 | 842 ms | 1.71 s | not measured |
+| PCManFM | 1.4.0-2 | 416 ms | 114.99 s | 700 |
+| Strata | v1.0.0 | 656 ms | 3.26 s | not measured |
+| Thunar | 4.20.10-1 | 507 ms | 0.93 s | not measured |
 
-The apps produced different amounts of thumbnail work, so settled time and CPU are
-**not ranked** across the whole table. Flea and Strata made the same work, 43 and 42
-thumbnails, and Flea settled in 1.80 s against 2.88 s on less CPU.
+Note: Nemo, Thunar: "unranked: nothing reached the thumbnail cache so its work was not measured".
+Note: Strata: "unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count".
 
-| File manager | First window | Settled | Window PSS | CPU | Thumbnails |
-|---|---:|---:|---:|---:|---:|
-| **Flea** | 410 ms | 1.80 s | 83.0 MiB | 6.02 s | 43 |
-| Dolphin | 761 ms | 13.83 s | 93.1 MiB | 67.87 s | 500 |
-| Nautilus | 923 ms | 20.36 s | 180.8 MiB | 125.08 s | 641 |
-| Nemo | 864 ms | 3.60 s | 54.2 MiB | 9.10 s | 60 |
-| PCManFM | 438 ms | Timed out | 39.6 MiB | 157.27 s | 687 |
-| Strata | 553 ms | 2.88 s | 74.3 MiB | 7.08 s | 42 |
-| Thunar | 568 ms | 13.23 s | 38.8 MiB | 21.03 s | 221 |
+#### btrfs, 2000 visible entries, filesystem btrfs
 
-### 1,700 matched files
+| File manager | Version | First window | Settled | Thumbnails |
+|---|---|---:|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 530 ms | 1.77 s | 43 |
+| Dolphin | 26.08.2-1 | 747 ms | 13.76 s | 642 |
+| Nautilus | 51.0.1-2 | 897 ms | 19.29 s | 641 |
+| Nemo | 6.6.4-1 | 862 ms | 3.40 s | 60 |
+| PCManFM | 1.4.0-2 | 420 ms | Timed out | 690 |
+| Strata | v1.0.0 | 599 ms | 3.45 s | not measured |
+| Thunar | 4.20.10-1 | 513 ms | 1.00 s | not measured |
 
-The same set less HEIC and MKV, the two formats some of these apps decline, so none of them
-finishes sooner by skipping a format. Work still differs by app, so the same rule holds. Nemo left
-nothing in the thumbnail cache on this set, so its work was not measured and its time is not a
-result. Flea and Strata again made the same work, and Flea settled in 1.81 s against 2.88 s.
+Note: Strata: "unranked: its watches saw 0 renders for 86 opened fixture files so neither is a count".
+Note: Thunar: "unranked: nothing reached the thumbnail cache so its work was not measured".
 
-| File manager | First window | Settled | Window PSS | CPU | Thumbnails |
-|---|---:|---:|---:|---:|---:|
-| **Flea** | 410 ms | 1.81 s | 83.4 MiB | 6.40 s | 43 |
-| Dolphin | 679 ms | 13.49 s | 93.1 MiB | 66.40 s | 500 |
-| Nautilus | 871 ms | 19.07 s | 179.7 MiB | 117.55 s | 641 |
-| Nemo | 817 ms | 1.98 s | 46.0 MiB | 1.60 s | not measured |
-| PCManFM | 442 ms | 115.06 s | 41.6 MiB | 181.72 s | 700 |
-| Strata | 557 ms | 2.88 s | 74.1 MiB | 7.14 s | 42 |
-| Thunar | 538 ms | 12.90 s | 37.9 MiB | 20.79 s | 221 |
+### Memory and CPU
 
-"First window" records compositor registration. "Settled" means 500 ms without process-tree
-CPU activity; neither measures input readiness.
-PSS covers the window process, excluding helpers and GPU memory. Flea's separate backend used a
-median **6.7 MiB** on the large listing and **3.3 MiB** on media. CPU is everything the app
-started, counted from a control group of its own, so sandboxed thumbnailers are in it; a figure
-from before 0.3.2 counted only reaped children and is not comparable. Shared libraries affect PSS.
-PCManFM did not settle in any media run. Results describe this machine and workload.
+#### btrfs, 100000 visible entries, filesystem btrfs
 
-[Method](docs/benchmarks.md) · [Scale CSV](docs/bench/scale-0.3.3-20260923.csv) ·
-[Scale manifest](docs/bench/scale-0.3.3-20260923.manifest.md) ·
-[Media CSV](docs/bench/media-0.3.3-20260923.csv) ·
-[Media manifest](docs/bench/media-0.3.3-20260923.manifest.md) ·
-[Matched CSV](docs/bench/matched-0.3.3-20260923.csv) ·
-[Matched manifest](docs/bench/matched-0.3.3-20260923.manifest.md) ·
-[0.1.6 run and TUI results](docs/bench/results-0.1.6.md)
+| File manager | Version | Window PSS | CPU |
+|---|---|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 80.7 MiB | 0.75 s |
+| Dolphin | 26.08.2-1 | 202.6 MiB | 7.67 s |
+| Nautilus | 51.0.1-2 | 321.4 MiB | 8.27 s |
+| Nemo | 6.6.4-1 | 472.8 MiB | 25.00 s |
+| PCManFM | 1.4.0-2 | 123.0 MiB | 23.05 s |
+| Strata | v1.0.0 | 130.6 MiB | 1.53 s |
+| Thunar | 4.20.10-1 | 358.5 MiB | 19.33 s |
+
+#### btrfs, 1700 visible entries, filesystem btrfs
+
+| File manager | Version | Window PSS | CPU |
+|---|---|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 93.6 MiB | 5.04 s |
+| Dolphin | 26.08.2-1 | 99.3 MiB | 64.30 s |
+| Nautilus | 51.0.1-2 | 176.4 MiB | 114.32 s |
+| Nemo | 6.6.4-1 | 45.1 MiB | 1.66 s |
+| PCManFM | 1.4.0-2 | 42.0 MiB | 171.36 s |
+| Strata | v1.0.0 | 86.3 MiB | 7.61 s |
+| Thunar | 4.20.10-1 | 34.2 MiB | 0.90 s |
+
+#### btrfs, 2000 visible entries, filesystem btrfs
+
+| File manager | Version | Window PSS | CPU |
+|---|---|---:|---:|
+| **Flea** | 0.3.10, source 5816ab88 | 93.5 MiB | 4.82 s |
+| Dolphin | 26.08.2-1 | 102.8 MiB | 68.07 s |
+| Nautilus | 51.0.1-2 | 176.4 MiB | 120.73 s |
+| Nemo | 6.6.4-1 | 54.7 MiB | 9.38 s |
+| PCManFM | 1.4.0-2 | 39.6 MiB | 154.08 s |
+| Strata | v1.0.0 | 87.5 MiB | 7.32 s |
+| Thunar | 4.20.10-1 | 35.2 MiB | 0.95 s |
+
+"First window" records compositor registration. "Settled" means 500 ms without process-tree CPU activity; neither measures input readiness.
+PSS covers the window process, excluding helpers and GPU memory. CPU is everything the app started, counted from a control group of its own, so sandboxed thumbnailers are in it. Shared libraries affect PSS. Results describe this machine and workload.
+Settled time and CPU are not ranked against an app whose thumbnail work was not measured; the notes under each speed table name those apps.
+
+[Method](docs/benchmarks.md) · [Local CSV](docs/bench/local-0.3.10-20261012.csv) · [Local manifest](docs/bench/local-0.3.10-20261012.manifest.md) · [Matched CSV](docs/bench/matched-0.3.10-20261012.csv) · [Matched manifest](docs/bench/matched-0.3.10-20261012.manifest.md) · [Media CSV](docs/bench/media-0.3.10-20261012.csv) · [Media manifest](docs/bench/media-0.3.10-20261012.manifest.md)
 
 ## Keyboard
 
@@ -219,16 +247,19 @@ Press **?** for the full keymap, or **,** to change settings.
 | Quick Look | `Space` |
 | Select / extend selection | `v` / `Shift` + arrows |
 | Copy / cut / paste | `y` `x` `p`, or `Ctrl+C` `Ctrl+X` `Ctrl+V` |
-| Rename / trash / undo | `r` or `F2` / `dd` or `Delete` / `z` |
+| Rename / trash / undo / redo | `r` or `F2` / `dd` or `Delete` / `z` / `Ctrl+Shift+Z` |
+| Tag the selection | `T`, then `1`–`7` |
 | New folder | `Ctrl+Shift+N` |
 | Search / filter the list | `f` / `/` |
 | Enter a path, or jump to a folder by name | `:` or `Ctrl+L`, then a path or a name |
-| List / columns / grid | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` |
+| List / columns / grid / two panes | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
+| Next / previous area | `Tab` / `Shift+Tab` |
 | New tab / close tab / switch tab | `t` / `w` / `1`–`9` |
 | Open terminal / context menu | `Ctrl+T` / `m` |
 | Show hidden files | `.` |
+| Zoom an image in Quick Look / fit | `+` `-` / `0` |
 
-The Windows preset uses `Ctrl+Shift+1/2/3` for views. Menu visibility does not disable shortcuts.
+The Windows preset uses `Ctrl+Shift+1/2/3/4` for views and `Ctrl+Y` for redo. Menu visibility does not disable shortcuts.
 See [the full key table](keys.toml) for preset bindings and pointer actions.
 
 ## Build
@@ -241,8 +272,7 @@ cargo build --release
 FLEA_UI="$PWD/ui" ./target/release/flea --gui
 ```
 
-Pass a directory to open it, or `--select <path>` to reveal a file. The terminal interface
-is not implemented yet.
+Pass a directory to open it, or `--select <path>` to reveal a file.
 
 ```bash
 ./tests/run-all.sh

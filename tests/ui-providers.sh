@@ -133,9 +133,10 @@ providers_open() {
 }
 
 providers_disabled() {
-    local action="$1" reason="$2" state target before
-    # GM ruled a provider that cannot answer reads as red, so the row carries no reason at all.
-    menus_expect menuState "any(.entries[]; .action == \"$action\" and .disabled and .errored and (.hint == null))" "$action reads as an error ($reason)"
+    local action="$1" reason="$2" word="$3" state target before
+    # A provider that cannot answer reads as red with its own state word, never its reason.
+    [[ -n "$word" ]] || fail "providers: no expected word for $action ($reason)"
+    menus_expect menuState "any(.entries[]; .action == \"$action\" and .disabled and .errored and .hint == \"$word\")" "$action reads $word ($reason)"
     state=$(ipc menuState)
     target=$(jq -er --arg action "$action" '.entries | to_entries[] | select(.value.action == $action) | .key' <<< "$state")
     before=$(providers_calls omarchy-tailscale-send)
@@ -181,7 +182,7 @@ providers_fixture() {
     exec {taildrop_fd}<>"$menu_box/tailscale-release" || fail 'providers: cannot open Tailscale gate'
     exec {dropbox_fd}<>"$menu_box/dropbox-cli-release" || fail 'providers: cannot open Dropbox gate'
     exec {localsend_fd}<>"$menu_box/localsend-release" || fail 'providers: cannot open LocalSend gate'
-    # Excluding every real provider prevents removal of a double from falling through to GM's account.
+    # Excluding every real provider prevents removal of a double from falling through to the box's real account.
     IFS=: read -r -a parts <<< "$PATH"
     for part in "${parts[@]}"; do
         [[ -d "$part" ]] || continue
@@ -370,7 +371,7 @@ providers_sharelink_checks() {
             share-missing)
                 providers_mode dropbox-cli vanish 'Up to date'
                 warning="Process failed to start, likely because the binary could not be found. Command: QList(\"dropbox-cli\", \"sharelink\", \"$menu_box/Dropbox/b-cursor.txt\")"
-                reason='The Dropbox share link helper could not start.' ;;
+                reason='Dropbox could not be asked for a share link.' ;;
             clipboard-failed)
                 providers_mode wl-copy ready '' 'fixture clipboard refusal' 7
                 reason='The share link could not be copied to the clipboard.'
@@ -378,7 +379,7 @@ providers_sharelink_checks() {
             clipboard-missing)
                 providers_install wl-copy no
                 warning='Process failed to start, likely because the binary could not be found. Command: QList("wl-copy", "https://fixture.invalid/share")'
-                reason='The clipboard helper could not start; the share link was not copied.' ;;
+                reason='The share link could not be copied to the clipboard.' ;;
         esac
         providers_choose sharelink
         menus_error "$reason" "$scenario reports its own plain failure"
@@ -428,7 +429,7 @@ providers_dropbox_move_checks() {
     providers_selection "$menu_dir"
     providers_choose dropbox
     menus_error 'Move failed: a-marked.txt · permission denied' 'Move to Dropbox reports the real refusal'
-    menus_expect statusActivityState '(.activities | length) == 0 and .errors == 1' 'failed Dropbox move finishes without hiding its error'
+    menus_expect statusActivityState '(.activities | length) == 0 and .errors == 1' 'refused Dropbox move finishes without hiding its error'
     menus_expect statusFooterState '.secondary.text == " · esc dismisses"' 'unacknowledged Dropbox error keeps the informational error specimen'
     menus_equal 'the refusal keeps the marked source bytes' 'list/a-marked.txt original' "$(cat "$menu_dir/a-marked.txt")"
     [[ ! -e "$menu_box/Dropbox/a-marked.txt" ]] || fail 'providers: a refused move left an item in Dropbox'
@@ -456,7 +457,7 @@ providers_dropbox_move_checks() {
     menus_guard "$menu_dir/a-marked.txt"
     menus_guard "$menu_box/Dropbox/a-marked.txt"
     key z >/dev/null || fail 'providers: native Dropbox Undo failed'
-    menus_message 'Undid the move.' 'native Undo restores the same Dropbox source'
+    menus_message 'Undid the move' 'native Undo restores the same Dropbox source'
     wait_listing 2
     [[ ! -e "$menu_box/Dropbox/a-marked.txt" ]] || fail 'providers: Undo retained its moved destination'
     menus_equal 'Dropbox Undo restores original source bytes' 'list/a-marked.txt original' "$(cat "$menu_dir/a-marked.txt")"
@@ -495,7 +496,7 @@ providers_localsend_checks() {
     cursor_before=$(cat "$menu_dir/a-marked.txt")
     providers_choose localsend
     providers_localsend_diag cursor-only
-    menus_message 'Sending a-marked.txt to Fixture Phone with LocalSend.' 'a cursor-only send names the single cursor file'
+    menus_message 'Sending a-marked.txt to Fixture Phone with LocalSend' 'a cursor-only send names the single cursor file'
     providers_localsend_release
     providers_call localsend-cli "$(jq -cn --arg p "$menu_dir/a-marked.txt" '["-f", $p]')" 1
     menus_message 'LocalSend finished the transfer.' 'and the verdict follows it'
@@ -520,7 +521,7 @@ providers_localsend_checks() {
     second_before=$(cat "$menu_dir/b-cursor.txt")
     providers_choose localsend
     providers_localsend_diag two-selected
-    menus_message 'Sending 2 items to Fixture Phone with LocalSend.' 'the dispatch names the device the flyout chose'
+    menus_message 'Sending 2 items to Fixture Phone with LocalSend' 'the dispatch names the device the flyout chose'
     providers_localsend_release
     # The send run names both selected sources as one -f pair each, in the selection's own order.
     providers_call localsend-cli "$(jq -cn --arg a "$menu_dir/a-marked.txt" --arg b "$menu_dir/b-cursor.txt" '["-f", $a, "-f", $b]')" "$before"
@@ -541,7 +542,7 @@ providers_localsend_checks() {
 
 case_providers() (
     local menu_box="$fixture_root/providers" menu_dir="$fixture_root/providers/list" menus_checks=0
-    local taildrop_fd dropbox_fd localsend_fd name before action record reason path saved
+    local taildrop_fd dropbox_fd localsend_fd name before action record reason word path saved
     local provider_ready='{"BackendState":"Running","Self":{"UserID":"fixture-owner","Capabilities":["https://tailscale.com/cap/file-sharing"]},"Peer":{"fixture-peer":{"HostName":"Fixture","DNSName":"fixture.invalid.","Online":true,"TaildropTarget":1,"UserID":"fixture-owner"}}}'
     providers_fixture
     trap 'providers_cleanup || exit 1' EXIT
@@ -563,46 +564,46 @@ case_providers() (
     done
     providers_install omarchy-tailscale-send yes
     providers_open
-    providers_disabled taildrop 'not executable'
-    providers_disabled dropbox 'not executable'
+    providers_disabled taildrop 'not executable' offline
+    providers_disabled dropbox 'not executable' 'not running'
     menus_equal 'unusable providers spawn no helper' 0 "$(jq -s length "$menu_box/calls.jsonl")"
     menus_shot providers-unusable
     providers_close
     for name in tailscale dropbox-cli; do menus_guard "$menu_box/doubles/$name"; chmod 700 "$menu_box/doubles/$name" || fail 'providers: executable recovery failed'; done
 
-    while IFS='|' read -r record reason; do
+    while IFS='|' read -r record reason word; do
         providers_mode tailscale ready "$record"
         providers_open
-        providers_disabled taildrop "$reason"
+        providers_disabled taildrop "$reason" "$word"
         providers_close
     done <<'STATES'
-{"BackendState":"NeedsLogin"}|signed out
-{"BackendState":"Stopped"}|stopped
-{"BackendState":"Running","Self":{"Capabilities":["https://tailscale.com/cap/file-sharing"]},"Peer":{}}|no peers
-{"BackendState":"Running","Self":{},"Peer":{}}|disabled for this account
-malformed|invalid status
+{"BackendState":"NeedsLogin"}|signed out|signed out
+{"BackendState":"Stopped"}|stopped|offline
+{"BackendState":"Running","Self":{"Capabilities":["https://tailscale.com/cap/file-sharing"]},"Peer":{}}|no peers|no devices
+{"BackendState":"Running","Self":{},"Peer":{}}|disabled for this account|offline
+malformed|invalid status|offline
 STATES
     providers_mode tailscale ready '' 'fixture Tailscale failure' 7
     providers_open
-    providers_disabled taildrop 'fixture Tailscale failure'
+    providers_disabled taildrop 'fixture Tailscale failure' offline
     providers_close
     providers_mode tailscale gate "$provider_ready"
     providers_open
-    providers_disabled taildrop 'timed out'
+    providers_disabled taildrop 'timed out' offline
     menus_shot providers-timeout
     providers_close
     providers_ready
     providers_install omarchy-tailscale-send no
     providers_open
-    providers_disabled taildrop 'not installed'
+    providers_disabled taildrop 'not installed' offline
     providers_close
     providers_install omarchy-tailscale-send yes
 
     for record in '{}' malformed '{"personal":{"path":"relative"}}'; do
         providers_write home/.dropbox/info.json "$record"
         providers_open
-        if [[ "$record" == '{}' ]]; then reason='signed out'; else reason='invalid'; fi
-        providers_disabled dropbox "$reason"
+        if [[ "$record" == '{}' ]]; then reason='signed out'; word='signed out'; else reason='invalid'; word='not running'; fi
+        providers_disabled dropbox "$reason" "$word"
         providers_close
     done
     providers_ready
@@ -611,16 +612,16 @@ STATES
         providers_open
         reason="$record"
         [[ -n "$reason" ]] || reason='empty status'
-        providers_disabled dropbox "$reason"
+        providers_disabled dropbox "$reason" 'not running'
         providers_close
     done
     providers_mode dropbox-cli ready '' 'fixture Dropbox failure' 7
     providers_open
-    providers_disabled dropbox 'fixture Dropbox failure'
+    providers_disabled dropbox 'fixture Dropbox failure' 'not running'
     providers_close
     providers_mode dropbox-cli gate 'Up to date'
     providers_open
-    providers_disabled dropbox 'timed out'
+    providers_disabled dropbox 'timed out' 'not running'
     providers_close
     providers_ready
 

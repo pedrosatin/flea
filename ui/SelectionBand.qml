@@ -15,6 +15,8 @@ MouseArea {
     property var shown: pane ? pane.shown : null
     property int offset: 0
     readonly property int count: flickable.count
+    // Grid narrows a cell to its icon and caption.
+    property var rowAt: (x, y) => flickable.indexAt(x, y)
     property var gesture: null
     property bool tracking: false
     property point start: Qt.point(0, 0)
@@ -31,7 +33,9 @@ MouseArea {
     z: 1
     acceptedButtons: Qt.LeftButton
     preventStealing: true
-    enabled: pane !== null && !pane.listInFlight && pane.renamingIndex < 0 && pane.listingState === "ready"
+    enabled: pane !== null && pane.renamingIndex < 0
+    // The listing gate is read in onPressed, not by enabled, whose flip dirties a MouseArea and drew a frame per key.
+    readonly property bool listingOpen: pane !== null && !pane.listInFlight && pane.listingState === "ready"
     clip: true
 
     function endpoint() {
@@ -62,7 +66,8 @@ MouseArea {
     function cancel() { root.finish(true) }
 
     onPressed: function (mouse) {
-        if (root.flickable.indexAt(root.flickable.contentX + mouse.x, root.flickable.contentY + mouse.y) >= 0) {
+        var at = root.endpoint()
+        if (!root.listingOpen || root.rowAt(at.x, at.y) >= 0) {
             mouse.accepted = false
             return
         }
@@ -72,7 +77,7 @@ MouseArea {
         // pane's timer here or it renames the sole selected row under the held button.
         if (root.pane && root.pane.cancelSlowClick) root.pane.cancelSlowClick()
         root.start = Qt.point(mouse.x, mouse.y)
-        root.anchor = Qt.point(root.flickable.contentX + mouse.x, root.flickable.contentY + mouse.y)
+        root.anchor = at
         root.additive = (mouse.modifiers & Qt.ControlModifier) !== 0
         root.tracking = true
         root.pane.selectionBand = root
@@ -94,6 +99,7 @@ MouseArea {
     onCanceled: root.cancel()
     onVisibleChanged: if (!visible) root.cancel()
     onEnabledChanged: if (!enabled) root.cancel()
+    onListingOpenChanged: if (!listingOpen) root.cancel()
     onWidthChanged: root.cancel()
     onHeightChanged: root.cancel()
     onColumnsChanged: root.cancel()

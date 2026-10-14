@@ -37,16 +37,20 @@ case "${1-} ${2-}" in
 esac
 SH
 chmod +x "$test_root/bin/gio" || exit 1
+# One probe run: run_probe LOG BACKEND HANG, where HANG=1 means the backend never answers.
+run_probe() {
+    # The shell starts the GVfs trash daemon, so it runs on its own bus, whose daemons log to bus.log and stay out of the engine-warning scan.
+    ( env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QML_DISABLE_DISK_CACHE \
+        HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" XDG_CACHE_HOME="$test_root/cache" \
+        XDG_RUNTIME_DIR="$test_root/runtime" FLEA_BIN="$2" STARTUP_OBJECTS_HANG="$3" \
+        FLEA_PATH="$test_root/fixture" STARTUP_OBJECTS_UI="$PWD/ui" STARTUP_OBJECTS_DISK="$power_disk" \
+        PATH="$test_root/bin:$PATH" STARTUP_OBJECTS_LEG_TIMEOUT_SECONDS="$leg_timeout_seconds" \
+        QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_FORCE_STDERR_LOGGING=1 QML_IMPORT_TRACE=1 \
+        QT_LOGGING_RULES='qt.qml.diskcache*=true' \
+        dbus-run-session -- bash -c 'timeout "$1" qs -p "$2" > "$3" 2>&1' _ "$probe_timeout_seconds" "$test_root/config" "$1" 2> "$test_root/bus.log" ) 2>/dev/null
+}
 log="$test_root/startup.log"
-# The shell starts the GVfs trash daemon, so it runs on its own bus, whose daemons log to bus.log and stay out of the engine-warning scan.
-( env -u DISPLAY -u WAYLAND_DISPLAY -u HYPRLAND_INSTANCE_SIGNATURE -u QML_DISABLE_DISK_CACHE \
-    HOME="$test_root/home" XDG_STATE_HOME="$test_root/state" XDG_CACHE_HOME="$test_root/cache" \
-    XDG_RUNTIME_DIR="$test_root/runtime" FLEA_BIN="$PWD/target/debug/flea" \
-    FLEA_PATH="$test_root/fixture" STARTUP_OBJECTS_UI="$PWD/ui" STARTUP_OBJECTS_DISK="$power_disk" \
-    PATH="$test_root/bin:$PATH" STARTUP_OBJECTS_LEG_TIMEOUT_SECONDS="$leg_timeout_seconds" \
-    QT_QPA_PLATFORM=offscreen QT_QPA_PLATFORMTHEME=generic QT_QUICK_BACKEND=software QT_FORCE_STDERR_LOGGING=1 QML_IMPORT_TRACE=1 \
-    QT_LOGGING_RULES='qt.qml.diskcache*=true' \
-    dbus-run-session -- bash -c 'timeout "$1" qs -p "$2" > "$3" 2>&1' _ "$probe_timeout_seconds" "$test_root/config" "$log" 2> "$test_root/bus.log" ) 2>/dev/null
+run_probe "$log" "$PWD/target/debug/flea" 0
 status=$?
 grep -a 'STARTUP_OBJECTS' "$log" || true
 if [ "$status" -ne 0 ] && [ "$status" -ne 143 ]; then
@@ -88,6 +92,43 @@ if [ "$(grep -ac 'STARTUP_OBJECTS PASS' "$log")" -ne 1 ] \
     || grep -aq 'STARTUP_OBJECTS FAIL' "$log"; then
     printf 'FAIL startup-objects: no clean completion receipt\n'
     cat "$log"
+    exit 1
+fi
+# Every unit loaded before the first rows costs each launch; the probe's empty cache logs each one, pinned by name and bytes.
+pinned=tests/startup-units.txt
+grep -aq 'STARTUP_OBJECTS TOTAL' "$log" || { printf 'FAIL startup-objects: log %s has no STARTUP_OBJECTS TOTAL line to cut the units at\n' "$log"; exit 1; }
+# Sample line: Error loading "file:///home/gm/flea/ui/Row.qml" from disk cache: <reason>, kept only before the TOTAL line since the probe's Quick Look and power-off legs follow it.
+seen=$(sed -n '1,/STARTUP_OBJECTS TOTAL/p' "$log" | grep -aoE 'Error loading "file://[^"]*/ui/[^"]+" from disk cache' | sed -E 's|.*/ui/([^"]+)".*|\1|' | sort -u)
+listed=$(grep -vE '^(#|bytes )' "$pinned" | sort -u)
+if [ "$seen" != "$listed" ]; then
+    printf 'FAIL startup-objects: the first-frame units moved; added then dropped against %s:\n' "$pinned"
+    comm -13 <(printf '%s\n' "$listed") <(printf '%s\n' "$seen") | sed 's/^/+ /'
+    comm -23 <(printf '%s\n' "$listed") <(printf '%s\n' "$seen") | sed 's/^/- /'
+    exit 1
+fi
+bytes=0
+while IFS= read -r unit; do bytes=$((bytes + $(wc -c < "ui/$unit"))); done <<< "$seen"
+ceiling=$(sed -n 's/^bytes //p' "$pinned")
+[[ "$ceiling" =~ ^[0-9]+$ ]] || { printf 'FAIL startup-objects: %s has no single numeric bytes line, got [%s]\n' "$pinned" "$ceiling"; exit 1; }
+if [ "$bytes" -gt "$ceiling" ]; then
+    printf 'FAIL startup-objects: the first-frame units hold %s bytes, over the %s pinned in %s\n' "$bytes" "$ceiling" "$pinned"
+    exit 1
+fi
+printf 'startup-objects: %s first-frame units, %s bytes\n' "$(printf '%s\n' "$seen" | grep -c .)" "$bytes"
+# A listing that never answers must still build the IPC seam once the pane turns "waiting".
+printf '#!/bin/sh\nexec cat > /dev/null\n' > "$test_root/bin/flea-silent" && chmod +x "$test_root/bin/flea-silent" || exit 1
+hang_log="$test_root/hang.log"
+run_probe "$hang_log" "$test_root/bin/flea-silent" 1
+status=$?
+grep -a 'STARTUP_OBJECTS' "$hang_log" || true
+if [ "$status" -ne 0 ] && [ "$status" -ne 143 ]; then
+    printf 'FAIL startup-objects: hang leg qs exit %s\n' "$status"
+    cat "$hang_log"
+    exit 1
+fi
+if [ "$(grep -ac 'STARTUP_OBJECTS PASS' "$hang_log")" -ne 1 ] || grep -aq 'STARTUP_OBJECTS FAIL' "$hang_log"; then
+    printf 'FAIL startup-objects: a listing that never answered built no IPC seam\n'
+    cat "$hang_log"
     exit 1
 fi
 printf 'startup-objects: 1 passed, 0 failed\n'

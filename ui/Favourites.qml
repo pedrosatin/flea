@@ -3,7 +3,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import "js/UiState.js" as UiState
-import "js/FavGuard.js" as FavGuard
+import "js/Startup.js" as Startup
 
 // All callers share one operation writer; the Rust updater locks and re-reads before editing.
 QtObject {
@@ -52,7 +52,7 @@ QtObject {
         return root.apply({ op: "rename", index: index, label: label, expected: root.records })
     }
     // One favourite on a dead mount must not hold the single-flight guard forever.
-    readonly property int inspectWaitMs: FavGuard.INSPECT_WAIT_MS
+    readonly property int inspectWaitMs: Startup.INSPECT_WAIT_MS
     property var inspectTimeout: Timer {
         interval: root.inspectWaitMs
         onTriggered: inspector.running = false
@@ -90,7 +90,7 @@ QtObject {
                         next[rows[i].index] = rows[i].error
                 }
                 root.statuses = next
-            } catch (error) { root.failed("Favorite availability could not be read.") }
+            } catch (error) { root.failed("Flea could not check which favorites still exist.") }
         }
     }
 
@@ -107,7 +107,7 @@ QtObject {
             if (!running && pending) {
                 pending = false
                 root.finish(writer.beforeRecords)
-                root.lastError = "Favorites updater could not start."
+                root.lastError = "Favorites could not be saved."
                 root.failed(root.lastError)
                 root.completed(writer.requestId, false, root.lastError)
             }

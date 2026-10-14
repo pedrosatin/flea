@@ -13,7 +13,7 @@ import tempfile
 import tarfile
 
 COUNTED_WORKER = 'ui/CountedWorker.qml'
-GATES = ('conflict-marker', 'fused-line', 'paneprops', 'del-printable', 'qml-undeclared-read', 'qml-duplicate-member', 'worker-announce', 'commons-color')
+GATES = ('conflict-marker', 'fused-line', 'paneprops', 'del-printable', 'qml-undeclared-read', 'qml-duplicate-member', 'worker-announce', 'commons-color', 'extern-variadic', 'pane-function-value', 'dead-module-call', 'worker-report', 'easing', 'ellipsis')
 SUFFIXES = {'.rs', '.qml', '.js', '.sh'}
 # Bound alias propagation so pathological chains cannot keep a source gate running.
 ALIAS_FIXPOINT_CAP = 8
@@ -25,6 +25,10 @@ STDERR_EXCERPT_LENGTH = 200
 QMLCACHEGEN_POOL_SIZE = 4
 QMLCACHEGEN_TIMEOUT_SECONDS = 15
 QMLCACHEGEN_PATHS = ('/usr/lib/qt6/qmlcachegen', '/usr/lib/qt6/libexec/qmlcachegen')
+# One stub import root per module under QMLLINT_STUBS: qs.Commons is always on the import path, each probed module only where the import probe finds the real one missing.
+QMLLINT_STUBS = 'tests/staticgates-stubs'
+QMLLINT_ALWAYS_STUB = 'qs.Commons'
+QMLLINT_PROBED_MODULES = ('Quickshell', 'QtQuick.Shapes', 'QtQuick.Layouts')
 
 
 def inventory(root, tracked=False):
@@ -49,7 +53,7 @@ def inventory(root, tracked=False):
 
 
 # Sample input: var text = "quoted"; /* comment */ run()
-def masked(source, suffix):
+def masked(source, suffix, fill='~'):
     # Keep offsets and newlines so diagnostics always point at the original source.
     out = list(source)
     i = 0
@@ -122,7 +126,7 @@ def masked(source, suffix):
             continue
         for at in range(start, min(i, len(source))):
             if source[at] != '\n':
-                out[at] = '~'
+                out[at] = fill
     text = ''.join(out)
     if suffix == '.sh':
         # Literal heredoc bodies are fixture data or child-script strings, not shell tokens.
@@ -210,6 +214,23 @@ def fused_line(root, files):
         code = masked(path.read_text(), path.suffix)
         for m in re.finditer(r'(?<=[^\s~]) {4,}(?=[^\s~])', code):
             errors.append(f'{location(file, code, m.start())}: fused code gap ({len(m[0])} spaces)')
+    return scanned, errors
+
+
+# Sample input: RESULT.md at the tree root is rejected; docs/notes.md passes.
+def worker_report(root, files):
+    errors = []
+    scanned = 0
+    for file in files:
+        if not (root / file).is_file():
+            continue
+        scanned += 1
+        if '.superpowers' in Path(file).parts:
+            errors.append(f'{file}:1: worker report tracked at .superpowers')
+        elif '/' not in file and (re.fullmatch(r'RESULT.*\.md', file) or re.fullmatch(r'REPORT.*\.md', file)
+                                  or re.fullmatch(r'STUDY.*\.md', file) or file == 'RUN.md'
+                                  or re.fullmatch(r'PREMISE.*\.txt', file)):
+            errors.append(f'{file}:1: worker report tracked at root')
     return scanned, errors
 
 
@@ -413,6 +434,110 @@ def paneprops(root, files, sample=False):
     return scanned, sorted(set(errors))
 
 
+# Sample input: "    function menuSelectionIdentity() {" at brace depth 1 in ui/Pane.qml names a Pane function.
+def pane_functions(root):
+    code = masked((root / 'ui/Pane.qml').read_text(), '.qml')
+    depth, depths = 0, []
+    for char in code:
+        depths.append(depth)
+        depth += (char == '{') - (char == '}')
+    return {m[1] for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', code) if depths[m.start()] == 1}
+
+
+# Sample input: id !== pane.identityOf reads a Pane function without its call; id !== pane.identityOf() passes.
+def pane_function_value(root, files, sample=False):
+    functions = pane_functions(root)
+    errors = []
+    scanned = 0
+    sources, references = pane_flow(root, files, functions)
+    for file in files:
+        path = root / file
+        if path.suffix not in ('.js', '.qml') or not file.startswith(('ui/', 'tests/js/')) or not path.is_file():
+            continue
+        scanned += 1
+        code = sources[file]
+        for m in re.finditer(r'\b([\w.]+)\.(\w+)', code):
+            if m[2] not in functions or m[1] not in references(file, m.start()):
+                continue
+            if re.match(r'\s*\(', code[m.end():]):
+                continue
+            if re.search(r'\btypeof\s*\(?\s*$', code[:m.start()]):
+                continue
+            left = re.search(r'(===|!==|==|!=)\s*$', code[:m.start()])
+            right = re.match(r'\s*(===|!==|==|!=)', code[m.end():])
+            if left or right:
+                errors.append(f'{location(file, code, m.start())}: {m[1]}.{m[2]} compared without its call')
+    return scanned, sorted(set(errors))
+
+
+# Sample input: "var A = 1, B = f(2, 3),\n    C = [4]" names A, B and C; a comma inside brackets starts no name.
+def declared_names(blank, start):
+    names, depth, expecting = [], 0, True
+    # blank is the module with strings and comments spaced out, so a comma or bracket inside one starts no name.
+    tail = blank[start:]
+    for m in re.finditer(r'[(){}\[\],;\n]|[A-Za-z_$][\w$]*|[^\s]', tail):
+        token = m[0]
+        if token in '([{':
+            depth += 1
+        elif token in ')]}':
+            depth -= 1
+        elif depth == 0 and token == ';':
+            break
+        elif depth == 0 and token == '\n':
+            # A list goes on past a line that ends in a comma or whose next token is one.
+            if not re.search(r',\s*$', tail[:m.start()]) and not re.match(r'\s*,', tail[m.end():]):
+                break
+        elif depth == 0 and token == ',':
+            expecting = True
+        elif depth == 0 and expecting and re.fullmatch(r'[A-Za-z_$][\w$]*', token):
+            names.append(token)
+            expecting = False
+        else:
+            expecting = False
+    return names
+
+
+# Sample input: "function start(root) {", "async function go() {" or "var NOTE = {" at column 0 names a module member; indented declarations are local.
+def module_names(code):
+    blank = masked(code, '.js', ' ')
+    names = {m[1] for m in re.finditer(r'^(?:async\s+)?function\s+(\w+)\s*\(', blank, re.M)}
+    for m in re.finditer(r'^(?:var|let|const)\s', blank, re.M):
+        names.update(declared_names(blank, m.end()))
+    return names
+
+
+# Sample input: Search.run(pane) after import "js/Search.js" as Search is rejected when Search.js defines no function run; Search.start(pane) passes.
+def dead_module_call(root, files):
+    modules = {}
+    for file in files:
+        path = root / file
+        if file.startswith('ui/') and file.endswith('.js') and path.is_file():
+            source = path.read_text()
+            if re.search(r'^\s*\.pragma\s+library\b', masked(source, '.js'), re.M):
+                modules[file] = module_names(source)
+    errors = []
+    scanned = 0
+    for file in files:
+        path = root / file
+        if path.suffix not in ('.js', '.qml') or not file.startswith('ui/') or not path.is_file():
+            continue
+        scanned += 1
+        source = path.read_text()
+        code = masked(source, path.suffix)
+        for imported in re.finditer(r'^\s*\.?import\s+"([^"]+\.js)"\s+as\s+(\w+)', source, re.M):
+            module = os.path.normpath(os.path.join(os.path.dirname(file), imported[1]))
+            alias = imported[2]
+            # A local named like the alias hides the module there, so the file is not judged for it; a call argument is no local.
+            name = r'\b' + alias + r'\b'
+            local = r'\b(?:var|let|const|function)\s+' + alias + r'\b|(?:\bfunction\b[^(){}]*|\bcatch\s*)\([^()]*' + name + r'[^()]*\)|\([^()]*' + name + r'[^()]*\)\s*=>|' + name + r'\s*=>'
+            if module not in modules or re.search(local, code):
+                continue
+            for call in re.finditer(r'(?<![\w.$])' + alias + r'\.(\w+)\s*\(', code):
+                if call[1] not in modules[module]:
+                    errors.append(f'{location(file, code, call.start())}: {alias}.{call[1]} is called but {module} defines no function {call[1]}')
+    return scanned, errors
+
+
 def literal_fields(code, start, end):
     depth = 0
     previous = '{'
@@ -462,6 +587,8 @@ def closing(code, start, left, right):
 def stub_allowances():
     # Only test observation fields belong here; production Pane writes can never use this list.
     return {
+        ('tests/js/archivecards.js', 'said'): 'Records messages emitted by the stub message signal.',
+        ('tests/js/archivecards.js', 'stuck'): 'Records sticky lines the stub status shows.',
         ('tests/js/clipboard.js', 'asked'): 'Records collision requests and captured cut snapshots.',
         ('tests/js/clipboard.js', 'localAtSend'): 'Records the local clipboard when the backend request is sent.',
         ('tests/js/clipboard.js', 'said'): 'Records messages emitted by the stub message signal.',
@@ -470,6 +597,8 @@ def stub_allowances():
         ('tests/js/columns.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/columns.js', 'sent'): 'Records backend requests emitted by stub methods.',
         ('tests/js/columns.js', 'stuck'): 'Records the window offset held by a stub backend.',
+        ('tests/js/cursorreturn.js', 'sentLocate'): 'Records locate requests the windowed landing emits.',
+        ('tests/js/cursorreturn.js', 'sentWindow'): 'Records window requests the located reply emits.',
         ('tests/js/ddtarget.js', 'askLog'): 'Records request rows and menu identities.',
         ('tests/js/ddtarget.js', 'asked'): 'Records request calls through stub methods.',
         ('tests/js/ddtarget.js', 'moved'): 'Records setCursor calls through stub methods.',
@@ -485,7 +614,12 @@ def stub_allowances():
         ('tests/js/focus.js', 'clipRequests'): 'Records system clipboard requests dispatched by menu actions.',
         ('tests/js/focus-lines.js', 'picked'): 'Stores the stub selection behind selection methods.',
         ('tests/js/focus-lines.js', 'said'): 'Records messages emitted by the stub message signal.',
-        ('tests/js/focus-lines.js', 'walked'): 'Records backend.search calls through stub methods.',
+        ('tests/js/focus-lines.js', 'sentQueries'): 'Records backend.searchQuery calls through stub methods.',
+        ('tests/js/focus-lines.js', 'openedScopes'): 'Records backend.searchOpen calls through stub methods.',
+        ('tests/js/focus-lines.js', 'closedSessions'): 'Records backend.searchClose calls through stub methods.',
+        ('tests/js/focus-lines.js', 'relisted'): 'Records openWithoutHistory calls through stub methods.',
+        ('tests/js/focus-lines.js', 'cancelledCalls'): 'Records backend.searchCancel calls through stub methods.',
+        ('tests/js/focus.js', 'relisted'): 'Records openWithoutHistory calls through stub methods.',
         ('tests/js/focus.js', 'acted'): 'Records act calls through stub methods.',
         ('tests/js/focus.js', 'asked'): 'Records request calls through stub methods.',
         ('tests/js/focus.js', 'cancelled'): 'Records cancel calls through stub methods.',
@@ -506,13 +640,21 @@ def stub_allowances():
         ('tests/js/foldersorts.js', 'remembered'): 'Records backend.rememberSort calls.',
         ('tests/js/foldersorts.js', 'sent'): 'Records requests from stub backend methods.',
         ('tests/js/foldersorts.js', 'sorts'): 'Records backend.sort calls.',
+        ('tests/js/keyreach.js', 'pathBars'): 'Records pathBarRequested calls through stub methods.',
+        ('tests/js/keyreach.js', 'said'): 'Records messages emitted by the stub message signal.',
+        ('tests/js/keyreach.js', 'switched'): 'Records switchPane calls through stub methods.',
         ('tests/js/marquee.js', 'contexts'): 'Records showRow or pointer dispatch context arguments.',
         ('tests/js/menu.js', 'said'): 'Records stub message emissions.',
         ('tests/js/nav.js', 'cancelled'): 'Records cancel calls through stub methods.',
         ('tests/js/nav.js', 'cleared'): 'Records clearSelection calls through stub methods.',
         ('tests/js/nav.js', 'refuses'): 'Injects a refusal in the stub backend.list method.',
         ('tests/js/nav.js', 'said'): 'Records messages emitted by the stub message signal.',
+        ('tests/js/nav.js', 'selected'): 'Records the row the stub backend.list request names to select.',
         ('tests/js/nav.js', 'sent'): 'Records backend requests emitted by stub methods.',
+        ('tests/js/navnewest.js', 'cleared'): 'Counts clearSelection calls through stub methods.',
+        ('tests/js/navnewest.js', 'said'): 'Records messages emitted by the stub message signal.',
+        ('tests/js/navnewest.js', 'sent'): 'Records backend requests emitted by stub methods.',
+        ('tests/js/navnewest.js', 'stopped'): 'Counts the waiting listings the stub swap was told to let go.',
         ('tests/js/ops.js', 'asked'): 'Records request calls through stub methods.',
         ('tests/js/ops.js', 'permitted'): 'Records requested permission-dialog arguments.',
         ('tests/js/ops.js', 'said'): 'Records messages emitted by the stub message signal.',
@@ -536,6 +678,7 @@ def stub_allowances():
         ('tests/js/recentmode.js', 'cancelled'): 'Records cancel calls through stub methods.',
         ('tests/js/recentmode.js', 'holds'): 'Records swap.hold requests.',
         ('tests/js/recentmode.js', 'listed'): 'Records list or open requests.',
+        ('tests/js/recentmode.js', 'superseded'): 'Records whether the last openWithoutHistory passed supersede.',
         ('tests/js/recentmode.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/reclick.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/reclick.js', 'sent'): 'Records backend requests emitted by stub methods.',
@@ -544,8 +687,13 @@ def stub_allowances():
         ('tests/js/reload.js', 'refreshed'): 'Records refresh calls through stub methods.',
         ('tests/js/reload.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/reload.js', 'windowed'): 'Records requested backend windows.',
+        ('tests/js/runfile.js', 'acted'): 'Records act calls through stub methods.',
+        ('tests/js/runfile.js', 'qlOpened'): 'Records Quick Look opens through the stub preview.',
+        ('tests/js/runfile.js', 'ranText'): 'Records Open as text calls through the stub run lane.',
+        ('tests/js/runfile.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/search.js', 'relisted'): 'Records openWithoutHistory inputs.',
         ('tests/js/search.js', 'sent'): 'Records backend requests emitted by stub methods.',
+        ('tests/js/searchnoblank.js', 'sent'): 'Records the listing paths the stub backend is asked for.',
         ('tests/js/slowclick.js', 'cancelled'): 'Records cancel calls through stub methods.',
         ('tests/js/slowclick.js', 'did'): 'Records dispatch calls through stub methods.',
         ('tests/js/slowclick.js', 'picked'): 'Stores the stub selection behind selection methods.',
@@ -571,11 +719,14 @@ def stub_allowances():
         ('tests/js/tabs-switch.js', 'listed'): 'Records list or open requests.',
         ('tests/js/tabs-switch.js', 'preferenceHidden'): 'Simulates external ViewState.hidden in the stub listing.',
         ('tests/js/tabs-switch.js', 'sorted'): 'Records backend.sort calls.',
+        ('tests/js/tabs-switch.js', 'superseded'): 'Resets the flag the stub openWithoutHistory records for supersede.',
+        ('tests/js/tabs.js', 'superseded'): 'Resets the flag the stub openWithoutHistory records for supersede.',
         ('tests/js/tabsfixture.js', 'clearedAtOnce'): 'Records openWithoutHistory clearAtOnce options.',
         ('tests/js/tabsfixture.js', 'listed'): 'Records list or open requests.',
         ('tests/js/tabsfixture.js', 'preferenceHidden'): 'Simulates the external ViewState.hidden preference during a stub listing.',
         ('tests/js/tabsfixture.js', 'said'): 'Records messages emitted by the stub message signal.',
         ('tests/js/tabsfixture.js', 'sorted'): 'Records backend.sort inputs.',
+        ('tests/js/tabsfixture.js', 'superseded'): 'Records whether the last openWithoutHistory passed supersede.',
         ('tests/js/tabsfixture.js', 'windows'): 'Records backend.window inputs.',
         ('tests/js/tap.js', 'cancelled'): 'Records cancel calls through stub methods.',
         ('tests/js/tap.js', 'contexts'): 'Records showRow or pointer dispatch context arguments.',
@@ -632,6 +783,44 @@ def del_printable(root, files):
     return scanned, sorted(set(errors))
 
 
+def qmllint_command(root, binary, out, files, missing):
+    # Sample input: qmllint --json out.json -I tests/staticgates-stubs/qs.Commons ui/A.qml
+    command = [binary, '--json', str(out)]
+    for module in (QMLLINT_ALWAYS_STUB, *sorted(missing)):
+        stubs = (root / QMLLINT_STUBS / module).resolve()
+        if stubs.is_dir():
+            command += ['-I', str(stubs)]
+    return command + files
+
+
+def qmllint_missing_modules(root, binary, modules=QMLLINT_PROBED_MODULES):
+    # A probe without any -I names the modules the real Qt and Quickshell installs lack, and a probe that cannot answer raises.
+    with tempfile.TemporaryDirectory(prefix='staticgates-qsprobe-') as scratch:
+        probe = Path(scratch) / 'Probe.qml'
+        probe.write_text(''.join(f'import {module}\n' for module in modules) + 'import QtQuick\nItem {}\n')
+        out = Path(scratch) / 'diagnostics.json'
+        try:
+            result = subprocess.run([binary, '--json', str(out), str(probe)], cwd=root,
+                                    capture_output=True, text=True, timeout=QMLLINT_TIMEOUT_SECONDS)
+            if not out.exists():
+                raise ValueError(f'returned {result.returncode} without JSON: {result.stderr[:STDERR_EXCERPT_LENGTH]}')
+            # Sample input: {"files":[{"filename":"Probe.qml","warnings":[{"id":"import","message":"Failed to import Quickshell. Are your import paths set up properly?"}]}]}
+            files = json.loads(out.read_text())['files']
+            return {module for module in modules for file in files for warning in file.get('warnings', [])
+                    if warning['id'] == 'import' and warning['message'].startswith(f'Failed to import {module}.')}
+        except subprocess.TimeoutExpired:
+            reason = f'timed out after {QMLLINT_TIMEOUT_SECONDS} s'
+        except json.JSONDecodeError as error:
+            reason = f'invalid JSON: {error}'
+        except KeyError as error:
+            reason = f'JSON lacks {error}'
+        except (TypeError, AttributeError) as error:
+            reason = f'JSON of the wrong shape: {error}'
+        except (OSError, ValueError) as error:
+            reason = str(error)
+    raise ValueError(f'qmllint import probe failed: {reason}')
+
+
 def qml_undeclared_read(root, files, sample=False):
     qml = [f for f in files if f.startswith('ui/') and f.endswith('.qml') and (root / f).is_file()]
     if not qml:
@@ -639,9 +828,14 @@ def qml_undeclared_read(root, files, sample=False):
     binary = os.environ.get('FLEA_QMLLINT', '/usr/lib/qt6/bin/qmllint')
     if not Path(binary).is_file() or not os.access(binary, os.X_OK):
         return len(qml), [f'qmllint unavailable: {binary}']
+    try:
+        missing = qmllint_missing_modules(root, binary)
+    except ValueError as error:
+        return len(qml), [str(error)]
+    print('STATICGATE qml-undeclared-read PROBE missing=' + (','.join(sorted(missing)) or 'none'))
     with tempfile.TemporaryDirectory(prefix='staticgates-qmllint-') as scratch:
         out = Path(scratch) / 'diagnostics.json'
-        result = subprocess.run([binary, '--json', str(out), *qml], cwd=root, capture_output=True, text=True, timeout=QMLLINT_TIMEOUT_SECONDS)
+        result = subprocess.run(qmllint_command(root, binary, out, qml, missing), cwd=root, capture_output=True, text=True, timeout=QMLLINT_TIMEOUT_SECONDS)
         if not out.exists():
             return len(qml), [f'qmllint returned {result.returncode} without JSON: {result.stderr[:STDERR_EXCERPT_LENGTH]}']
         try:
@@ -663,9 +857,7 @@ def qml_undeclared_read(root, files, sample=False):
                     current[(str(path.relative_to(root)), n, name)] += 1
         baseline = collections.Counter()
         if not sample:
-            missing = any(w['id'] == 'import' and w['message'].startswith('Failed to import Quickshell.')
-                          for file in data['files'] for w in file.get('warnings', []))
-            profile = 'quickshell-missing' if missing else 'quickshell-present'
+            profile = 'quickshell-missing' if 'Quickshell' in missing else 'quickshell-present'
             active = False
             found = False
             for row, line in enumerate((root / 'tests/staticgates-unqualified.tsv').read_text().splitlines(), 1):
@@ -690,6 +882,7 @@ def qml_undeclared_read(root, files, sample=False):
         errors = [f'{f}:{n}: new unqualified read {name}' for f, n, name in (current - baseline).elements()]
         errors += [f'{f}:{n}: stale unqualified allowance {name}' for f, n, name in (baseline - current).elements()]
         return len(qml), errors
+
 
 
 def qmlcachegen_binary():
@@ -799,8 +992,144 @@ def commons_color(root, files):
     return scanned, errors
 
 
+# Every transition in ui/ runs on OutCubic; Linear stays for the fixed-rate publish smoothing.
+# Sample input: "easing.type: Easing.OutQuad" and "Easing.InQuad" are rejected; "Easing.OutCubic", "Easing.Linear" and a comment pass.
+def easing(root, files):
+    errors = []
+    scanned = 0
+    for file in files:
+        path = root / file
+        if not file.startswith('ui/') or path.suffix not in ('.qml', '.js') or not path.is_file():
+            continue
+        scanned += 1
+        code = masked(path.read_text(), path.suffix)
+        for m in re.finditer(r'(?<![\w.$])Easing\s*\.\s*(\w+)', code):
+            if m[1] not in ('OutCubic', 'Linear'):
+                errors.append(f'{location(file, code, m.start())}: Easing.{m[1]}, every transition uses Easing.OutCubic')
+    return scanned, errors
+
+
+# Sample input: x = "a//b" // 'c...' keeps the literals and drops the tail.
+def ellipsis_code(line, quote=None):
+    # A // tail is a comment only outside a string literal, so a URI keeps its slashes.
+    if quote != '`':
+        quote = None
+    out = ['`'] if quote == '`' else []
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if quote is not None:
+            out.append(char)
+            if char == '\\':
+                out.append(line[i + 1:i + 2])
+                i += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in '"\'`':
+            quote = char
+            out.append(char)
+        elif char == '/' and line[i + 1:i + 2] == '/':
+            break
+        else:
+            out.append(char)
+        i += 1
+    # A template still open at the line end closes here so the pattern sees its tail.
+    return ''.join(out) + ('`' if quote == '`' else ''), quote
+
+
+# Sample input: /* "Saving..." */ keeps code; "//" keeps tails and "'" keeps quotes.
+def ellipsis_blocks(text):
+    # Blank block comments keeping newlines; // and quotes end at newline, backticks span.
+    out = []
+    quote = None
+    blocked = False
+    lined = False
+    i = 0
+    while i < len(text):
+        char = text[i]
+        pair = text[i:i + 2]
+        if quote is not None:
+            out.append(char)
+            if char == '\\':
+                nxt = text[i + 1:i + 2]
+                out.append(nxt)
+                if nxt == '\n' and quote != '`':
+                    quote = None
+                i += 2
+                continue
+            if (char == '\n' and quote != '`') or char == quote:
+                quote = None
+        elif blocked:
+            if pair == '*/':
+                blocked = False
+                out.append('  ')
+                i += 2
+                continue
+            out.append('\n' if char == '\n' else ' ')
+        elif lined:
+            out.append(char)
+            if char == '\n':
+                lined = False
+        elif pair == '//':
+            lined = True
+            out.append(pair)
+            i += 2
+            continue
+        elif pair == '/*':
+            blocked = True
+            out.append('  ')
+            i += 2
+            continue
+        elif char in '"\'`':
+            quote = char
+            out.append(char)
+        else:
+            out.append(char)
+        i += 1
+    return ''.join(out)
+
+
+# Sample input: label: 'Saving...' is rejected; "Saving…" and a /* "Saving..." */ block pass.
+def ellipsis(root, files):
+    errors = []
+    scanned = 0
+    for file in files:
+        path = root / file
+        if path.suffix not in ('.qml', '.js') or not file.startswith('ui/') or not path.is_file():
+            continue
+        scanned += 1
+        quote = None
+        for n, line in enumerate(ellipsis_blocks(path.read_text()).splitlines(), 1):
+            code, quote = ellipsis_code(line, quote)
+            for m in re.finditer(r'["\'`][^"\'`\n]*[A-Za-z]\.\.\.[^"\'`\n]*["\'`]', code):
+                errors.append(f'{file}:{n}: three full stops after a letter, use the ellipsis character')
+    return scanned, sorted(set(errors))
+
+
+# Sample input: extern "C" { fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int; } is rejected; the same declaration with a ... tail passes.
+def extern_variadic(root, files):
+    errors = []
+    scanned = 0
+    declarations = re.compile(r'\bfn\s+(fcntl|prctl|ioctl|open|openat|syscall|execl|execle|execlp|printf|fprintf|sprintf|snprintf|dprintf)\b\s*\(([^)]*)\)')
+    for file in files:
+        path = root / file
+        if path.suffix != '.rs' or not path.is_file() or path.is_symlink():
+            continue
+        scanned += 1
+        code = masked(path.read_text(), '.rs')
+        # The "C" literal masks to tildes, so an extern block opens as extern ~~~ {.
+        for block in re.finditer(r'\bextern\s*~+\s*\{', code):
+            end = closing(code, block.end() - 1, '{', '}')
+            for m in declarations.finditer(code, block.end(), end):
+                if '...' in m[2]:
+                    continue
+                errors.append(f'{location(file, code, m.start())}: fn {m[1]} declared without its C variadic ... tail')
+    return scanned, errors
+
+
 CHECKS = dict(zip(GATES, (conflict_marker, fused_line, paneprops, del_printable, qml_undeclared_read, qml_duplicate_member, worker_announce,
-                          commons_color)))
+                          commons_color, extern_variadic, pane_function_value, dead_module_call, worker_report, easing, ellipsis)))
 
 
 def negative_controls(root):
@@ -815,12 +1144,26 @@ def negative_controls(root):
                                  '    readonly property alias wire: wire\n}\n'),
         'worker-announce': ('ui/Sample.qml', 'import QtQuick\nItem { WorkerScript { source: "W.js" } }\n'),
         'commons-color': ('shelf/Sample.qml', 'import QtQuick\nimport qs.Commons\nRectangle { color: Color.accent }\n'),
+        'extern-variadic': ('src/Sample.rs', 'extern "C" {\n    fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;\n}\n'),
+        'pane-function-value': ('ui/js/Sample.js', 'function f(pane, id) { return id !== pane.identityOf }\n'),
+        'dead-module-call': ('ui/Sample.qml', 'import QtQuick\nimport "js/Search.js" as Search\nItem { function f() { Search.run(this) } }\n'),
+        'worker-report': ('RESULT.md', 'run notes\n'),
+        'easing': ('ui/Sample.qml', 'import QtQuick\nItem { NumberAnimation { easing.type: Easing.OutQuad } }\n'),
+        'ellipsis': ('ui/Sample.qml', 'Item { property string busy: "Saving..." }\n'),
     }
     errors = []
     script = root / 'tests/staticgates.py'
     with tempfile.TemporaryDirectory(prefix='staticgates-controls-') as scratch:
+        # Each worker-report branch and root name needs its own planted file and sample dir.
         cases = list(samples.items()) + [('qml-duplicate-member', ('ui/js/Sample.js',
-                                         '.pragma library\nfunction wire() {}\nfunction wire() {}\n'))]
+                                         '.pragma library\nfunction wire() {}\nfunction wire() {}\n')),
+                                       ('extern-variadic', ('src/Other.rs',
+                                         'extern "C" {\n    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;\n}\n')),
+                                       ('worker-report', ('.superpowers/hyg1/NOTES.md', 'run notes\n')),
+                                       ('worker-report', ('REPORT-1.md', 'run notes\n')),
+                                       ('worker-report', ('STUDY-1.md', 'run notes\n')),
+                                       ('worker-report', ('RUN.md', 'run notes\n')),
+                                       ('worker-report', ('PREMISE-1.txt', 'run notes\n'))]
         for gate, (file, text) in cases:
             sample = Path(scratch) / gate / Path(file).stem
             path = sample / file
@@ -828,6 +1171,11 @@ def negative_controls(root):
             path.write_text(text)
             if gate == 'paneprops':
                 (sample / 'ui/Pane.qml').write_text('import QtQuick\nFocusScope { property int cursorIndex: 0 }\n')
+            if gate == 'dead-module-call':
+                (sample / 'ui/js').mkdir()
+                (sample / 'ui/js/Search.js').write_text('.pragma library\nfunction start(root) {}\n')
+            if gate == 'pane-function-value':
+                (sample / 'ui/Pane.qml').write_text('import QtQuick\nFocusScope { function identityOf() { return "" }\n}\n')
             result = subprocess.run([sys.executable, str(script), '--gate', gate, '--sample', str(sample)], capture_output=True, text=True)
             diagnostic = next((line for line in result.stdout.splitlines() if line.startswith(f'STATICGATE {gate} FAIL ')), '')
             expected = {'conflict-marker': 'unresolved conflict marker', 'fused-line': 'fused code gap',
@@ -835,6 +1183,12 @@ def negative_controls(root):
                         'qml-undeclared-read': 'new unqualified read asker',
                         'worker-announce': 'WorkerScript outside ui/CountedWorker.qml',
                         'commons-color': 'bare Color',
+                        'extern-variadic': 'declared without its C variadic',
+                        'pane-function-value': 'compared without its call',
+                        'dead-module-call': 'defines no function run',
+                        'worker-report': 'worker report tracked at',
+                        'easing': 'every transition uses Easing.OutCubic',
+                        'ellipsis': 'three full stops',
                         'qml-duplicate-member': ('wire declared again (first at 2)' if file.endswith('.js') else 'Duplicate alias name')}[gate]
             if (result.returncode != 1 or expected not in diagnostic or file + ':' not in diagnostic
                     or 'STATICGATES FAIL gates=1' not in result.stdout):
@@ -842,6 +1196,14 @@ def negative_controls(root):
             else:
                 # The planted defect's verdict word is dropped, so a passing run prints no FAIL token for CI.
                 print(f'STATICGATE {gate} RED exit=1 rejected={diagnostic.split(" FAIL ", 1)[-1]}')
+            if gate == 'pane-function-value' and not errors[-1:]:
+                positive = Path(scratch) / (gate + '-positive')
+                (positive / 'ui/js').mkdir(parents=True)
+                (positive / 'ui/js/Sample.js').write_text('function f(pane, id) { return id !== pane.identityOf() }\n')
+                (positive / 'ui/Pane.qml').write_text('import QtQuick\nFocusScope { function identityOf() { return "" }\n}\n')
+                called = subprocess.run([sys.executable, str(script), '--gate', gate, '--sample', str(positive)], capture_output=True, text=True)
+                if called.returncode != 0 or 'compared without its call' in called.stdout:
+                    errors.append(f'{gate}: called function was not accepted: {called.stdout} {called.stderr}')
     return errors
 
 

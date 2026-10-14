@@ -38,6 +38,7 @@ function pane() {
     }
     p.clearSelection = function () { p.cleared += 1 }
     p.message = function (text, isError) { p.said.push(text) }
+    p.armPrompted = function () {}
     p.listArea = { primeSettle: function () {} }
     // ui/PaneSwap.qml with nothing held, so the reset and the query it hands back both run at the request.
     p.swap = { hold: function () { return false } }
@@ -377,14 +378,14 @@ function editing() {
     var wireFile = "ui/PaneWire.qml"
     var p = { path: "/fixture/list", cursorIndex: 7, held: 0, windowSize: 350, shown: null, renameRequest: null, renameSource: "", renameError: "",
               renameMenuId: 42, renameKeepsPointerRow: false, listInFlight: false, searchMode: "", listingState: "ready",
-              total: 40, sent: [] }
+              total: 40, anchorRowHeight: 37, sent: [] }
     var cursorRow = "before.txt"
     p.cursorOn = function (name) { cursorRow = name }
     p.setCursor = function (index) { p.cursorIndex = index }
     p.rowFor = function () { return { n: cursorRow } }
     p.renameEditor = function () { return p.renamingIndex >= 0 ? {} : null }
     p.join = function (base, name) { return base + "/" + name }
-    p.swap = { drop: function () {} }
+    p.swap = { phase: Swap.idle(), drop: function () {}, landParked: function () { return false } }
     p.message = function (text, error) { messages.push(text + "|" + error) }
     p.sticky = function () {}
     p.refresh = function (selected) { refreshed.push(selected) }
@@ -494,7 +495,7 @@ function renameReplies(check) {
     p = editing()
     p.fail("journal", "/fixture/list/after.txt", "permission denied")
     same("a destination-side journal failure re-reads with the new name selected",
-         [p.renamePending, p.renamingIndex, refreshed, messages], [false, -1, ["/fixture/list/after.txt"], ["Renamed, but Undo was not recorded: permission denied.|true"]])
+         [p.renamePending, p.renamingIndex, refreshed, messages], [false, -1, ["/fixture/list/after.txt"], ["Renamed, but undo cannot reverse this rename.|true"]])
     p = editing()
     p.fail("rename-kept", "/fixture/list/before.txt", "permission denied")
     same("a kept twin re-reads selecting nothing", [p.renamePending, p.renamingIndex, refreshed, messages],
@@ -530,7 +531,7 @@ function renameReplies(check) {
         p = editing()
         p.fail(dead[d], "", "the backend stopped")
         same("a " + dead[d] + " failure ends the request without a verdict", [p.renamePending, p.renamingIndex, messages],
-             [false, -1, ["Backend stopped; rename outcome unknown.|true"]])
+             [false, -1, ["Flea stopped responding, so the rename may not have finished. Check the name.|true"]])
         same("and leaves the listing in the error state with no rows: " + dead[d], [p.listingState, p.total], ["error", 0])
     }
     p = editing()

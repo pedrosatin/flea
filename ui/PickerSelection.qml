@@ -1,4 +1,5 @@
 import QtQuick
+import "js/Format.js" as Format
 import "js/Picker.js" as Picker
 import "js/Marks.js" as Marks
 
@@ -63,7 +64,7 @@ Item {
         picker.markRequest = -1
         if (!listing.paths(indices, pending.request)) {
             reset()
-            picker.say("The listing backend is not running; reopen this folder.", true)
+            picker.say("Flea stopped responding. Reopen this folder.", true)
         }
     }
     function validate(accepting) {
@@ -73,6 +74,14 @@ Item {
         picker.markRequest = picker.check({op: "validate"})
     }
     function received(message) {
+        // The typed-path probe has the backend refuse a typed file in a save or folder dialog; its reply leaves a mark in flight alone.
+        if (picker.pathProbe > 0 && message.id === picker.pathProbe) {
+            picker.pathProbe = 0
+            if (!message.ok) { picker.say(message.error, true); return }
+            // An ok probe is a typed file that became a folder before its mark, which the backend now holds as the one mark.
+            picker.marks = Picker.reviewedMarks(picker.marks, message.marks)
+            return
+        }
         picker.markRequest = 0
         var accepting = picker.acceptMarks
         picker.acceptMarks = false
@@ -104,9 +113,10 @@ Item {
         else if (message.skipped && message.skipped.length) {
             var skipped = message.skipped
             var first = skipped[0]
-            var tail = skipped.length > 1 ? "; and " + (skipped.length - 1) + " more" : ""
-            picker.say("Selected " + picker.marks.length + " of " + (picker.marks.length + skipped.length)
-                + "; " + skipped.length + " left alone: " + first.path + ": " + first.why + tail, true)
+            var total = picker.marks.length + skipped.length
+            picker.say(skipped.length > 1
+                ? Format.fill(Picker.NOTES.skippedMany, picker.marks.length, total, skipped.length, first.path, first.why, skipped.length - 1)
+                : Format.fill(Picker.NOTES.skippedOne, picker.marks.length, total, first.path, first.why), true)
         }
         else if (accepting && picker.marks.length) { picker.finish(Picker.RESPONSE_OK, picker.marks); return }
         if (queued.length) {
@@ -122,7 +132,7 @@ Item {
         running: root.pending !== null && root.picker.markRequest === -1
         onTriggered: {
             root.reset()
-            root.picker.say("The listing backend did not answer the selection request; try again.", true)
+            root.picker.say("Flea did not confirm the selection. Try again.", true)
         }
     }
     Connections {

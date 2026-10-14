@@ -55,9 +55,13 @@ check "a text row answered with no file" "1" "$(echo "$out" | grep -c '"row":1,"
 check "an image generated a thumbnail" "1" "$(echo "$out" | grep -c '"row":2,"file":"/')"
 check "every requested row was answered" "3" "$(echo "$out" | grep -c '"t":"thumbed"')"
 
-# A cache hit is one read and one parse, tens of microseconds, against the 75 ms and up that a real decode costs here.
+# A generation publishes by rename, so a cached entry that keeps its inode and mtime across the request was not generated again.
+cached_stamp() { stat -c '%i %y' "$CACHE/large/$(printf 'file://%s' "$D/files/$1" | md5sum | cut -d' ' -f1).png" 2>/dev/null || echo "missing-$1"; }
+stamps_before="$(cached_stamp clip.mp4) $(cached_stamp photo.jpg)"
+check "both cached entries are on disk before the request" "0" "$(printf '%s' "$stamps_before" | grep -c missing)"
 out=$(printf '{"c":"list","path":"%s","first":10}\n{"c":"thumb","rows":[0,2]}\n{"c":"quit"}\n' "$D/files" | timeout 120 $BIN --backend)
-check "a cached row is answered without generating it" "2" "$(echo "$out" | grep -cE '"file":"/[^"]*","ms":[0-4]\.[0-9]+}')"
+check "a cached row is answered with its file" "2" "$(echo "$out" | grep -c '"file":"/')"
+check "and neither cached entry was generated again" "$stamps_before" "$(cached_stamp clip.mp4) $(cached_stamp photo.jpg)"
 
 # The only case that decodes a real 6000 by 3375 image, 20.25 megapixels and 81 MB of RGBA, through the product path, so it is what says the address-space cap is large enough for one: it reddens at --as=536870912 and it cannot go red on issue #17 itself, because this box passes the same pixels at the old 1 GiB cap; see AGENTS.md "Thumbnail sandbox".
 if command -v magick >/dev/null; then
@@ -97,8 +101,9 @@ check "an undecodable file answers empty" "1" "$(echo "$out" | grep -c '"row":0,
 check "and the decoder verdict is recorded" "0" "$([ -e "$CACHE/fail/flea/$broken_key.png" ] && echo 0 || echo 1)"
 # record_failure publishes by rename, so a second job would leave a different inode here; an unchanged one proves no child ran.
 marker_inode=$(stat -c %i "$CACHE/fail/flea/$broken_key.png" 2>/dev/null || echo missing-before)
+# The inode below, not a time, proves the marker answered: a lost marker decodes again and publishes a new one.
 out=$(printf '{"c":"list","path":"%s","first":10}\n{"c":"thumb","rows":[0]}\n{"c":"quit"}\n' "$D/corrupt" | timeout 120 $BIN --backend)
-check "the second request is answered from the marker" "1" "$(echo "$out" | grep -c '"row":0,"file":"","ms":0\.')"
+check "the second request is answered from the marker" "1" "$(echo "$out" | grep -c '"row":0,"file":""')"
 check "and no second child ran" "$marker_inode" "$(stat -c %i "$CACHE/fail/flea/$broken_key.png" 2>/dev/null || echo missing-after)"
 
 # A fifo named like a video is not a regular file: the 10 s bound is well under the 20 s job timeout it used to burn.
@@ -265,6 +270,99 @@ exec_facts=$(png_facts "$exec_png")
 check "the exec entry's chunks were read" "1" "$(echo "$exec_facts" | grep -c '^[0-9a-f]\{64\} ')"
 check "the two publish the same image and keys" "$exec_facts" "$(png_facts "$worker_png")"
 chmod 600 "$D/worker/w3-unreadable.mp4"
+
+# Issue #171: a registered thumbnailer outside /usr runs in the jail through one read-only bind of its program; see AGENTS.md "Thumbnail sandbox".
+solid_png() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import struct, sys, zlib
+out, (r, g, b) = sys.argv[1], map(int, sys.argv[2:5])
+def chunk(kind, body):
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+raw = b"".join(b"\x00" + bytes([r, g, b]) * 16 for _ in range(16))
+open(out, "wb").write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+PY
+}
+# Sample input: "$D/user-a" 1 asks row 1 of $D/user-a/files with $D/user-a/data as the user's XDG_DATA_HOME.
+ask_user_thumbnailer() {
+  printf '{"c":"list","path":"%s","first":10}\n{"c":"thumb","rows":[%s]}\n{"c":"quit"}\n' "$1/files" "$2" \
+    | XDG_DATA_HOME="$1/data" timeout 120 $BIN --backend 2>/dev/null
+}
+write_thumbnailer() {
+  mkdir -p "$1/data/thumbnailers"
+  printf '[Thumbnailer Entry]\nTryExec=%s\nExec=%s %%i %%o %%s\nMimeType=application/x-mswinurl;\n' "$2" "$2" > "$1/data/thumbnailers/url.thumbnailer"
+}
+key_of() { printf 'file://%s' "$1" | md5sum | cut -d' ' -f1; }
+solid_png "$D/png-a.png" 200 30 30
+solid_png "$D/png-b.png" 30 30 200
+png_a=$(png_facts "$D/png-a.png" | cut -d' ' -f1)
+b64_a=$(base64 -w0 "$D/png-a.png")
+b64_b=$(base64 -w0 "$D/png-b.png")
+
+# The program is self-contained: its PNG is embedded and only /usr/bin/base64 is borrowed from /usr.
+U=$D/user-a
+mkdir -p "$U/bin" "$U/files"
+printf '#!/bin/sh\nprintf %%s %s | /usr/bin/base64 -d > "$2"\n' "'$b64_a'" > "$U/bin/drive-url-thumbnail"
+chmod 755 "$U/bin/drive-url-thumbnail"
+write_thumbnailer "$U" "$U/bin/drive-url-thumbnail"
+printf '[InternetShortcut]\nURL=https://example.com/\n' > "$U/files/a.url"
+cp "$U/files/a.url" "$U/files/b.url"
+check "the suite's shared-mime-info types a .url file as application/x-mswinurl" "1" "$(grep -c ':application/x-mswinurl:\*\.url$' /usr/share/mime/globs2)"
+out=$(ask_user_thumbnailer "$U" 0)
+check "a thumbnailer outside /usr is asked for its row" "1" "$(echo "$out" | grep -c '"row":0,"file":"/')"
+user_png=$CACHE/large/$(key_of "$U/files/a.url").png
+check "and the thumbnail it wrote is cached with its own pixels" "$png_a" "$(png_facts "$user_png" 2>/dev/null | cut -d' ' -f1)"
+check "and no failure marker is recorded" "0" "$([ -e "$CACHE/fail/flea/$(key_of "$U/files/a.url").png" ] && echo 1 || echo 0)"
+# A program another user can rewrite is refused before the jail starts, so no marker either: a refusal is not a verdict on the file.
+chmod 775 "$U/bin/drive-url-thumbnail"
+out=$(ask_user_thumbnailer "$U" 1)
+check "a group-writable thumbnailer program is refused" "1" "$(echo "$out" | grep -c '"row":1,"file":""')"
+check "and publishes nothing" "0" "$([ -e "$CACHE/large/$(key_of "$U/files/b.url").png" ] && echo 1 || echo 0)"
+check "and records no failure marker" "0" "$([ -e "$CACHE/fail/flea/$(key_of "$U/files/b.url").png" ] && echo 1 || echo 0)"
+
+# The same shape as a jail probe: PNG A is written only when a sibling read, a write to the input and a TCP connection were all refused; a file made beside the input is judged from the host.
+V=$D/user-b
+mkdir -p "$V/bin" "$V/files"
+echo "beside the program" > "$V/bin/sibling.txt"
+printf '[InternetShortcut]\nURL=https://example.com/\n' > "$V/files/a.url"
+python3 - > "$V/port" 2>/dev/null <<'PY' &
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+s.listen(8)
+print(s.getsockname()[1], flush=True)
+while True:
+    s.accept()
+PY
+listener=$!
+trap 'kill "$listener" 2>/dev/null' EXIT
+for _ in $(seq 1 50); do [ -s "$V/port" ] && break; sleep 0.1; done
+port=$(cat "$V/port")
+check "the TCP listener reported its port within five seconds" "1" "$([ -n "$port" ] && echo 1 || echo 0)"
+[ -n "$port" ] || { sandbox_remove "$D"; exit 1; }
+cat > "$V/bin/probe-thumbnail" <<'PROBE'
+#!/usr/bin/bash
+verdict=A
+cat "${0%/*}/sibling.txt" >/dev/null 2>&1 && verdict=B
+: >> "$1" 2>/dev/null && verdict=B
+: > "${1%/*}/planted" 2>/dev/null
+(exec 3<>/dev/tcp/127.0.0.1/@PORT@) 2>/dev/null && verdict=B
+case $verdict in A) png='@A@' ;; *) png='@B@' ;; esac
+printf %s "$png" | /usr/bin/base64 -d > "$2"
+PROBE
+sed -i "s|@PORT@|$port|; s|@A@|$b64_a|; s|@B@|$b64_b|" "$V/bin/probe-thumbnail"
+chmod 755 "$V/bin/probe-thumbnail"
+write_thumbnailer "$V" "$V/bin/probe-thumbnail"
+# The positive controls: outside the jail every one of the three reaches succeeds, so a refusal inside it is the jail's.
+check "outside the jail the sibling file is readable" "0" "$(cat "$V/bin/sibling.txt" >/dev/null 2>&1; echo $?)"
+check "and the input is writable" "0" "$(: >> "$V/files/a.url" 2>/dev/null; echo $?)"
+check "and a file can be created beside the input" "0" "$(: > "$V/files/control" 2>/dev/null; echo $?)"
+check "and the listener accepts a TCP connection" "0" "$( (exec 3<>/dev/tcp/127.0.0.1/"$port") 2>/dev/null; echo $?)"
+rm -f "$V/files/control"
+out=$(ask_user_thumbnailer "$V" 0)
+kill "$listener" 2>/dev/null
+check "a probe outside /usr is answered" "1" "$(echo "$out" | grep -c '"row":0,"file":"/')"
+check "and the jail refused the sibling read, the write to the input and the connection" "$png_a" "$(png_facts "$CACHE/large/$(key_of "$V/files/a.url").png" 2>/dev/null | cut -d' ' -f1)"
+check "and the file the probe created beside the input never reached the host" "0" "$([ -e "$V/files/planted" ] && echo 1 || echo 0)"
 
 # Quick Look prefetch: one cache-only ask for the next row per settled rest, none mid-burst.
 prefetch_root="$D/qlprefetch"

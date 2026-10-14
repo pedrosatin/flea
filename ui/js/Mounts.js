@@ -1,7 +1,37 @@
 .pragma library
 
+.import "Format.js" as Format
 .import "Protocols.js" as Protocols
 .import "Menu.js" as Menu
+
+// Whole sentences with "%1" for a value, filled by fill so each translates as one; replace would read "$$" in a label as a pattern.
+var WORDS = {
+    nothingToRelease: "%1 has nothing to eject or unmount",
+    stillEjecting: "Still ejecting %1; wait for its result",
+    stillUnmounting: "Still unmounting %1; wait for its result",
+    anotherMounting: "Another drive is still mounting. Try again when it finishes",
+    stillUnmountingTryAgain: "%1 is still unmounting. Try again when it finishes",
+    ejecting: "Ejecting %1. Do not unplug it yet.",
+    noFolder: "%1 was mounted, but Flea could not find its folder.",
+    ejectUnfinished: "%1 did not finish ejecting and is still mounted.",
+    mountFailed: "%1 could not be mounted.",
+    damaged: "%1 could not be mounted: its file system is damaged or not supported.",
+    unmountFailed: "%1 could not be unmounted.",
+    ejectFailed: "%1 could not be ejected.",
+    busy: "%1 is busy; close what is using it and try again.",
+    mountRefused: "%1 was not mounted: you do not have permission.",
+    unmountRefused: "%1 was not unmounted: you do not have permission.",
+    ejectRefused: "%1 was not ejected: you do not have permission.",
+    noDisc: "%1 has no disc or card in it.",
+    notMountable: "%1 cannot be mounted on this computer.",
+    anotherOpening: "Another network location is still opening. Try again when it opens",
+    notSaved: "%1 is not saved, and stays in the sidebar until it is unmounted",
+    forgottenStays: "%1 is forgotten, and stays in the sidebar until it is unmounted",
+    forgotten: "%1 is forgotten",
+    unmountedLine: "Unmounted %1",
+    bridgeMissing: "Could not open %1 because part of Flea did not load. Reinstall Flea.",
+    transferUsing: "%1 could not be unmounted. A transfer may still be using it."
+}
 
 // Sample input, captured live on the box with one network share mounted (2026-08-31):
 // Drive(0): KBG40ZNS256G NVMe KIOXIA 256GB
@@ -11,12 +41,9 @@
 // Only Mount() lines matter here; Drive() and every indented "Type:" line are noise for the rail.
 function parseMounts(output) {
     var out = []
-    var lines = String(output || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-        var m = lines[i].match(/^Mount\(\d+\):\s*(.+?)\s*->\s*(\S+)\s*$/)
-        if (!m)
-            continue
-        var uri = m[2]
+    var mounts = mountLines(output)
+    for (var i = 0; i < mounts.length; i++) {
+        var uri = mounts[i].uri
         // corner: a local device mount (file://) is Favorites territory, not Network; Places.js skips the inverse.
         if (uri.indexOf("file://") === 0)
             continue
@@ -25,7 +52,35 @@ function parseMounts(output) {
         // iPhone's own, whose root mount prints here rather than inside its volume block.
         if (/^(mtp|gphoto2|afc):\/\//i.test(uri))
             continue
-        out.push({ label: Protocols.shareName(m[1], uri), uri: uri })
+        out.push({ label: Protocols.shareName(mounts[i].name, uri), uri: uri })
+    }
+    return out
+}
+
+// Sample input: "Mount(2): isos on 192.168.1.10 -> smb://192.168.1.10/isos/" answers { name: "isos on 192.168.1.10", uri: "smb://192.168.1.10/isos/" }.
+// Every top-level "Mount(N): name -> uri" line of gio mount -l; the one owner of that line's grammar.
+function mountLines(output) {
+    var out = []
+    var lines = String(output || "").split("\n")
+    for (var i = 0; i < lines.length; i++) {
+        var m = lines[i].match(/^Mount\(\d+\):\s*(.+?)\s*->\s*(\S+)\s*$/)
+        if (m)
+            out.push({ name: m[1], uri: m[2] })
+    }
+    return out
+}
+
+// Sample input: "Mount(0): photos -> file:///mnt/kmount-photos" answers { path: "/mnt/kmount-photos", label: "photos", uri: "file:///mnt/kmount-photos" }.
+// Issue #257: what gio adds to a kernel row, matched by path; a non-file line adds nothing, an unlisted mount keeps its leaf label.
+function gioKernelMounts(gioText) {
+    var out = []
+    var mounts = mountLines(gioText)
+    for (var i = 0; i < mounts.length; i++) {
+        var m = mounts[i]
+        if (m.uri.indexOf("file://") !== 0)
+            continue
+        var path = decodePath(m.uri.substring("file://".length)).replace(/\/+$/, "")
+        out.push({ path: path.length > 0 ? path : "/", label: Protocols.shareName(m.name, m.uri), uri: m.uri })
     }
     return out
 }
@@ -51,7 +106,12 @@ function localPath(body) {
 function trashable(path, writable) {
     if (writable === false)
         return false
-    return !/\/gvfs\/[a-z0-9-]+:/i.test(String(path || ""))
+    return !underGvfs(path)
+}
+
+// A path inside the GVFS FUSE root /run/user/<uid>/gvfs, where the "scheme:" segment names the mount; a folder named gvfs elsewhere is plain.
+function underGvfs(path) {
+    return /^\/run\/user\/[^/]+\/gvfs\/[A-Za-z0-9-]+:/.test(String(path || ""))
 }
 
 // Sample input: the operator's real bookmarks file, ui/js/Places.js "bookmarks" reads the same lines.
@@ -149,7 +209,8 @@ function sameEntry(x, y) {
     return x.path === y.path && x.label === y.label && x.group === y.group && x.kind === y.kind
         && x.uri === y.uri && x.device === y.device && x.mounted === y.mounted && x.glyph === y.glyph
         && x.size === y.size && x.editable === y.editable && x.removable === y.removable
-        && x.volumeMenu === y.volumeMenu
+        && x.fstype === y.fstype && x.fsver === y.fsver && x.mediaRemovable === y.mediaRemovable && x.readOnly === y.readOnly
+        && (x.locked || false) === (y.locked || false)
 }
 
 // Sample input: one rail entry as ui/DeviceMounts.qml and ui/NetworkMounts.qml build them,
@@ -202,20 +263,23 @@ function rowByKey(entries, key) {
     return -1
 }
 
-// The mounted row with a release whose path holds the directory, or null: what Ctrl+E acts on from
-// a listing. A share's FUSE path is not known to the rail (its path is ""), so a listing inside one
-// answers null rather than guessing, and the internal disk never offers a release to begin with.
+// The device or network row with a release whose path holds the directory, or null; a favourite never names a volume.
 function holding(entries, dir) {
     var list = entries || []
     var path = String(dir || "")
     for (var i = 0; i < list.length; i++) {
         var e = list[i]
-        if (!e.path || railMenu(e).length === 0)
+        if (!e.path || (e.group !== "device" && e.group !== "network") || railMenu(e).length === 0)
             continue
-        if (path === e.path || path.indexOf(e.path + "/") === 0)
+        if (inside(path, e.path))
             return e
     }
     return null
+}
+
+// Whether dir is root itself or lies under it; ui/js/Places.js heldBy asks the rail the same question.
+function inside(dir, root) {
+    return dir === root || dir.indexOf(root + "/") === 0
 }
 
 // The keyboard's route into the rail menu, and where a rail row without one is answered: the sheet
@@ -227,7 +291,7 @@ function raiseMenu(pane, sidebar) {
     if (rowMenu(entry).length > 0)
         sidebar.openCursorMenu()
     else
-        pane.message(entry.label + " has nothing to eject or unmount.", false)
+        pane.message(Format.fill(WORDS.nothingToRelease, entry.label), false)
 }
 
 // Sample input: (true, "a", "a", "b", "b") answers "skip", while (true, "a", "x", "b", "b") answers "rebuild".

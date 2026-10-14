@@ -3,6 +3,7 @@ import QtQuick
 import Quickshell
 import "flea" as Flea
 import "flea/js/Menu.js" as Menu
+import "qml-probe.js" as QmlProbe
 
 // tests/menu-fit.sh's harness: the real ui/ContextMenu.qml with every row shown and key hints on is as wide as its widest row, so no label elides.
 ShellRoot {
@@ -36,21 +37,12 @@ ShellRoot {
     // Where a scene that is not at the window edge opens its menu.
     readonly property point openPoint: Qt.point(100, 40)
 
-    function log(line) { console.log("MENUFIT " + line) }
+    function log(line) { QmlProbe.log("MENUFIT", line) }
     function quit() { Quickshell.execDetached(["kill", String(Quickshell.processId)]) }
-    function check(name, actual, expected) {
-        shell.checks++
-        if (JSON.stringify(actual) === JSON.stringify(expected)) return
-        shell.failures.push(name)
-        shell.log("FAIL " + name + ": got " + JSON.stringify(actual) + ", expected " + JSON.stringify(expected))
-    }
+    function check(name, actual, expected) { QmlProbe.checkQuiet(shell, name, actual, expected) }
 
     function report() {
-        ticker.running = false
-        shell.done = true
-        if (shell.failures.length === 0)
-            shell.log("PASS " + shell.checks + " checks")
-        shell.log("DONE failures=" + shell.failures.length)
+        QmlProbe.reportCard(shell, ticker)
         shell.quit()
     }
 
@@ -60,6 +52,20 @@ ShellRoot {
         color: "#303030"
         Flea.ContextMenu { id: menu; anchors.fill: parent }
     }
+
+    // The IPC probe reads the same live menu, so its wanted width is assertable headless.
+    QtObject { id: stubBackend; signal shebang(string path, bool hasShebang, int id) }
+    QtObject {
+        id: stubPane
+        property var backend: stubBackend
+        property var menuActions: ({ready: true, requestId: 0})
+        property string shebangAsked: ""
+        property bool rowHasShebang: false
+        property int shebangId: 0
+        function contextMenu() { return menu }
+    }
+    QtObject { id: windowStub; function rectOf(item) { return "" } }
+    Flea.IpcMenuState { id: probe; pane: stubPane; fleaWindow: windowStub }
 
     // One scene: {tag, stop, density, hints, all, kind: "file" | "background", flyout: action or "", edge, narrow}.
     function sceneList() {
@@ -83,20 +89,34 @@ ShellRoot {
             out.push({ stop: shell.stops[e], density: "compact", hints: true, all: true, kind: "file", flyout: "", edge: false, narrow: false, edges: "frame" })
             out.push({ stop: shell.stops[e], density: "compact", hints: true, all: true, kind: "file", flyout: "openWith", edge: false, narrow: false, edges: "flyout" })
         }
+        // Every errored row says its state word in the slot it already has, and a word may widen its menu, never past the work area.
+        for (var w = 0; w < shell.stops.length; w++)
+            for (var k = 0; k < shell.erroredKinds.length; k++)
+                out.push({ stop: shell.stops[w], density: "compact", hints: true, all: false, kind: "file", flyout: "", edge: false, narrow: false,
+                           errored: shell.erroredKinds[k] })
         // The row a flyout hangs from, opened by its key on a scrolled menu, is revealed clear of the fades too.
         out.push({ stop: 14, density: "compact", hints: true, all: true, kind: "file", flyout: "", edge: false, narrow: false, edges: "hang" })
         for (var i = 0; i < out.length; i++)
-            out[i].tag = out[i].kind + "/" + out[i].stop + "/" + out[i].density + (out[i].hints ? "/hints" : "/plain")
+            out[i].tag = (out[i].errored ? "errored-" + out[i].errored + "/" : "") + out[i].kind + "/" + out[i].stop + "/" + out[i].density + (out[i].hints ? "/hints" : "/plain")
                        + (out[i].all ? "/all" : "/default") + (out[i].flyout ? "/" + out[i].flyout : "")
                        + (out[i].edge ? "/edge" : "") + (out[i].narrow ? "/narrow" : "") + (out[i].edges ? "/scrolled-" + out[i].edges : "")
         return out
     }
     readonly property var scenes: shell.sceneList()
+    // The row a state word is read on, by the file kind the menu opens over; the words are ui/js/StateWords.js's table.
+    readonly property var erroredKinds: ["link", "special", "folder"]
+    readonly property var erroredWords: ({
+        link: { taildrop: "signed out", localsend: "no devices", dropbox: "signed out", permissions: "symlink" },
+        special: { taildrop: "offline", localsend: "no devices", dropbox: "not running", permissions: "special file" },
+        folder: { taildrop: "files only", localsend: "files only", dropbox: "not running" }
+    })
+    readonly property var erroredModes: ({ link: 0o120777, special: 0o010644, folder: 0o040755 })
 
     function setup(s) {
         var stateDoc = { keyHints: s.hints, density: s.density, display: { textSize: { mode: s.stop } } }
         // Every row shown: no hidden id, and the shelf on, which is a stored boolean of its own.
         if (s.all) { stateDoc.menu = { hidden: [] }; stateDoc.shelf = { enabled: true } }
+        if (s.errored) stateDoc.menu = { hidden: [] }
         Flea.ViewState.state = stateDoc
         Flea.Scripts.entries = s.all ? [{ id: "backup", label: "Backup", path: "/x/backup.sh" }] : []
         menu.workArea = s.narrow ? Qt.rect(0, 0, Math.round(Flea.Theme.menuWidth * shell.narrowWorkShare), shell.windowHeight) : Qt.rect(0, 0, shell.windowWidth, shell.windowHeight)
@@ -117,6 +137,7 @@ ShellRoot {
         menu.localSend = { installed: s.all, peers: s.all ? [{ id: "q", label: "Phone" }] : [], checking: false }
         menu.dropboxInstalled = s.all
         menu.dropboxPath = s.all ? "/home/u/Dropbox" : ""
+        if (s.errored) shell.setupErrored(s)
         menu.openWithLoaded = true
         menu.openWithApps = [{ id: "a", label: "App A", default: true }, { id: "b", label: "App B" }]
         // A flyout taller than its frame, so it scrolls.
@@ -130,6 +151,34 @@ ShellRoot {
             shell.check(s.tag + ": the row that opens " + s.flyout + " exists", index >= 0, true)
             if (index >= 0) { menu.cursor = index; menu.openSubmenu(index) }
         }
+    }
+    // Every provider installed and unable to answer, over a row of the scene's kind.
+    function setupErrored(s) {
+        menu.rowMode = shell.erroredModes[s.errored]
+        menu.rowIsFile = s.errored !== "folder"
+        menu.taildropInstalled = true
+        menu.taildropPeers = []
+        menu.taildropCode = s.errored === "link" ? "signedOut" : ""
+        menu.localSend = { installed: true, peers: [], checking: false }
+        menu.dropboxInstalled = true
+        menu.dropboxPath = ""
+        menu.dropboxCode = s.errored === "special" || s.errored === "folder" ? "" : "signedOut"
+    }
+    // Each errored row draws its word whole in the hint slot, and its wanted width counts the label, the gap and the word.
+    function runErrored(s) {
+        var words = shell.erroredWords[s.errored], bad = [], missing = []
+        for (var action in words) {
+            var index = shell.entryIndex(action)
+            var row = index >= 0 ? menu.itemFor(index) : null
+            if (!row) { missing.push(action); continue }
+            var drawn = shell.textDrawn(row, words[action])
+            if (!(row.errored && row.hint === words[action] && drawn && drawn.visible && !drawn.truncated)) bad.push(action + ":" + row.hint)
+            var lab = shell.textDrawn(row, row.entry.label)
+            if (lab && drawn && row.wantedWidth < lab.implicitWidth + Flea.Theme.spacing.gap + drawn.implicitWidth) bad.push(action + " wants only " + row.wantedWidth)
+            shell.log("MEASURE " + s.tag + " " + action + " wanted=" + row.wantedWidth + " menuWidth=" + Flea.Theme.menuWidth + " label=" + (lab ? lab.implicitWidth : -1) + " word=" + (drawn ? drawn.implicitWidth : -1) + " frame=" + menu.frameItem.width + " chevron=" + (row.isSubmenu ? 1 : 0))
+        }
+        shell.check(s.tag + ": the errored rows are all there", missing, [])
+        shell.check(s.tag + ": each errored row draws its state word whole and wants room for it", bad, [])
     }
     function entryIndex(action) {
         for (var i = 0; i < menu.entries.length; i++)
@@ -166,6 +215,19 @@ ShellRoot {
             if (row.wantedWidth > out.wanted) { out.wanted = row.wantedWidth; out.widest = row }
         }
         return out
+    }
+
+    // A row's needed width from its own parts, the sum ui/MenuRow.qml's wantedWidth takes; 0 when a row is unbuilt.
+    // Sample input: [{separator: false, markLeft: 12, slot: 16, labelLeft: 8, label: 61, labelRight: 8, hint: 40, hintWrap: false, hintRight: 0, status: 0, chevron: 0, chevronRight: 12}, {separator: true}]
+    function neededWidth(rows) {
+        var widest = 0
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i]
+            if (!r) return 0
+            if (r.separator) continue
+            widest = Math.max(widest, Math.ceil(r.markLeft + r.slot + r.labelLeft + r.label + r.labelRight + (r.hintWrap ? 0 : r.hint) + r.hintRight + r.status + r.chevron + r.chevronRight))
+        }
+        return widest
     }
 
     function inside(item, area) {
@@ -317,26 +379,36 @@ ShellRoot {
         if (s.edges === "hang") { shell.runHang(s); return }
         if (s.edges) { shell.runEdges(s); return }
         var tag = s.tag
+        if (s.errored) shell.runErrored(s)
         var main = shell.readCard(menu.frameItem, menu.entries.length, menu.itemFor)
+        // The probe carries each row's own parts; the frame is min(area, max(token, their sum)), not widestRow's answer.
+        var st = JSON.parse(probe.state()), need = shell.neededWidth(st.rows)
+        shell.check(tag + ": the probe states every row's parts", need > 0, true)
+        shell.check(tag + ": the frame is the parts' sum between the token and the work area", Math.abs(menu.frameItem.width - Math.min(menu.workArea.width, Math.max(Flea.Theme.menuWidth, need))) <= shell.roundingSlack, true)
+        if (menu.frameItem.width < menu.workArea.width)
+            shell.check(tag + ": the probe reports no elided frame label", st.rows.filter(function (r) { return r && !r.separator && r.labelTruncated }).length, 0)
+        if (!s.all && !s.errored)
+            shell.check(tag + ": the parts of rows that all fit stay under Theme.menuWidth", need <= Flea.Theme.menuWidth, true)
         var cards = [{ name: "frame", frame: menu.frameItem, read: main }]
         if (s.flyout)
             cards.push({ name: "flyout", frame: menu.submenuFrameItem,
                          read: shell.readCard(menu.submenuFrameItem, menu.submenuEntries.length, menu.submenuItemFor) })
         for (var c = 0; c < cards.length; c++) {
             var card = cards[c]
-            var want = Math.min(menu.workArea.width, Math.max(Flea.Theme.menuWidth, card.read.wanted))
-            shell.check(tag + ": " + card.name + " is as wide as its widest row, capped by the work area", card.frame.width, want)
+            var want = Math.min(menu.workArea.width, Math.max(Flea.Theme.menuWidth, card.read.wanted, card.name === "flyout" ? menu.frameItem.width : 0))
+            shell.check(tag + ": " + card.name + " is as wide as its widest row and its parent frame, capped by the work area", card.frame.width, want)
             shell.check(tag + ": " + card.name + " stays inside the work area", shell.inside(card.frame, menu.workArea), true)
             shell.check(tag + ": " + card.name + " rows each state a wanted width", card.read.unmeasured, [])
             if (!s.narrow) {
                 shell.check(tag + ": " + card.name + " elides no label", card.read.truncated, [])
                 shell.check(tag + ": " + card.name + " keeps every hint clear of its label", card.read.touching, [])
             }
-            if (!s.all)
+            // A state word is part of its errored row's wanted width, so an errored menu is as wide as that row, not Theme.menuWidth.
+            if (!s.all && !s.errored)
                 shell.check(tag + ": " + card.name + " of rows that all fit keeps Theme.menuWidth", card.frame.width, Flea.Theme.menuWidth)
             // The widest row of a widened card is flush: its hint sits one gap from its label, no wider than needed.
             var widest = card.read.widest
-            if (!s.narrow && widest && card.frame.width > Flea.Theme.menuWidth && widest.hint.length > 0 && widest.entry.hintSquare !== true) {
+            if (!s.narrow && widest && card.frame.width > Flea.Theme.menuWidth && card.frame.width <= widest.wantedWidth + shell.roundingSlack && widest.hint.length > 0 && widest.entry.hintSquare !== true) {
                 var label = shell.textDrawn(widest, widest.entry.label), hint = shell.textDrawn(widest, widest.hint)
                 var slack = hint.x - (label.x + label.implicitWidth) - Flea.Theme.spacing.gap
                 shell.check(tag + ": " + card.name + " is no wider than its widest row needs", Math.abs(slack) <= shell.roundingSlack, true)

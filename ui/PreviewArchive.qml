@@ -35,11 +35,13 @@ Item {
                     width: Theme.font.caption
                     height: Theme.font.caption
                     name: modelData.d ? "folder" : "file"
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                 }
 
-                // corner: an archive holds arbitrary names, so PlainText, the same rule every name follows.
+                // corner: an archive holds arbitrary names, so PlainText; the row's height, centred, puts the name on the glyph's line.
                 Text {
+                    height: parent.height
+                    verticalAlignment: Text.AlignVCenter
                     text: modelData.n
                     color: Theme.color.muted
                     font.family: Theme.font.family

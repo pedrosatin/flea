@@ -2,16 +2,24 @@ import QtQuick
 import "js/Drag.js" as DragOps
 import "js/DragOut.js" as DragOut
 import "js/Ops.js" as Ops
+import "js/Search.js" as Search
 
 // The platform drag belongs to the view: a tab switch may destroy the pressed delegate inside QDrag.exec().
 Item {
     id: root
 
     required property var pane
+    // A peek column's {pane, dir, v, w}: its rows are in no listing, so a lift carries the row's own path instead.
+    property var peekSource: null
+    // The window the gesture speaks in: the listing's pane, or the pane a peek column belongs to.
+    readonly property var host: root.pane || (root.peekSource ? root.peekSource.pane : null)
     property var dragRows: []
     // The numbering dragRows were read in, fixed at the lift so a drop after a re-list is refused rather than resolved anew.
     property real dragListing: 0
     property int dropIndex: -1
+    // The hovered folder a drop lands in after it opens: a swap may rebuild the lit delegate on another row.
+    property string dropDest: ""
+    property int dropDestDev: 0
     property bool dragCopy: false
     property bool dragShift: false
     property bool dragLink: false
@@ -19,6 +27,11 @@ Item {
     property bool buttonUp: false
     property var dragMime: ({})
     property var feedback: null
+    // Drops callout 2: the folder the pointer rests on and the autoscroll band it rests in; the timers are built on first use.
+    property int hoverIndex: -1
+    property string hoverPath: ""
+    property int scrollDir: 0
+    property var hoverTimers: null
 
     Drag.dragType: Drag.Automatic
     // Plain lift offers copy alone, narrowed by modifiers (a browser uploader refuses move); Ctrl copy, Shift move, both link, so any receiver takes the lift's verb.
@@ -37,6 +50,8 @@ Item {
         root.dragRows = DragOps.carried(root.pane, index)
         root.dragListing = root.pane.backend ? root.pane.backend.heldListing : 0
         root.dropIndex = -1
+        root.dropDest = ""
+        root.dropDestDev = 0
         // Ctrl is the threshold's, and a paths reply must not sample it again.
         root.dragCopy = DragOps.copying(centroid.modifiers)
         root.dragShift = DragOps.shifting(centroid.modifiers)
@@ -68,6 +83,32 @@ Item {
         root.pane.backend.send({ c: "paths", rows: rows, listing: listing })
     }
 
+    function liftPeek(row, centroid) {
+        if (!root.peekSource || !row) return
+        root.buttonUp = false
+        root.dragRows = []
+        root.dragListing = 0
+        root.dropIndex = -1
+        root.dropDest = ""
+        root.dropDestDev = 0
+        root.dragCopy = DragOps.copying(centroid.modifiers)
+        root.dragShift = DragOps.shifting(centroid.modifiers)
+        root.dragLink = DragOps.linking(centroid.modifiers)
+        root.dragMime = root.peekMime(row, root.dragCopy, root.dragShift)
+        root.startOffer()
+    }
+
+    // No rows in the marker, so no receiver resolves it by index (DragOps.canDropByIndex needs rows); the uri is the column's directory plus the name.
+    function peekMime(row, copy, shift) {
+        var src = root.peekSource
+        var path = src.pane.join(src.dir, row.n)
+        var mime = {}
+        mime[DragOps.ROWS_MIME] = DragOps.markerPayload([], copy, src.dir, src.v, src.w, shift === true)
+        mime["text/uri-list"] = DragOps.uriFor(path) + "\r\n"
+        mime["text/plain"] = path
+        return mime
+    }
+
     function liftReleased() {
         root.buttonUp = true
     }
@@ -80,11 +121,12 @@ Item {
     }
 
     function startOffer() {
+        root.dragMime = DragOut.keys.stamped(root.dragMime)
         root.feedback = DragOps.feedbackFor(root.dragMime[DragOps.ROWS_MIME],
             (root.dragMime["text/uri-list"] || "").split("\r\n"))
         root.showTarget("", root.feedback.dev)
         // Drag.Automatic runs QDrag::exec synchronously, so a finish inside it must not overwrite the hold: arm the watch first.
-        if (root.pane) root.pane.dragHolding = true
+        if (root.host) root.host.dragHolding = true
         root.Drag.active = true
     }
 
@@ -106,7 +148,7 @@ Item {
     function mimeForPaths(rows, paths, copy, shift) {
         var mime = {}
         var dev = root.pane.backend ? root.pane.backend.dirDev : 0
-        mime[DragOps.ROWS_MIME] = DragOps.markerPayload(rows, copy, root.pane.path, dev, DragOps.listingDeletable(root.pane), shift === true)
+        mime[DragOps.ROWS_MIME] = DragOps.markerPayload(rows, copy, Search.baseOf(root.pane), dev, DragOps.listingDeletable(root.pane), shift === true)
         var uris = []
         for (var i = 0; i < paths.length; i++) uris.push(DragOps.uriFor(paths[i]))
         mime["text/uri-list"] = uris.join("\r\n") + "\r\n"
@@ -119,33 +161,67 @@ Item {
         var line = DragOps.line(root.dragRows.length, "", root.dragCopy, root.dragLink) + DragOps.reachNote(false)
         root.awaitingPaths = false
         root.liftEnded()
-        if (root.pane) root.pane.message(line, false)
+        if (root.host) root.host.message(line, false)
     }
 
-    function verbAt(marker, row) {
-        return DragOps.verbFor(DragOps.isOwnDrag(marker), DragOps.markerCopying(marker),
-                               DragOps.markerShift(marker), DragOps.markerDev(marker),
+    function verbAt(marker, row, seenCopy, seenShift) {
+        return DragOps.verbFor(DragOps.isOwnDrag(marker), DragOps.dropHeld(DragOps.markerCopying(marker), seenCopy),
+                               DragOps.dropHeld(DragOps.markerShift(marker), seenShift), DragOps.markerDev(marker),
                                row ? row.v : 0, DragOps.markerDeletable(marker))
     }
 
     function liftEnded() {
         root.Drag.active = false
-        if (root.pane) { root.pane.dragHolding = false; root.pane.awaitingPaths = false }
+        if (root.host) { root.host.dragHolding = false; root.host.awaitingPaths = false; root.host.pointerHeld = false }
         root.dragRows = []
         root.dragListing = 0
         root.dragMime = ({})
         root.dropIndex = -1
+        root.dropDest = ""
+        root.dropDestDev = 0
         root.dragCopy = false
         root.dragShift = false
         root.dragLink = false
         root.feedback = null
+        root.hoverIndex = -1
+        root.hoverPath = ""
+        root.scrollDir = 0
+        if (root.hoverTimers) root.hoverTimers.stopRest()
         // A different view may now speak for this gesture; its activity is separate from every transfer.
-        var bar = root.pane ? root.pane.statusBar : null
+        var bar = root.host ? root.host.statusBar : null
         if (bar && bar.dragFeedbackOwner) bar.dragFeedbackOwner.say("")
     }
 
+    // A folder row under the pointer starts the rest that opens it and the band that scrolls; a move restarts both.
+    function hoverBegan(index, path, y, height) {
+        root.hoverIndex = index
+        root.hoverPath = path
+        root.scrollDir = DragOut.band(y, height)
+        root.ensureHoverTimers()
+        root.hoverTimers.rest()
+    }
+
+    function hoverMoved(y, height) {
+        root.scrollDir = DragOut.band(y, height)
+        if (root.scrollDir !== 0) root.ensureHoverTimers()
+        if (root.hoverTimers) root.hoverTimers.rest()
+    }
+
+    function hoverEnded() {
+        root.hoverIndex = -1
+        root.hoverPath = ""
+        root.scrollDir = 0
+        if (root.hoverTimers) root.hoverTimers.stopRest()
+    }
+
+    function ensureHoverTimers() {
+        if (root.hoverTimers !== null)
+            return
+        root.hoverTimers = Qt.createComponent("HoverTimers.qml").createObject(root, { session: root })
+    }
+
     function say(text) {
-        var bar = root.pane ? root.pane.statusBar : null
+        var bar = root.host ? root.host.statusBar : null
         if (!bar) return
         if (!text) {
             if (bar.dragFeedbackOwner === root) {
@@ -174,16 +250,16 @@ Item {
     }
 
     function leaveTarget() {
-        var bar = root.pane ? root.pane.statusBar : null
+        var bar = root.host ? root.host.statusBar : null
         if (!bar || bar.dragFeedbackOwner !== root) return
         root.say(root.feedback && root.feedback.own
             ? DragOps.feedbackLine(root.feedback, "", root.feedback.dev) : "")
     }
 
     Connections {
-        target: root.pane ? root.pane.statusBar : null
+        target: root.host ? root.host.statusBar : null
         function onActivitiesChanged() {
-            var bar = root.pane.statusBar
+            var bar = root.host.statusBar
             if (bar.dragFeedbackOwner === root
                     && bar.activities.some(function (entry) { return entry.transfer.running })) root.say("")
         }

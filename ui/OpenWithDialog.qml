@@ -2,6 +2,7 @@ import QtQuick
 import qs.Commons
 import "." as Flea
 import "js/OpenWith.js" as OpenWith
+import "js/Format.js" as Format
 import "js/Input.js" as Input
 
 // OpenWith.html rule 4: the Convert popup family, and the one place a default handler is written.
@@ -23,10 +24,9 @@ Item {
     property var installed: []
     property bool always: false
     property int cursor: 0
-    // 0 search, 1 list, 2 always box, 3 Cancel, 4 Open: rule 8's own cycle, and it wraps.
-    property int focusPart: 1
-    // Where any row last saw the pointer. Without it a row that scrolls under a resting pointer
-    // reports a move and drags the keyboard cursor back to itself, see ui/MenuRow.qml's HoverHandler.
+    // 0 search, 1 list, 2 always box, 3 Cancel, 4 Open: rule 8's own cycle, and it wraps; the cursor row draws on 0 and 1 only, as Enter from either opens it.
+    property int focusPart: 0
+    // Where a row or the ground last saw the pointer, -1 since opening, so a row built or scrolled under a resting pointer never takes the cursor.
     property point pointerGlobal: Qt.point(-1, -1)
 
     signal requested(var message)
@@ -45,7 +45,7 @@ Item {
     readonly property var closeItem: cancelButton
     readonly property var submitItem: openButton
     readonly property var fieldItem: field
-    readonly property var titleRuleItem: titleRule
+    readonly property var titleRuleItem: title.ruleItem
     readonly property var searchItem: searchBox
     readonly property var applicationsItem: list
     readonly property var alwaysItem: alwaysBox
@@ -64,8 +64,12 @@ Item {
     readonly property int searchTrail: Math.round(root.eyebrowLeadBoard * Theme.font.bodySmall / root.bodySmallBoard)
 
     anchors.fill: parent
-    visible: root.opened
+    visible: root.opened || root.opacity > 0
+    // Closed means no input, even while the fade-out is still drawn.
+    enabled: root.opened
+    opacity: 0
     z: 2
+    Flea.Reveal { target: root; shown: root.opened; lift: card }
 
     // The shared signature the Loader calls both cards with; this one reads the item off the reply.
     function open(operation, id, sourceFolder, holder) {
@@ -83,12 +87,12 @@ Item {
         root.errorText = ""
         root.committing = false
         root.busy = true
-        root.focusPart = 1
+        root.focusPart = 0
         field.text = ""
         root.opened = true
         list.contentY = 0
         wheel.resetSteps()
-        list.forceActiveFocus()
+        field.forceActiveFocus()
         // installed: the whole catalogue, which only this card draws. The flyout asks without it,
         // so a right-click does not pay for a walk of every applications directory on the box.
         root.requested({c: "menuaction", op: "applications", id: id, installed: true})
@@ -100,11 +104,18 @@ Item {
         // ends the child rather than leaving it running behind a card that is already gone.
         root.requested({c: "menuaction", op: "close", id: root.requestId})
         root.opened = false
-        root.busy = false
-        root.committing = false
+        root.settleClosed()
         root.closed()
         if (root.focusHolder) root.focusHolder.forceActiveFocus()
     }
+
+    // A closed card keeps its busy look while it fades out; the reset waits until it is gone.
+    function settleClosed() {
+        if (root.opened || root.opacity !== 0) return
+        root.busy = false
+        root.committing = false
+    }
+    onOpacityChanged: root.settleClosed()
 
     // The pane calls this when the folder is refreshed under an open dialog. Nothing to redraw here:
     // the backend rechecks the captured item on submit, so a selection that moved refuses there.
@@ -114,7 +125,7 @@ Item {
         if (!root.opened || message.id !== root.requestId) return
         if (message.op === "applications") {
             root.busy = false
-            if (!message.ok) { root.errorText = message.error || "The registry could not be read."; return }
+            if (!message.ok) { root.errorText = message.error || "The list of applications could not be read."; return }
             root.path = message.path || ""
             root.kind = message.kind || ""
             root.mime = message.mime || ""
@@ -125,9 +136,9 @@ Item {
             return
         }
         if (message.op !== "openWith") return
+        if (message.ok) { root.close(); return }
         root.busy = false
         root.committing = false
-        if (message.ok) { root.close(); return }
         if (!message.cancelled) root.errorText = message.error || "The application could not be opened."
     }
 
@@ -181,9 +192,12 @@ Item {
         opacity: 0.5
 
         MouseArea {
+            id: ground
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
+            onEntered: root.pointerGlobal = ground.mapToItem(null, ground.mouseX, ground.mouseY)
+            onPositionChanged: function (mouse) { root.pointerGlobal = ground.mapToItem(null, mouse.x, mouse.y) }
             onClicked: root.close()
             onWheel: function (wheel) { wheel.accepted = true }
         }
@@ -199,51 +213,41 @@ Item {
         height: Theme.cardSpan(body.wanted + 2 * Theme.spacing.rowPaddingX, root.height - 2 * root.clampMargin)
         color: Theme.color.surface
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         radius: Style.cornerRadius
 
         // The checkbox handler takes a passive grab, so without this sink its press reaches the ground.
         MouseArea {
+            id: cardSink
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             hoverEnabled: true
+            onEntered: root.pointerGlobal = cardSink.mapToItem(null, cardSink.mouseX, cardSink.mouseY)
+            onPositionChanged: function (mouse) { root.pointerGlobal = cardSink.mapToItem(null, mouse.x, mouse.y) }
             onClicked: {}
             onWheel: function (wheel) { wheel.accepted = true }
         }
 
-        Flea.CardScroll {
+        Flea.CardFrame {
             id: body
-            bleedY: Theme.ringClearance
+            bleedY: Theme.focusClearance
             anchors.fill: parent
-            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.ringClearance
-            anchors.bottomMargin: Theme.spacing.rowPaddingX - Theme.ringClearance
+            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.focusClearance
+            anchors.bottomMargin: Theme.spacing.rowPaddingX - Theme.focusClearance
+            spacing: 0
+
+            // RunCard's own header: the esc hint at the right and the rule inset to the content edge.
+            title: Flea.DialogHeader {
+                id: title
+                x: Theme.spacing.rowPaddingX
+                width: parent.width - 2 * Theme.spacing.rowPaddingX
+                elide: Text.ElideMiddle
+                // The registry names the item, so the title says only what it knows until it lands.
+                text: root.name.length > 0 ? Format.fill(OpenWith.WORDS.titleNamed, root.name) : "Open with"
+            }
 
         Column {
             width: parent.width
-
-            Text {
-                id: title
-                width: parent.width
-                leftPadding: Theme.spacing.rowPaddingX
-                rightPadding: Theme.spacing.rowPaddingX
-                bottomPadding: Theme.spacing.gap
-                // The registry names the item, so the title says only what it knows until it lands.
-                text: root.name.length > 0 ? "Open " + root.name + " with" : "Open with"
-                color: Theme.color.foreground
-                font.family: Theme.font.family
-                font.pixelSize: Theme.font.body
-                font.bold: true
-                textFormat: Text.PlainText
-                elide: Text.ElideMiddle
-                Rectangle {
-                    id: titleRule
-                    anchors.bottom: parent.bottom
-                    width: parent.width
-                    height: Theme.spacing.hairline
-                    color: Theme.color.muted
-                    opacity: 0.4
-                }
-            }
 
             // Rule 4: the Network board's field, with the lens beside it and a clear mark once it holds text.
             Item {
@@ -261,7 +265,7 @@ Item {
                     height: Theme.rowHeight - Theme.spacing.rowPaddingY
                     color: Theme.color.background
                     border.width: Theme.spacing.hairline
-                    border.color: field.activeFocus ? Theme.color.accent : Theme.color.muted
+                    border.color: field.activeFocus ? Theme.color.accent : Theme.color.mutedFrame
 
                     Flea.Glyph {
                         id: lens
@@ -271,7 +275,7 @@ Item {
                         width: Theme.font.body
                         height: Theme.font.body
                         name: "search"
-                        color: Theme.color.muted
+                        color: Theme.color.mutedFrame
                     }
 
                     TextInput {
@@ -316,7 +320,7 @@ Item {
                             anchors.fill: parent
                             visible: field.text.length > 0
                             name: "x"
-                            color: Theme.color.muted
+                            color: Theme.color.mutedFrame
                         }
 
                         TapHandler {
@@ -371,7 +375,7 @@ Item {
                             width: parent.width
                             height: Theme.spacing.hairline
                             visible: row.isEyebrow && row.modelData.rule === true
-                            color: Theme.color.muted
+                            color: Theme.color.mutedFrame
                             opacity: 0.4
                         }
 
@@ -398,7 +402,7 @@ Item {
                             entry: row.isEyebrow ? ({}) : ({ label: row.modelData.label, action: "",
                                 icon: row.modelData.icon, glyph: "app-window",
                                 hint: row.modelData.default === true ? "default" : "" })
-                            current: !row.isEyebrow && root.cursor === row.appIndex
+                            current: !row.isEyebrow && root.focusPart < 2 && root.cursor === row.appIndex
                             lastPointerGlobal: root.pointerGlobal
                             onPointerSeen: function (at) { root.pointerGlobal = at }
                             // The cursor follows the pointer, the focus does not: a pointer crossing
@@ -423,10 +427,12 @@ Item {
                     wrapMode: Text.Wrap
                 }
 
-                // The fade that says the viewport cut the list, drawn in the card's own ground.
+                // The fade that says the viewport cut the list, drawn in the card's own ground inside its frame.
                 Rectangle {
                     anchors.left: parent.left
                     anchors.right: parent.right
+                    anchors.leftMargin: Theme.spacing.hairline
+                    anchors.rightMargin: Theme.spacing.hairline
                     anchors.bottom: parent.bottom
                     height: Theme.spacing.gap
                     visible: list.contentHeight > list.height && list.contentY < list.contentHeight - list.height - 1
@@ -437,7 +443,7 @@ Item {
                 }
             }
 
-            // Rule 7: the Convert board's checkbox row, drawn at this board's own 14 unit frame.
+            // The Always checkbox row; a tap or Space toggles it.
             Item {
                 id: alwaysBox
                 width: parent.width
@@ -454,7 +460,7 @@ Item {
                     anchors.top: parent.top
                     width: parent.width
                     height: Theme.spacing.hairline
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                     opacity: 0.4
                 }
 
@@ -480,7 +486,7 @@ Item {
                     anchors.right: parent.right
                     anchors.rightMargin: Theme.spacing.rowPaddingX
                     anchors.verticalCenter: parent.verticalCenter
-                    text: root.kind.length > 0 ? "Always use this application for " + root.kind + " files"
+                    text: root.kind.length > 0 ? Format.fill(OpenWith.WORDS.alwaysKind, root.kind)
                                                : "Always use this application for this file type"
                     color: Theme.color.foreground
                     font.family: Theme.font.family
@@ -502,9 +508,8 @@ Item {
                 leftPadding: Theme.spacing.rowPaddingX + box.width + Theme.spacing.gap
                 rightPadding: Theme.spacing.rowPaddingX
                 bottomPadding: Theme.spacing.gap
-                // The board says "one line"; gio writes a default and an association stanza, so the
-                // caption names what it does rather than a count it cannot keep. GM ruled, 2026-09-10.
-                text: "Writes your default for this type to mimeapps.list. Undo does not reverse it; change it here again."
+                // The board's one line: the box above already says what is written.
+                text: "Undo does not reverse this; change it here again."
                 color: Theme.color.muted
                 font.family: Theme.font.family
                 font.pixelSize: Theme.font.caption
@@ -512,21 +517,23 @@ Item {
                 wrapMode: Text.Wrap
             }
 
+            // The status slot is always laid out, two caption lines tall (the network slot's rowHeight) inside its padding, so rest, busy and a short error keep one card height; only a longer error grows it.
             Text {
                 width: parent.width
                 leftPadding: Theme.spacing.rowPaddingX
                 rightPadding: Theme.spacing.rowPaddingX
                 bottomPadding: Theme.spacing.gap
-                visible: root.errorText.length > 0
-                text: root.errorText
-                color: Theme.color.error
+                height: Math.max(Theme.rowHeight + topPadding + bottomPadding, implicitHeight)
+                text: root.committing ? "Opening…" : root.errorText
+                color: root.committing ? Theme.color.muted : Theme.color.errorOnSurface
                 font.family: Theme.font.family
                 font.pixelSize: Theme.font.caption
                 textFormat: Text.PlainText
                 wrapMode: Text.Wrap
             }
+        }
 
-            Item {
+            buttons: Item {
                 width: parent.width
                 height: Math.max(cancelButton.implicitHeight, openButton.implicitHeight)
 
@@ -539,7 +546,6 @@ Item {
                         id: cancelButton
                         label: "Cancel"
                         focused: root.focusPart === 3
-                        available: true
                         activeFocusOnTab: true
                         Keys.forwardTo: [keys]
                         onActivated: root.close()
@@ -547,7 +553,7 @@ Item {
 
                     Flea.DialogButton {
                         id: openButton
-                        label: root.committing ? "Opening..." : "Open"
+                        label: "Open"
                         primary: true
                         focused: root.focusPart === 4
                         available: root.canSubmit
@@ -557,7 +563,6 @@ Item {
                     }
                 }
             }
-        }
         }
     }
 

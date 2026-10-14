@@ -26,7 +26,7 @@ function run(check) {
     check("a row with no mode at all falls back to the icon name",
           Icons.glyphForRow("text-x-generic", 0), "file-text")
 
-    // GM ruled the brand marks are reproduced from the official artwork, not recut, so neither is a
+    // The brand marks are reproduced from the official artwork, not recut, so neither is a
     // cut glyph and neither belongs in PATHS. The recut strings must not come back.
     check("tailscale is not a cut glyph", Icons.PATHS["tailscale"] === undefined, true)
     check("dropbox is not a cut glyph", Icons.PATHS["dropbox"] === undefined, true)
@@ -122,10 +122,15 @@ function run(check) {
           Icons.pathFor("sort"), "M11 5h10 M11 9h7 M11 13h4 M7 5v14 M7 19l-3-3 M7 19l3-3")
 
     // ui/ContextMenu.qml's New Folder row. The mark is drawn on Main.dc.html's specimen sheet with
-    // no consumer, and GM's ruling is that recut lucide geometry wins over the board's hand drawing.
+    // no consumer, and the rule is that recut lucide geometry takes precedence over the board's hand drawing.
     drawsItsOwnMark("folder-plus")
     check("folder-plus keeps the closed folder's own body, so the two marks cannot drift",
           Icons.pathFor("folder-plus").indexOf(Icons.pathFor("folder")) === 0, true)
     check("folder-plus is the recut lucide plus, not the board's 5 unit one",
           Icons.pathFor("folder-plus"), "M2 20V3h6l2 3h12v14H2z M12 10v6 M9 13h6")
+
+    // The compress submenu's With-password row, pinned like every other mark so a silent fallback cannot take it.
+    drawsItsOwnMark("key")
+    check("key is the set's own bow, shaft and teeth",
+          Icons.pathFor("key"), "M3 7a4 4 0 1 0 8 0a4 4 0 1 0-8 0 M10.5 10.5l8 8 M16 16l2.5-2.5 M18.5 18.5l1.5-1.5")
 }

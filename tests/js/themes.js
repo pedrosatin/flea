@@ -13,11 +13,10 @@ var THEME_DIR = "file:///usr/share/omarchy/themes/"
 
 // Every threshold carries the rule it answers to; none of them is fitted to what the palettes do.
 var TEXT_MIN = 4.5          // HANDOFF rule 2: body text on its own ground, WCAG AA.
-var CAPTION_MIN = 3.0       // A muted caption is large-text AA against the ground it sits on.
 var DISABLED_MIN = 1.5      // Containers: a disabled row still reads as a row, never as an empty one.
 var WASH_MIN = 1.06         // A 14 percent wash has to be visible against the ground it washes.
 var MARK_MIN = 3.0          // A drawn mark or frame is a graphical object, AA at 3:1.
-var EDGE_MIN = 1.5          // The cursor's accent edge borders the unselected ground, see the KB.
+var EDGE_MIN = 1.5          // The cursor's accent edge borders the unselected ground, so a low-chroma theme keeps it.
 var WASH = 0.14             // Theme.washActive, the one wash strength on every surface.
 var SELECTED_FILL = 0.18    // Style.selectedFillAlpha, the OEM default a theme's shell.toml may raise.
 var DISABLED = 0.55         // Theme.disabledOpacity.
@@ -40,19 +39,27 @@ function roles(body) {
     var accent = Palette.pick(found, ["accent", "color4"], "#cacccc")
     var urgent = Palette.pick(found, ["red", "color1"], "#a55555")
     var surface = Palette.pick(found, Palette.SURFACE_KEYS, "#181825")
+    var mutedFrame = Contrast.ensureRatio(Palette.pick(found, ["muted"], darker(foreground)), background, MARK_MIN)
+    var muted = Contrast.ensureRatio(Contrast.ensureRatio(mutedFrame, background, TEXT_MIN), surface, TEXT_MIN)
+    var hued = saturation(urgent) > 0.2
+    var error = hued ? Contrast.ensureRatio(urgent, background, Math.max(TEXT_MIN, Contrast.ratio(muted, background))) : foreground
+    var errorOnSurface = hued ? Contrast.ensureRatio(urgent, surface, Math.max(TEXT_MIN, Contrast.ratio(muted, surface))) : foreground
     return { foreground: foreground, background: background, accent: accent, urgent: urgent,
-             // ui/Theme.qml's own rule, key for key: the palette's muted or a darkened foreground, lifted
-             // to the caption floor on the ground it sits on.
-             muted: Contrast.ensureRatio(Palette.pick(found, ["muted"], darker(foreground)), background, CAPTION_MIN),
+             // ui/Theme.qml's rule: the palette's muted or a darkened foreground, lifted to the frame floor for frames, then to the text floor on both grounds for text.
+             mutedFrame: mutedFrame,
+             muted: muted,
+             // Metadata ink: the darkened foreground, unlifted for a resting glyph and lifted like muted for text.
+             metadataFrame: darker(foreground),
+             metadata: Contrast.ensureRatio(Contrast.ensureRatio(darker(foreground), background, TEXT_MIN), surface, TEXT_MIN),
              // ui/Theme.qml: the heading ink is the palette's bright_foreground (color15 without one) when it has more contrast on the ground than the foreground.
              foregroundBright: brighter(foreground, Palette.pick(found, ["bright_foreground", "color15"], foreground), background),
              surface: surface,
              accentFrame: Contrast.ensureRatio(accent, surface, MARK_MIN),
              // ui/Theme.qml: a red with no chroma of its own reads as switched off, so it is dropped
              // for the foreground; every other red is lifted to AA the way symlink and executable are.
-             error: saturation(urgent) > 0.2 ? Contrast.ensureRatio(urgent, background, TEXT_MIN) : foreground,
+             error: error,
              // ui/Theme.qml's status bar role: the same red lifted on the surface it is drawn on.
-             errorOnSurface: saturation(urgent) > 0.2 ? Contrast.ensureRatio(urgent, surface, TEXT_MIN) : foreground }
+             errorOnSurface: errorOnSurface }
 }
 
 // Qt.darker(c, 1.4) in the value channel, which is ui/Theme.qml's fallback when a palette sets no
@@ -98,7 +105,7 @@ function mirrorFallbacks(check) {
     // binds this mirror's darker() to ui/Theme.qml's own Qt.darker(c, 1.4).
     check("a palette with no muted takes the darkened foreground the window renders", none.muted, "#9299ae")
     atLeast(check, "a palette with no muted", "its derived caption still clears the floor",
-            Contrast.ratio(none.muted, none.background), CAPTION_MIN)
+            Contrast.ratio(none.muted, none.background), TEXT_MIN)
     var eight = roles(ground + "color8 = \"#585b70\"\n")
     check("and color8 is not the caption either, because ui/Theme.qml does not read it",
           eight.muted, none.muted)
@@ -130,12 +137,12 @@ var ERROR_ON_SURFACE_SAMPLES = [
 // Sample input: one palette body above; the bar's own ground is the surface it sits on.
 function errorOnSurfaceSamples(check) {
     var applied = Source.source("ui/Theme.qml")
-    check("Theme.qml lifts the status bar red on its surface", applied.indexOf("Contrast.ensureRatio(Commons.Color.urgent, surface, 4.5)") >= 0, true)
+    check("Theme.qml lifts the status bar red on its surface", applied.indexOf("Contrast.ensureRatio(Commons.Color.urgent, surface,") >= 0, true)
     var weak = 0
     for (var i = 0; i < ERROR_ON_SURFACE_SAMPLES.length; i++) {
         var r = roles(ERROR_ON_SURFACE_SAMPLES[i])
         atLeast(check, "surface sample " + i, "error on surface", Contrast.ratio(r.errorOnSurface, r.surface), TEXT_MIN)
-        if (Contrast.ratio(r.error, r.surface) < TEXT_MIN)
+        if (Contrast.ratio(Contrast.ensureRatio(r.urgent, r.background, TEXT_MIN), r.surface) < TEXT_MIN)
             weak += 1
     }
     check("the background lift alone lands under 4.5 on at least one surface", weak >= 1, true)
@@ -162,7 +169,11 @@ function run(check) {
         // Text, on both grounds a listing row can sit on.
         atLeast(check, name, "foreground on background", Contrast.ratio(r.foreground, r.background), TEXT_MIN)
         atLeast(check, name, "foreground on surface", Contrast.ratio(r.foreground, r.surface), TEXT_MIN)
-        atLeast(check, name, "muted caption on background", Contrast.ratio(r.muted, r.background), CAPTION_MIN)
+        atLeast(check, name, "muted text on background", Contrast.ratio(r.muted, r.background), TEXT_MIN)
+        atLeast(check, name, "muted text on surface", Contrast.ratio(r.muted, r.surface), TEXT_MIN)
+        atLeast(check, name, "metadata text on background", Contrast.ratio(r.metadata, r.background), TEXT_MIN)
+        atLeast(check, name, "metadata text on surface", Contrast.ratio(r.metadata, r.surface), TEXT_MIN)
+        atLeast(check, name, "muted frame on background", Contrast.ratio(r.mutedFrame, r.background), MARK_MIN)
 
         // The heading ink never reads weaker than the body ink it sits over.
         atLeast(check, name, "heading ink against the foreground",
@@ -186,16 +197,26 @@ function run(check) {
         // The checkbox draws in the two roles above and nothing of its own: a foreground fill with the
         // ground cut out for its tick, and the muted frame when empty, so it needs no rule here.
 
-        // The error role on its ground, and beside the caption it must never be the quieter of: two inks
-        // compared to each other would measure the floors above, and ethereal's muted of 4.90 would fail.
+        // The error role on its ground, and beside the drawn caption it is never the quieter of: ethereal's caption lands at 4.90.
         atLeast(check, name, "error on background", Contrast.ratio(r.error, r.background), TEXT_MIN)
         atLeast(check, name, "error is never dimmer than a caption",
                 Contrast.ratio(r.error, r.background), Contrast.ratio(r.muted, r.background))
+        atLeast(check, name, "error on surface is never dimmer than a caption",
+                Contrast.ratio(r.errorOnSurface, r.surface), Contrast.ratio(r.muted, r.surface))
 
         // The cursor's edge borders the unselected ground, which is what a low-chroma theme breaks.
         atLeast(check, name, "cursor edge on the unselected ground", Contrast.ratio(r.accent, r.background), EDGE_MIN)
         atLeast(check, name, "cursor edge against the selected fill",
                 Contrast.ratio(r.accent, washed(r.accent, SELECTED_FILL, r.background)), EDGE_MIN)
+
+        // A pane without focus keeps its marked rows in the selected rung: above the ground and the hover rung, below the focused selection.
+        var inactive = washed(r.foreground, SELECTED_FILL, r.background)
+        atLeast(check, name, "unfocused selection clears the background", Contrast.ratio(inactive, r.background), WASH_MIN)
+        atLeast(check, name, "unfocused selection clears the hover rung",
+                Contrast.ratio(inactive, washed(r.foreground, HOVER_FILL, r.background)), WASH_MIN)
+        atLeast(check, name, "unfocused selection clears the focused selection",
+                Contrast.ratio(inactive, washed(r.foreground, SELECTION_FILL, r.background)), WASH_MIN)
+        atLeast(check, name, "unfocused cursor edge against the unfocused selection", Contrast.ratio(r.muted, inactive), EDGE_MIN)
 
         // The primary button carries its identity in a frame, on the card's own surface.
         atLeast(check, name, "primary frame on surface", Contrast.ratio(r.accentFrame, r.surface), MARK_MIN)
@@ -208,4 +229,32 @@ function run(check) {
     // 4.4943 for a requested 4.5, on the ground catppuccin actually ships.
     atLeast(check, "a channel at the extreme", "the lift toward white still delivers the floor",
             Contrast.ratio(Contrast.ensureRatio("#ff0000", "#1e1e2e", TEXT_MIN), "#1e1e2e"), TEXT_MIN)
+    tagThemeSamples(check)
+}
+
+var HOVER_FILL = 0.08       // Style.hoverFillAlpha, the OEM default.
+var SELECTION_FILL = 0.35   // Style.selectionFillAlpha, the OEM default.
+
+// Tag swatches lift to 3:1 on both grounds with the digit fallback decided once per theme load.
+function tagThemeSamples(check) {
+    var latte = { red: "#d20f39", orange: "#d84e2b", yellow: "#df8e1d", green: "#40a02b",
+                  blue: "#1e66f5", magenta: "#ea76cb", dark_foreground: "#9ca0b0" }
+    var matte = { red: "#d35f5f", orange: "#c63d3d", yellow: "#b91c1c", green: "#ffc107",
+                  blue: "#e68e0d", magenta: "#d35f5f", dark_foreground: "#555555" }
+    var white = { red: "#2a2a2a", orange: "", yellow: "#4a4a4a", green: "#3a3a3a",
+                  blue: "#1a1a1a", magenta: "#2e2e2e", dark_foreground: "#c0c0c0" }
+    var bg = "#eff1f5", surface = "#e6e9ef"
+    var t = Contrast.tagTheme(latte, bg, surface)
+    check("catppuccin latte reads in colour", t.fallback, false)
+    check("catppuccin latte names every tag on both grounds",
+          Object.keys(t.colors).length + "|" + Object.keys(t.menuColors).length, "7|7")
+    check("catppuccin latte lifts Red to 3:1 on the background",
+          Contrast.ratio(t.colors.Red, bg) >= MARK_MIN, true)
+    check("catppuccin latte lifts Gray to 3:1 on the surface",
+          Contrast.ratio(t.menuColors.Gray, surface) >= MARK_MIN, true)
+    check("matte black falls back to digits", Contrast.tagTheme(matte, "#121212", "#1a1a1a").fallback, true)
+    check("white falls back to digits", Contrast.tagTheme(white, "#ffffff", "#f2f2f2").fallback, true)
+    check("a missing colour falls back", Contrast.tagTheme({
+        red: "#d20f39", orange: "", yellow: "#df8e1d", green: "#40a02b",
+        blue: "#1e66f5", magenta: "#ea76cb", dark_foreground: "#9ca0b0" }, bg, surface).fallback, true)
 }

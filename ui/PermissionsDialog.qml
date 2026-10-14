@@ -1,13 +1,18 @@
 import QtQuick
 import qs.Commons
 import "." as Flea
+import "js/Format.js" as Format
 import "js/Permissions.js" as Permissions
 
 // One item, one mode; the backend owns its reviewed descriptor for this dialog's lifetime.
 FocusScope {
     id: root
     anchors.fill: parent
-    visible: opened
+    visible: opened || opacity > 0
+    // Closed means no input, even while the fade-out is still drawn.
+    enabled: opened
+    opacity: 0
+    Flea.Reveal { target: root; shown: root.opened; lift: card }
     property bool opened: false
     property int requestId: 0
     // Inspect ids are request blocks of this width; a wider selection reserves whole blocks.
@@ -33,7 +38,6 @@ FocusScope {
     property string failedBatchError: ""
     // The Apply skips, carried to the applyMany reply for the final message.
     property var multiApplySkipped: []
-    property int multiApplySent: 0
     readonly property bool isMulti: multiPaths.length > 1
     readonly property var multiSummary: isMulti ? Permissions.summarize(multiModes, multiStore.reasons) : null
     // Several items: a selection where no file can change shows the files' bits and is not editable, as one unchangeable file is.
@@ -43,17 +47,17 @@ FocusScope {
     readonly property bool applying: busy && facts.ok === true
     // Permissions040: a multi Apply cannot be cancelled either.
     readonly property bool applyLocked: applying || applyingMany
-    readonly property real labelWidth: Math.round(96 * Theme.font.bodySmall / 13)
+    // One Apply condition for the button and the probe, which reads the button.
+    readonly property bool canApply: isMulti ? editable : editable && modeValue >= 0
+    readonly property real labelWidth: Math.round(96 * root.boardScale)
     // ButtonSystem040 A: a text field is DialogField's height (ui/DialogField.qml's box), centred in its row.
     readonly property int fieldHeight: Theme.rowHeight - Theme.spacing.rowPaddingY
     readonly property int controlHeight: Math.max(Theme.rowHeight, Math.ceil(Theme.font.body * Theme.lineBoxRatio) + 2 * Theme.spacing.rowPaddingY)
     // The board is drawn at base size 14, whose bodySmall is 13; every board pixel below scales from it and lands whole.
     readonly property real boardScale: Theme.font.bodySmall / 13
     readonly property int boardCardWidth: 480
-    // lib.py note(): the note's line box is 1.5 x its font size, and its glyphs sit centred in it.
-    readonly property real noteLineRatio: 1.5
     readonly property int bodyInset: Math.round(16 * root.boardScale) + Theme.spacing.hairline
-    readonly property int headingHeight: Math.round(26 * Theme.font.bodySmall / 13)
+    readonly property int headingHeight: Math.round(26 * root.boardScale)
     // Permissions040, several items: the surface's one 8 px gap, and the 6 px its button row adds above itself.
     readonly property int multiGap: Theme.spacing.rowPaddingY + Theme.spacing.hairline
     // The board's three flex:1 columns are exact thirds of this span; whole-number arithmetic rounds each start half up, as the board's paint does.
@@ -63,8 +67,7 @@ FocusScope {
     // The box sits at the rounded exact centre of its third, so it lands on whole pixels where the board's does.
     function boxLead(column, box) { return Math.floor((2 * column * root.bitSpan + root.bitSpan - 3 * box + 3) / 6) - root.bitStart(column) }
     // lib.py note(): a caption's line box is 1.5 x its size and its glyphs sit centred in it.
-    readonly property int captionLineBox: Math.round(root.noteLineRatio * Theme.font.caption)
-    readonly property int captionLead: Math.round((root.captionLineBox - noteFont.height) / 2)
+    readonly property int captionLead: Math.round((SettingsMetrics.hintLine - noteFont.height) / 2)
     // Permissions040's strip draws the title and "esc" glyphs one row above where Qt's line box seats them (board rows 7-16 and 10-16, the build's 8-17 and 11-17 once centred above the rule).
     readonly property int stripTextRise: Theme.spacing.hairline
     readonly property int railHalf: Math.round(Theme.settings.railPaddingY / 2)
@@ -77,34 +80,41 @@ FocusScope {
     readonly property var bodyItem: body
     readonly property string displayedError: errorLabel.text
     readonly property string displayedSummary: (isMulti ? "" : changeSummary.text + "\n") + scopeLabel.text
+    // One section rule for the four drawn below; each site sets its own place and visibility.
+    component Rule: Rectangle {
+        width: parent.width
+        height: Theme.spacing.hairline
+        color: Theme.color.mutedFrame
+        opacity: 0.4
+    }
+    // No enabled keys: each item.enabled already carries every mode's answer, a copy could disagree.
     function controls() {
-        var result = [{name: "Close", item: closeMark, enabled: !applying}, {name: "Octal", item: octal, enabled: editable},
-            {name: "Cancel", item: cancelFocus, enabled: !applying}, {name: "Apply", item: applyFocus, enabled: editable && modeValue >= 0}]
+        var result = [{name: "Close", item: closeMark}, {name: "Octal", item: octal},
+            {name: "Cancel", item: cancelButton}, {name: "Apply", item: applyButton}]
         for (var row = 0; row < permissionRows.count; row++) {
             var group = permissionRows.itemAt(row)
             for (var column = 0; column < group.checks.count; column++) {
                 var checkbox = group.checks.itemAt(column)
-                result.push({name: checkbox.Accessible.name, item: checkbox, checked: checkbox.checked, bit: checkbox.bit, enabled: editable})
+                result.push({name: checkbox.Accessible.name, item: checkbox, checked: checkbox.checked, bit: checkbox.bit})
             }
         }
         return result
     }
     readonly property string scopeText: facts.directory
-        ? "Scope this directory only · enclosed items unchanged · ownership unchanged"
+        ? "Scope this folder only · enclosed items unchanged · ownership unchanged"
         : "Scope this item only · ownership unchanged"
     signal requested(var message)
     signal changed(string note)
     signal refreshNeeded()
     signal closed()
 
-    function open(itemPath, holder) {
-        requestId += 1
-        multiPaths = []
-        multiStore = ({ modes: [], reasons: [], skipped: [] })
+    // One reset for both openers, so a field added to one cannot be missed in the other.
+    function reset(itemPath, paths, holder) {
+        multiPaths = paths.slice()
+        multiStore = ({ modes: [], reasons: [], skipped: [], pending: paths.length })
         multiModes = []
-        multiPending = 0
+        multiPending = paths.length
         multiApplySkipped = []
-        multiApplySent = 0
         failedBatchError = ""
         explicitSet = 0
         explicitClear = 0
@@ -118,35 +128,28 @@ FocusScope {
         busy = true
         opened = true
         body.contentY = 0
-        cancelFocus.forceActiveFocus()
+        cancelButton.forceActiveFocus()
+    }
+    // One inspect fan-out for openMany and the failed-batch re-read: the same requests.
+    function inspectAll() {
+        multiStore = ({ modes: [], reasons: [], skipped: [], pending: multiPaths.length })
+        multiModes = []
+        multiPending = multiPaths.length
+        for (var i = 0; i < multiPaths.length; i++)
+            requested({ c: "permissions", op: "inspect", id: multiBase * inspectStride + i, path: multiPaths[i] })
+    }
+
+    function open(itemPath, holder) {
+        requestId += 1
+        reset(itemPath, [], holder)
         requested({ c: "permissions", op: "inspect", id: requestId, path: path })
     }
     // One Entry holds every path the Apply changed, so one undo restores them all.
     function openMany(paths, holder) {
         requestId += 1
         multiBase = requestId
-        multiPaths = paths.slice()
-        multiStore = ({ modes: [], reasons: [], skipped: [], pending: paths.length })
-        multiModes = []
-        multiPending = paths.length
-        multiApplySkipped = []
-        multiApplySent = 0
-        failedBatchError = ""
-        explicitSet = 0
-        explicitClear = 0
-        applyingMany = false
-        path = ""
-        focusHolder = holder
-        facts = ({})
-        modeText = ""
-        errorText = ""
-        transportFailed = false
-        busy = true
-        opened = true
-        body.contentY = 0
-        cancelFocus.forceActiveFocus()
-        for (var i = 0; i < paths.length; i++)
-            requested({ c: "permissions", op: "inspect", id: multiBase * inspectStride + i, path: paths[i] })
+        reset("", paths, holder)
+        inspectAll()
         // A wider selection reserves whole strides so the next open's block cannot overlap this one.
         requestId += Math.max(0, Math.floor((paths.length - 1) / inspectStride))
     }
@@ -154,7 +157,7 @@ FocusScope {
         if (isMulti) { receiveMany(message); return }
         if (!opened || transportFailed || message.id !== requestId || message.op === "close") return
         busy = false
-        cancelFocus.forceActiveFocus()
+        cancelButton.forceActiveFocus()
         if (!message.ok) { errorText = message.error || "Could not change permissions."; return }
         if (message.op === "apply") { changed(""); close(); return }
         facts = message
@@ -210,13 +213,9 @@ FocusScope {
                 errorText += "\n" + Permissions.skipNote(multiApplySkipped)
             // A failed batch re-reads every mode so the grid and a retry start from disk.
             failedBatchError = message.error || ""
-            multiStore = ({ modes: [], reasons: [], skipped: [], pending: multiPaths.length })
-            multiModes = []
-            multiPending = multiPaths.length
+            inspectAll()
             busy = true
-            cancelFocus.forceActiveFocus()
-            for (var i = 0; i < multiPaths.length; i++)
-                requested({ c: "permissions", op: "inspect", id: multiBase * inspectStride + i, path: multiPaths[i] })
+            cancelButton.forceActiveFocus()
             refreshNeeded()
             return
         }
@@ -234,27 +233,26 @@ FocusScope {
             var refused = failedBatchError.length > 0 && multiStore.skipped.some(function (skip) { return skip.why === failedBatchError })
             if (note.length > 0 && (errorText.length === 0 || refused)) errorText = note
             failedBatchError = ""
-            cancelFocus.forceActiveFocus()
+            cancelButton.forceActiveFocus()
         } else {
             multiPending = multiStore.pending
         }
     }
-    function backendFailed(message) {
+    function backendFailed() {
         if (!opened || transportFailed) return
         // A multi Apply counts as applying with an unknown outcome, and ends so Cancel and close work.
-        var applying = (busy && facts.ok === true) || applyingMany
+        var applying = applyLocked
         applyingMany = false
         transportFailed = true
         busy = false
-        cancelFocus.forceActiveFocus()
-        var reason = message || "the backend stopped"
+        cancelButton.forceActiveFocus()
         errorText = applying
-            ? "Permission change outcome is unknown because " + reason + "; restart Flea and reopen Permissions to check the current mode."
-            : "Permissions is unavailable because " + reason + "; restart Flea and reopen Permissions."
+            ? "Flea stopped responding, so the permission change may not have finished. Restart Flea and reopen Permissions to check."
+            : "Permissions is unavailable because Flea stopped responding. Restart Flea and reopen Permissions."
     }
     function close() {
         // An issued fchmod cannot be cancelled; retain its result before allowing dismissal.
-        if (!opened || applying || applyingMany) return
+        if (!opened || applyLocked) return
         if (isMulti) {
             for (var i = 0; i < multiPaths.length; i++)
                 requested({ c: "permissions", op: "close", id: multiBase * inspectStride + i })
@@ -302,11 +300,10 @@ FocusScope {
             applyingMany = false
             busy = false
             errorText = Permissions.multiResult(skipped)
-            cancelFocus.forceActiveFocus()
+            cancelButton.forceActiveFocus()
             return
         }
         multiApplySkipped = skipped
-        multiApplySent = paths.length
         requested({ c: "permissionsBatch", paths: paths, modes: modes, id: requestId })
     }
     function focusItems(item, result) {
@@ -349,7 +346,7 @@ FocusScope {
         width: Theme.cardSpan(Math.round(root.boardCardWidth * root.boardScale), root.width - 2 * Theme.spacing.gap)
         height: Theme.cardSpan(Theme.spacing.hairline + chrome.height + body.wanted + Theme.spacing.rowPaddingX + root.bodyInset, root.height - 2 * Theme.spacing.gap)
         color: Theme.color.surface
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         border.width: Theme.spacing.hairline
         radius: Style.cornerRadius
         clip: true
@@ -379,7 +376,7 @@ FocusScope {
                 id: title
                 x: lockMark.x + lockMark.width + Theme.spacing.gap
                 y: Math.floor((titleBand.height - height) / 2) - root.stripTextRise
-                text: root.isMulti ? "Permissions for " + root.multiPaths.length + " items" : "Permissions"
+                text: root.isMulti ? Format.fill(Permissions.WORDS.titleMany, root.multiPaths.length) : "Permissions"
                 color: Theme.color.foreground; textFormat: Text.PlainText; font { family: Theme.font.family; pixelSize: Theme.font.caption; bold: true }
             }
             // Dialogs rule 7: the way out is named beside the mark that performs it, the settings panel's own corner.
@@ -392,35 +389,35 @@ FocusScope {
 
             Flea.ChromeButton {
                 id: closeMark
+                ruleRows: Theme.spacing.hairline
                 anchors.right: parent.right
                 anchors.rightMargin: Theme.spacing.rowPaddingX
-                anchors.verticalCenter: titleBand.verticalCenter
+                anchors.verticalCenter: parent.verticalCenter
                 glyph: "x"; gesturePolicy: TapHandler.ReleaseWithinBounds
-                // Muted at rest as the board draws the strip; the keyboard adds ChromeButton's own ring.
-                restingColor: Theme.color.muted
+                // Muted at rest as the board draws the strip; the keyboard adds ChromeButton's own frame.
+                restingColor: Theme.color.mutedFrame
                 enabled: !root.applyLocked
                 accessName: "Close permissions"
                 activeFocusOnTab: true
                 keyboardFocused: activeFocus
                 Keys.onTabPressed: function(event) { root.stepFocus((event.modifiers & Qt.ShiftModifier) !== 0) }
                 Keys.onBacktabPressed: root.stepFocus(true)
-                Keys.onReturnPressed: root.close()
-                Keys.onSpacePressed: root.close()
                 onActivated: root.close()
             }
-            Rectangle { anchors.bottom: parent.bottom; width: parent.width; height: Theme.spacing.hairline; color: Theme.color.muted; opacity: 0.4 }
+            Rule { anchors.bottom: parent.bottom }
         }
-        Flea.CardScroll {
+        Flea.CardFrame {
             id: body
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: chrome.bottom
             anchors.bottom: parent.bottom
-            bleed: Theme.ringClearance
-            anchors.leftMargin: root.bodyInset - Theme.ringClearance
-            anchors.rightMargin: root.bodyInset - Theme.ringClearance
-            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.ringClearance
-            anchors.bottomMargin: root.bodyInset - Theme.ringClearance
+            bleed: Theme.focusClearance
+            anchors.leftMargin: root.bodyInset - Theme.focusClearance
+            anchors.rightMargin: root.bodyInset - Theme.focusClearance
+            anchors.topMargin: Theme.spacing.rowPaddingX - Theme.focusClearance
+            anchors.bottomMargin: root.bodyInset - Theme.focusClearance
+            spacing: 0
             Column {
                 width: body.holderWidth
                 spacing: 0
@@ -430,11 +427,11 @@ FocusScope {
                     spacing: Theme.spacing.gap
                     // For several items the grid and Apply are the whole card, so the name row drops out.
                     visible: !root.isMulti
-                    Flea.Glyph { width: Theme.markSize; height: nameLabel.height; anchors.verticalCenter: parent.verticalCenter; name: root.facts.directory ? "folder" : "file"; color: Theme.color.muted }
+                    Flea.Glyph { width: Theme.markSize; height: nameLabel.height; anchors.verticalCenter: parent.verticalCenter; name: root.facts.directory ? "folder" : "file"; color: Theme.color.mutedFrame }
                     Text { id: nameLabel; width: parent.width - Theme.markSize - kindLabel.width - 2 * parent.spacing; anchors.verticalCenter: parent.verticalCenter; text: root.path.split("/").pop(); elide: Text.ElideMiddle; textFormat: Text.PlainText; color: Theme.color.foreground; font { family: Theme.font.family; pixelSize: Theme.font.body } }
                     Text { id: kindLabel; anchors.verticalCenter: parent.verticalCenter; text: root.facts.ok ? (root.facts.directory ? "directory" : "file") : ""; textFormat: Text.PlainText; color: Theme.color.foreground; font { family: Theme.font.family; pixelSize: Theme.font.caption } }
                 }
-                Rectangle { width: parent.width; height: Theme.spacing.hairline; color: Theme.color.muted; opacity: 0.4; visible: !root.isMulti }
+                Rule { visible: !root.isMulti }
                 Flea.PermissionsHeadings { width: parent.width; card: root; enter: !root.isMulti && root.facts.directory === true }
                 Repeater {
                     id: permissionRows
@@ -496,7 +493,7 @@ FocusScope {
                     width: parent.width
                     height: Theme.spacing.rowPaddingY + root.railHalf + Theme.spacing.hairline
                     visible: !root.isMulti
-                    Rectangle { y: root.railHalf; width: parent.width; height: Theme.spacing.hairline; color: Theme.color.muted; opacity: 0.4 }
+                    Rule { y: root.railHalf }
                 }
                 Row {
                     width: parent.width
@@ -512,7 +509,7 @@ FocusScope {
                         y: Math.round((parent.height - height) / 2)
                         color: Theme.color.background
                         // A focused field is its own frame in the accent, and the error role where its line reports an error, as RenameField draws it.
-                        border.color: octal.activeFocus ? (errorLabel.visible && !root.busy ? Theme.color.error : Theme.color.accent) : Theme.color.muted
+                        border.color: octal.activeFocus ? (errorLabel.visible && !root.busy ? Theme.color.error : Theme.color.accent) : Theme.color.mutedFrame
                         TextInput {
                             id: octal
                             anchors.fill: parent
@@ -531,7 +528,7 @@ FocusScope {
                             Keys.onTabPressed: function(event) { root.stepFocus((event.modifiers & Qt.ShiftModifier) !== 0) }
                             Keys.onBacktabPressed: root.stepFocus(true)
                             onTextEdited: root.modeText = text
-                            onAccepted: if (root.editable && root.modeValue >= 0) applyFocus.forceActiveFocus()
+                            onAccepted: if (root.editable && root.modeValue >= 0) applyButton.forceActiveFocus()
                         }
                     }
                 }
@@ -557,14 +554,14 @@ FocusScope {
                     visible: root.facts.directory === true && !root.isMulti
                     color: Theme.color.background
                     border.width: Theme.spacing.hairline
-                    border.color: Theme.color.muted
+                    border.color: Theme.color.mutedFrame
                     Flea.Glyph { id: scopeMark; x: Theme.spacing.gap; y: Theme.spacing.gap; width: Theme.font.bodySmall; height: width; name: "check"; color: Theme.color.accent }
                     Text {
                         id: directoryScope
                         x: scopeMark.x + scopeMark.width + Theme.spacing.gap
                         y: Theme.spacing.gap
                         width: parent.width - x - Theme.spacing.gap
-                        text: "Scope: this directory only. Enclosed files and directories keep every bit."
+                        text: "Scope: this folder only. Items inside it keep their permissions."
                         textFormat: Text.PlainText
                         wrapMode: Text.Wrap
                         color: Theme.color.foreground
@@ -582,13 +579,13 @@ FocusScope {
                         : root.facts.ok && root.modeValue < 0 ? "Enter three octal digits or a leading-zero four-digit mode." : "")
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
-                    color: root.busy ? Theme.color.muted : Theme.color.error
+                    color: root.busy ? Theme.color.muted : Theme.color.errorOnSurface
                     font { family: Theme.font.family; pixelSize: Theme.font.caption }
                 }
                 Item {
                     width: parent.width
                     height: root.isMulti ? root.multiGap : Theme.settings.railPaddingY + Theme.spacing.gap + Theme.spacing.hairline
-                    Rectangle { y: Theme.settings.railPaddingY; width: parent.width; height: Theme.spacing.hairline; color: Theme.color.muted; opacity: 0.4; visible: !root.isMulti }
+                    Rule { y: Theme.settings.railPaddingY; visible: !root.isMulti }
                 }
                 Text {
                     text: "WILL CHANGE"
@@ -604,9 +601,9 @@ FocusScope {
                     // For several items the grid and Apply are the whole card, so the preview drops out.
                     visible: !root.isMulti
                     text: (root.facts.ok && !root.facts.reason && root.modeValue >= 0
-                        ? "Requested mode " + Permissions.octal(root.modeValue) : "No changes available")
+                        ? Format.fill(Permissions.WORDS.requestedMode, Permissions.octal(root.modeValue)) : "No changes to apply")
                         + "\nPath " + root.path.replace(/\//g, "/\u200b")
-                        + (root.facts.reason ? "\nCurrent mode " + root.facts.mode : "")
+                        + (root.facts.reason ? "\n" + Format.fill(Permissions.WORDS.currentMode, root.facts.mode) : "")
                     textFormat: Text.PlainText
                     wrapMode: Text.WordWrap
                     color: Theme.color.accent
@@ -616,8 +613,8 @@ FocusScope {
                     id: scopeLabel
                     width: parent.width
                     // Fixed line boxes put the spare height under the glyphs, so the top padding centres them as CSS line-height does.
-                    height: lineCount * root.captionLineBox
-                    lineHeight: root.captionLineBox
+                    height: lineCount * SettingsMetrics.hintLine
+                    lineHeight: SettingsMetrics.hintLine
                     lineHeightMode: Text.FixedHeight
                     topPadding: root.captionLead
                     // A box whose bit differs across the files shows a bar until it is clicked.
@@ -627,45 +624,32 @@ FocusScope {
                     color: Theme.color.foreground
                     font { family: Theme.font.family; pixelSize: Theme.font.caption }
                 }
+            }
+            buttons: Column {
+                width: parent.width
                 Item { width: parent.width; height: root.isMulti ? root.multiGap + root.buttonLead : Theme.settings.railPaddingY + Theme.spacing.hairline }
                 Row {
                     anchors.right: parent.right
                     spacing: Theme.spacing.gap
-                    FocusScope {
-                        id: cancelFocus
-                        width: cancelButton.implicitWidth; height: cancelButton.implicitHeight
-                        activeFocusOnTab: true
-                        enabled: !root.applyLocked
-                        Keys.onTabPressed: function(event) { root.stepFocus((event.modifiers & Qt.ShiftModifier) !== 0) }
-                        Keys.onBacktabPressed: root.stepFocus(true)
-                        Keys.onReturnPressed: root.close()
-                        Keys.onSpacePressed: root.close()
-                        Flea.DialogButton {
-                            id: cancelButton
-                            label: "Cancel"
-                            focused: parent.activeFocus
-                            available: !root.applyLocked
-                            onActivated: root.close()
-                        }
+                    Flea.DialogButton {
+                        id: cancelButton
+                        label: "Cancel"
+                        available: !root.applyLocked
+                        tabHandle: true
+                        tabStop: true
+                        onTabbed: function(from, back) { root.stepFocus(back) }
+                        onActivated: root.close()
                     }
-                    FocusScope {
-                        id: applyFocus
-                        width: applyButton.implicitWidth; height: applyButton.implicitHeight
-                        activeFocusOnTab: true
+                    Flea.DialogButton {
+                        id: applyButton
+                        label: "Apply"
+                        primary: true
                         // The multi card has no octal to validate, so Apply enables on the grid alone.
-                        enabled: root.isMulti ? root.editable : root.editable && root.modeValue >= 0
-                        Keys.onTabPressed: function(event) { root.stepFocus((event.modifiers & Qt.ShiftModifier) !== 0) }
-                        Keys.onBacktabPressed: root.stepFocus(true)
-                        Keys.onReturnPressed: root.apply()
-                        Keys.onSpacePressed: root.apply()
-                        Flea.DialogButton {
-                            id: applyButton
-                            label: "Apply"
-                            primary: true
-                            focused: parent.activeFocus
-                            available: root.isMulti ? root.editable : root.editable && root.modeValue >= 0
-                            onActivated: root.apply()
-                        }
+                        available: root.canApply
+                        tabHandle: true
+                        tabStop: true
+                        onTabbed: function(from, back) { root.stepFocus(back) }
+                        onActivated: root.apply()
                     }
                 }
             }

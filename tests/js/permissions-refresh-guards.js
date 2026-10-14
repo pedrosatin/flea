@@ -4,7 +4,7 @@
 .import "../../ui/js/Swap.js" as Swap
 .import "sourcefixture.js" as Source
 
-// Advloop permfocus r1: the flyout-close debt, the Undo stage and the search listing's Apply refresh.
+// The first permfocus review round: the flyout-close debt, the Undo stage and the search listing's Apply refresh.
 var ORIGINAL_MODE = 0o100644
 var APPLIED_MODE = 0o100600
 var ROW_HEIGHT = 37
@@ -22,7 +22,7 @@ function flyoutClose(check, body) {
     var flyout = {count: 1, itemAt: function () { return {pressed: true} }}
     var menu = {opened: true, forRail: false, forHeader: false, forLocked: false,
         refreshOwed: false, entries: [{action: "openWith", label: "Old"}], cursor: 0,
-        openSubmenuRow: 0, submenuCursor: 0, submenuOpen: true,
+        openSubmenuRow: 0, submenuCursor: 0, submenuOpen: true, loneFlyoutAction: "",
         buildEntries: function () { return [{action: "openWith", label: "New"}] },
         // The real menu's list setter, which only guards the card's fit while the rows build.
         setEntries: function (next) { this.entries = next }}
@@ -42,6 +42,28 @@ function flyoutClose(check, body) {
     while (later.length > 0) later.shift()()
     check("flyout close without release refreshes provider rows", menu.entries[0].label, "New")
     check("flyout close clears provider debt", menu.refreshOwed, false)
+}
+
+// A repeater of rows with the given pressed flags, as far as anyPressed reads one.
+function rowsOf(flags) {
+    return {count: flags.length, itemAt: function (i) { return {pressed: flags[i]} }}
+}
+
+// anyPressed's answer, or "threw" so a broken guard fails a named check instead of the harness.
+function pressedAnswer(main, flyout) {
+    try { return MenuRefresh.anyPressed(main, flyout) } catch (error) { return "threw" }
+}
+
+// A closed flyout passes null, so its held rows no longer count as pressed; an open one still does.
+function anyPressedBranches(check) {
+    var idle = rowsOf([false, false])
+    var held = rowsOf([false, true])
+    check("a pressed main row counts", pressedAnswer(held, null), true)
+    check("a pressed flyout row counts while the flyout is passed", pressedAnswer(idle, held), true)
+    check("a pressed flyout row is ignored once null is passed", pressedAnswer(idle, null), false)
+    check("no pressed row answers false", pressedAnswer(idle, rowsOf([false])), false)
+    check("a gone delegate holds nothing", pressedAnswer({count: 1, itemAt: function () { return null }}, null), false)
+    check("an empty main repeater never throws", pressedAnswer(rowsOf([]), null), false)
 }
 
 // The real Undo stage of tests/permissions-focus.qml, run against a root where Apply's watch re-read has landed.
@@ -88,9 +110,11 @@ function searchPane(pane, running) {
 
 // The window reply lands through PaneSwap's own takeRows, so the swap's selection rule is the production one.
 function landWindow(p, body, mode) {
-    var take = new Function("root", "Swap", "RecentMode", "start", "items", "kinds", "listing", body(Source.source("ui/PaneSwap.qml"), "takeRows"))
-    var swap = {pane: p, phase: Swap.idle(), rowsLanded: function () {}}
-    take(swap, Swap, RecentMode, p.held, p.rows.map(function (row) { return {n: row.n, p: mode} }), [], LISTING)
+    var take = new Function("root", "Swap", "RecentMode", "start", "items", "kinds", "listing", "gen", body(Source.source("ui/PaneSwap.qml"), "takeRows"))
+    var swap = {pane: p, phase: Swap.idle(), rowsLanded: function () {},
+        // The rows under test carry no tg field, so the production stamp is a no-op here.
+        stampTags: function () {}}
+    take(swap, Swap, RecentMode, p.held, p.rows.map(function (row) { return {n: row.n, p: mode} }), [], LISTING, 0)
 }
 
 // An Apply on a search listing re-stats the held window: no walk, no debt, and the rows show the new mode.
@@ -109,14 +133,17 @@ function searchRefresh(check, body, pane, apply) {
         check(label + " keeps cursor", p.cursorIndex, CURSOR)
         check(label + " keeps scroll", p.listArea.contentY, ROW_HEIGHT)
         if (running === 1) {
-            Search.ranked(p)
-            check("running search rank re-asks the window at the finish", p.sent.join(","), "window 0,window 0")
+            p.searchGen = 9
+            p.listArea.restartSettle = function () {}
+            Search.searched(p, p.total, 0, 0, false, 9, false)
+            check("a landed live answer asks no window", p.sent.join(","), "window 0")
         }
     }
 }
 
 function run(check, body, pane, apply) {
     flyoutClose(check, body)
+    anyPressedBranches(check)
     undoGuard(check, body)
     searchRefresh(check, body, pane, apply)
 }

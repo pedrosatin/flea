@@ -75,7 +75,7 @@ pub(crate) fn launch_warm_command(exe: &Path, list: Option<&Path>, gvfs: Option<
 }
 
 // The launcher's side: one spawn and one fork-wait for both jobs, true when the helper started.
-fn warm_all(list: Option<&Path>, gvfs: Option<(&str, &Path)>) -> bool {
+pub(crate) fn warm_all(list: Option<&Path>, gvfs: Option<(&str, &Path)>) -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let Some(mut cmd) = launch_warm_command(&exe, list, gvfs) else { return false };
     // The child forks and its parent exits at once, so this wait is only the fork.
@@ -180,7 +180,7 @@ fn apply_renderer(cmd: &mut Command, renderer: LaunchRenderer) {
 }
 
 // The qs invocation both entry points share, including the renderer chosen at the last hand-off point.
-fn qs_command(target: PathBuf) -> Command {
+pub(crate) fn qs_command(target: PathBuf) -> Command {
     let mut cmd = Command::new("qs");
     cmd.arg("-p").arg(target);
     // Only the main window records a prefetch list; a chooser started from a Flea terminal must not overwrite it.
@@ -190,6 +190,8 @@ fn qs_command(target: PathBuf) -> Command {
     cmd.env_remove(crate::gvfsprefetch::PREFETCH_ENV);
     cmd.env_remove(crate::gvfsprefetch::PATH_ENV);
     cmd.env_remove(crate::gvfsprefetch::START_ENV);
+    // A shell started under an --unlock window must not replay its dialog; unlock_command sets it back for the one launch.
+    cmd.env_remove(crate::unlock::ENV);
     skip_gtk_platform_theme(&mut cmd);
     // An explicit choice is the operator's; map_or because is_none_or needs Rust 1.82 over the 1.77 floor.
     if std::env::var_os("FLEA_BIN").map_or(true, |value| value.is_empty()) {
@@ -197,6 +199,8 @@ fn qs_command(target: PathBuf) -> Command {
             cmd.env("FLEA_BIN", binary);
         }
     }
+    // Before the probe and qs in every arm, so neither loads a driver for a GPU vendor this box does not hold.
+    crate::icdexclude::exclude_absent_vendors();
     // Empty is absent, the rule paths::has_display() applies: a wrapper's unset variable is not a choice.
     if std::env::var_os("QSG_RHI_BACKEND").is_some_and(|value| !value.is_empty()) {
         // An explicit choice is the operator's, so it is neither replaced nor offered a retry.
@@ -206,7 +210,7 @@ fn qs_command(target: PathBuf) -> Command {
             pin_display_icd(&mut cmd, None);
         }
     } else {
-        apply_renderer(&mut cmd, automatic_renderer(vulkan::usable()));
+        apply_renderer(&mut cmd, automatic_renderer(crate::vkprobecache::usable()));
     }
     cmd
 }
@@ -222,7 +226,7 @@ fn pin_display_icd(cmd: &mut Command, already: Option<&[(u32, u32, u32)]>) {
     let owned;
     let devices = match already {
         Some(devices) => devices,
-        None => match vulkan::usable() {
+        None => match crate::vkprobecache::usable() {
             Ok(devices) => {
                 owned = devices;
                 owned.as_slice()
@@ -298,12 +302,12 @@ fn apply_theme_restore(command: &mut Command, marker: Option<&OsStr>) {
     command.env_remove(THEME_MARKER);
 }
 
-fn exec(mut cmd: Command) -> i32 {
+pub(crate) fn exec(mut cmd: Command) -> i32 {
     // The setting is preserved across exec, so this is the last point that can hand it to qs.
     thp::disable();
     // exec() only returns on failure; the reason is elided, never shown raw.
     let _ = cmd.exec();
-    eprintln!("flea: could not start the shell, qs is not on PATH or failed to run");
+    eprintln!("flea: the window could not start: Quickshell is not installed or could not run");
     1
 }
 

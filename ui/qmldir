@@ -1,5 +1,6 @@
 module flea
 singleton Theme 1.0 Theme.qml
+singleton Glass 1.0 Glass.qml
 singleton MediaSound 1.0 MediaSound.qml
 singleton Scripts 1.0 Scripts.qml
 singleton ViewState 1.0 ViewState.qml
@@ -16,6 +17,7 @@ ColumnPane 1.0 ColumnPane.qml
 ColumnRow 1.0 ColumnRow.qml
 CountedWorker 1.0 CountedWorker.qml
 Crumb 1.0 Crumb.qml
+CursorMark 1.0 CursorMark.qml
 PreviewColumn 1.0 PreviewColumn.qml
 PreviewLines 1.0 PreviewLines.qml
 PreviewMarkdown 1.0 PreviewMarkdown.qml
@@ -39,10 +41,16 @@ FigureStore 1.0 FigureStore.qml
 PreviewPdf 1.0 PreviewPdf.qml
 PreviewSwap 1.0 PreviewSwap.qml
 PreviewImage 1.0 PreviewImage.qml
+PreviewImagePan 1.0 PreviewImagePan.qml
+PreviewImageSharp 1.0 PreviewImageSharp.qml
 ConvertDialog 1.0 ConvertDialog.qml
+BulkOldNames 1.0 BulkOldNames.qml
+BulkRenameDialog 1.0 BulkRenameDialog.qml
 DialogButton 1.0 DialogButton.qml
 ProtocolChip 1.0 ProtocolChip.qml
 DialogField 1.0 DialogField.qml
+DialogHeader 1.0 DialogHeader.qml
+DialogScrim 1.0 DialogScrim.qml
 DialogTitle 1.0 DialogTitle.qml
 Divider 1.0 Divider.qml
 EscapeHint 1.0 EscapeHint.qml
@@ -58,6 +66,8 @@ SettingsHint 1.0 SettingsHint.qml
 SettingsRuler 1.0 SettingsRuler.qml
 SettingsSegment 1.0 SettingsSegment.qml
 MediaStrip 1.0 MediaStrip.qml
+MediaTrack 1.0 MediaTrack.qml
+MediaVolume 1.0 MediaVolume.qml
 MenuRow 1.0 MenuRow.qml
 MenuEdgeFade 1.0 MenuEdgeFade.qml
 RenameField 1.0 RenameField.qml
@@ -66,6 +76,9 @@ FastScrollHandler 1.0 FastScrollHandler.qml
 ViewportScrollBar 1.0 ViewportScrollBar.qml
 ViewportScrollBars 1.0 ViewportScrollBars.qml
 CardScroll 1.0 CardScroll.qml
+CardFrame 1.0 CardFrame.qml
+Reveal 1.0 Reveal.qml
+FlyoutFade 1.0 FlyoutFade.qml
 DeviceMounts 1.0 DeviceMounts.qml
 DropboxMark 1.0 DropboxMark.qml
 HyprlandMark 1.0 HyprlandMark.qml
@@ -106,6 +119,7 @@ PreviewText 1.0 PreviewText.qml
 Row 1.0 Row.qml
 ResizeHandle 1.0 ResizeHandle.qml
 Pane 1.0 Pane.qml
+PickerBox 1.0 PickerBox.qml
 PickerChrome 1.0 PickerChrome.qml
 PickerGrid 1.0 PickerGrid.qml
 PickerHeader 1.0 PickerHeader.qml
@@ -114,10 +128,13 @@ PickerSelection 1.0 PickerSelection.qml
 PickerPlaces 1.0 PickerPlaces.qml
 PickerRecent 1.0 PickerRecent.qml
 PickerSave 1.0 PickerSave.qml
+PickerPathBar 1.0 PickerPathBar.qml
+PathEntry 1.0 PathEntry.qml
 PanePath 1.0 PanePath.qml
 PaneRail 1.0 PaneRail.qml
 PaneWire 1.0 PaneWire.qml
 PaneSwap 1.0 PaneSwap.qml
+ParkedWait 1.0 ParkedWait.qml
 ShareBrowser 1.0 ShareBrowser.qml
 Sidebar 1.0 Sidebar.qml
 SidebarRow 1.0 SidebarRow.qml
@@ -128,6 +145,8 @@ ShareLink 1.0 ShareLink.qml
 StateMessage 1.0 StateMessage.qml
 TailscaleMark 1.0 TailscaleMark.qml
 StatusBar 1.0 StatusBar.qml
+StableModel 1.0 StableModel.qml
+PrebuildDriver 1.0 PrebuildDriver.qml
 SelectionBand 1.0 SelectionBand.qml
 TabBar 1.0 TabBar.qml
 TabDragGeometry 1.0 TabDragGeometry.qml
@@ -147,12 +166,33 @@ singleton ShelfPins 1.0 ShelfPins.qml
 SettingsFavourite 1.0 SettingsFavourite.qml
 TrashView 1.0 TrashView.qml
 TrashConfirm 1.0 TrashConfirm.qml
+TagSlot 1.0 TagSlot.qml
+TagSwatch 1.0 TagSwatch.qml
+RailHeading 1.0 RailHeading.qml
+TagState 1.0 TagState.qml
+TagRailSection 1.0 TagRailSection.qml
+TagMenuMark 1.0 TagMenuMark.qml
 CollideConfirm 1.0 CollideConfirm.qml
 CollideHost 1.0 CollideHost.qml
+RunCard 1.0 RunCard.qml
+FatNamesConfirm 1.0 FatNamesConfirm.qml
 TrashMonitor 1.0 TrashMonitor.qml
 TrashHost 1.0 TrashHost.qml
+FlashView 1.0 FlashView.qml
+FlashHost 1.0 FlashHost.qml
+FlashImageRow 1.0 FlashImageRow.qml
+FlashDriveRows 1.0 FlashDriveRows.qml
+FlashStepRow 1.0 FlashStepRow.qml
+FlashRunner 1.0 FlashRunner.qml
+FlashStrip 1.0 FlashStrip.qml
+UnlockDialog 1.0 UnlockDialog.qml
+UnlockHost 1.0 UnlockHost.qml
+DeviceLock 1.0 DeviceLock.qml
 PaneMenuActions 1.0 PaneMenuActions.qml
 PaneStates 1.0 PaneStates.qml
 MenuActionDialog 1.0 MenuActionDialog.qml
 PickerListing 1.0 PickerListing.qml
 PickerLifecycle 1.0 PickerLifecycle.qml
+ArchiveCompressDialog 1.0 ArchiveCompressDialog.qml
+ArchivePasswordDialog 1.0 ArchivePasswordDialog.qml
+ArchiveCards 1.0 ArchiveCards.qml

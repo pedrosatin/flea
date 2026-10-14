@@ -21,9 +21,28 @@ function onName(label, owner, point, centered) {
 // idempotent on a row, so it runs on both taps of a double click rather than behind a double-click
 // timer, which would delay every selection by the whole mouseDoubleClickInterval.
 
+// A view keeps its delegates across a re-list, so a tap count can outlive the row its first tap named.
+var firstTap = null
+// A later tap counts only on the row its gesture's first tap named; a tap on another row answers 0 and starts the count again.
+function gestureCount(index, tapCount, root) {
+    var row = index >= 0 ? root.rowFor(index) : null
+    var key = String(root.path) + "\n" + (row ? row.n : "")
+    if (tapCount === 1 || firstTap === null || firstTap.pane !== root) {
+        firstTap = { pane: root, key: key, base: 0 }
+        return tapCount
+    }
+    if (firstTap.key !== key) {
+        firstTap = { pane: root, key: key, base: tapCount }
+        return 0
+    }
+    return tapCount - firstTap.base
+}
+
 // One tap selects, the second opens; a click carries context 0 so the list never moves under the pointer.
 function tapped(index, tapCount, modifiers, root) {
     if (index < 0) return
+    tapCount = gestureCount(index, tapCount, root)
+    if (tapCount === 0) return
     // Single-click mode opens on the first tap alone, so later taps of one gesture add nothing.
     if (root.singleClick === true && tapCount !== 1) return
     // Finder's two selection modifiers. Neither ever opens, and only the first tap of one counts,
@@ -36,7 +55,7 @@ function tapped(index, tapCount, modifiers, root) {
         if (tapCount === 1) root.extendSelectionTo(index)
         return
     }
-    // What a tap means is the search's to say, not this file's: on a result the operator's ruling is
+    // What a tap means is the search's to say, not this file's: on a result it is
     // that it takes you to the file rather than launching it, and ui/js/Search.js activateAction
     // answers "open" everywhere else. A result answers on the first tap (2026-09-11), so the reveal
     // has already moved the pane by the time a second one arrives and that tap belongs to another
@@ -63,10 +82,13 @@ function tapped(index, tapCount, modifiers, root) {
 function tappedMiddle(index, tapCount, modifiers, root) {
     var row = index >= 0 ? root.rowFor(index) : null
     var plain = (modifiers & (Qt.ControlModifier | Qt.ShiftModifier)) === 0
+    // tapped() counts the gesture itself, so a tap is counted once on either path.
     if (!row || !row.d || !plain) {
         tapped(index, tapCount, modifiers, root)
         return
     }
+    tapCount = gestureCount(index, tapCount, root)
+    if (tapCount === 0) return
     // The first tap moved the pane, so a second one is another directory's row, the same reason
     // tappedColumn refuses to reveal a neighbour twice.
     if (tapCount !== 1)
@@ -128,4 +150,12 @@ function tappedTab(row, base, root) {
         return
     root.commitOpenRename()
     Tabs.openNew(root, target)
+}
+
+// The slow click renames on the pane's timer; a second tap opens through tapped() instead, so only a lone tap on the name arms it.
+function slowTap(pane, armed, index, modifiers, dragActive, wasSole) {
+    if (armed)
+        pane.armSlowClick(index, modifiers, dragActive, wasSole)
+    else
+        pane.cancelSlowClick()
 }

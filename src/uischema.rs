@@ -13,7 +13,9 @@ pub const DEFAULTS: &str = r#"{
   "sort": { "key": "name", "reverse": false },
   "rememberSort": true,
   "folderSorts": {},
-  "dual": { "paths": [], "focus": 0 },
+  "rememberViewPerFolder": false,
+  "folderViews": {},
+  "dual": { "paths": [], "focus": 0, "split": 5000 },
   "foldersFirst": true,
   "groupByKind": false,
   "hidden": false,
@@ -23,6 +25,7 @@ pub const DEFAULTS: &str = r#"{
   "escapeUp": false,
   "openMode": "double",
   "clickRename": true,
+  "openFoldersWhileDragging": false,
   "keyHints": false,
   "startIn": "home",
   "startFolder": "",
@@ -35,7 +38,7 @@ pub const DEFAULTS: &str = r#"{
     "favourites": [],
     "showHome": true, "showRecent": false, "showNetwork": true,
     "showDevices": true, "showTrash": true,
-    "driveSize": false, "trashCount": false, "showUnmounted": true, "rail": "shown", "autoHide": false, "sidebarWidth": 192
+    "driveSize": false, "trashCount": false, "showUnmounted": true, "showTags": false, "rail": "shown", "autoHide": false, "sidebarWidth": 192
   },
   "shelf": {
     "enabled": false, "bar": true, "rail": "off",
@@ -45,15 +48,15 @@ pub const DEFAULTS: &str = r#"{
     "column": true, "loadOn": "automatic",
     "thumbnails": "media", "thumbSize": "medium",
     "thumbNetwork": false, "thumbPhone": false, "thumbUsb": true,
-    "ctrlZoom": true
+    "ctrlZoom": true, "volume": 100
   },
   "keys": "default",
   "display": { "textSize": { "mode": "system" }, "hyprlandIcons": false },
   "menu": { "hidden": ["delete", "openTerminal", "placeMenu", "runScript",
             "moveto", "copyto", "properties", "permissions", "copyAs", "pasteAs",
-            "invertSelection", "extThumbs"] },
+            "invertSelection", "extThumbs", "run", "openAsText"] },
   "updates": { "autoCheck": true },
-  "stateVersion": 2
+  "stateVersion": 3
 }"#;
 
 // The list row's optional columns in the order ui/js/Columns.js lays them out; name is never optional.
@@ -88,6 +91,8 @@ pub enum Rule {
     Version,
     // A folder path to its own sort order, at most MAX_FOLDER_SORTS entries; see folderSorts above.
     FolderSorts,
+    // A folder path to one browser view, at most MAX_FOLDER_VIEWS entries; see folderViews above.
+    FolderViews,
     Group(&'static [(&'static str, Rule)]),
 }
 
@@ -108,8 +113,9 @@ pub const SORT_KEYS: [&str; 4] = ["name", "size", "date", "kind"];
 // Tabs040 callout 2: at most one entry per tab ui/js/Tabs.js MAX allows, in tab order.
 pub const MAX_LAST_TABS: usize = 9;
 pub const MAX_FOLDER_SORTS: usize = 500;
+pub const MAX_FOLDER_VIEWS: usize = 500;
 
-pub const DUAL: &[(&str, Rule)] = &[("paths", Rule::Pair), ("focus", Rule::Count(0.0, 1.0))];
+pub const DUAL: &[(&str, Rule)] = &[("paths", Rule::Pair), ("focus", Rule::Count(0.0, 1.0)), ("split", Rule::Count(0.0, 10000.0))];
 
 pub const PLACES: &[(&str, Rule)] = &[
     ("favourites", Rule::Favourites),
@@ -122,6 +128,7 @@ pub const PLACES: &[(&str, Rule)] = &[
     ("driveSize", Rule::Bool),
     ("trashCount", Rule::Bool),
     ("showUnmounted", Rule::Bool),
+    ("showTags", Rule::Bool),
     ("rail", Rule::Word(&["shown", "hidden"])),
     ("autoHide", Rule::Bool),
     ("sidebarWidth", Rule::SidebarWidth),
@@ -148,6 +155,7 @@ pub const PREVIEW: &[(&str, Rule)] = &[
     ("thumbPhone", Rule::Bool),
     ("thumbUsb", Rule::Bool),
     ("ctrlZoom", Rule::Bool),
+    ("volume", Rule::Count(0.0, 100.0)),
 ];
 
 // mode is "system" or one stop, so there is nowhere to put a free number; see the handoff's Display row.
@@ -178,6 +186,8 @@ pub const SCHEMA: &[(&str, Rule)] = &[
     ("sort", Rule::Group(SORT)),
     ("rememberSort", Rule::Bool),
     ("folderSorts", Rule::FolderSorts),
+    ("rememberViewPerFolder", Rule::Bool),
+    ("folderViews", Rule::FolderViews),
     ("dual", Rule::Group(DUAL)),
     ("foldersFirst", Rule::Bool),
     ("groupByKind", Rule::Bool),
@@ -190,6 +200,7 @@ pub const SCHEMA: &[(&str, Rule)] = &[
     ("escapeUp", Rule::Bool),
     ("openMode", Rule::Word(&["double", "single"])),
     ("clickRename", Rule::Bool),
+    ("openFoldersWhileDragging", Rule::Bool),
     // The Menus section's "Show keyboard hints" row: every menu's key column and the empty
     // directory's own tip, off until it is switched on.
     ("keyHints", Rule::Bool),
@@ -267,14 +278,14 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "view", "pickerView", "density", "columns", "columnsLimit", "columnWidths", "addressBar", "sort", "rememberSort", "folderSorts",
-                "dual", "foldersFirst", "groupByKind", "hidden", "hiddenLast", "highlightToday", "wrapAtEnds", "escapeUp", "openMode", "clickRename", "keyHints", "startIn", "startFolder",
+                "view", "pickerView", "density", "columns", "columnsLimit", "columnWidths", "addressBar", "sort", "rememberSort", "folderSorts", "rememberViewPerFolder", "folderViews",
+                "dual", "foldersFirst", "groupByKind", "hidden", "hiddenLast", "highlightToday", "wrapAtEnds", "escapeUp", "openMode", "clickRename", "openFoldersWhileDragging", "keyHints", "startIn", "startFolder",
                 "lastPath", "lastTabs", "newTab", "trashAutoEmpty", "trashSweptOn", "places", "shelf",
                 "preview", "keys",
                 "display", "menu", "updates", "stateVersion"
             ]
         );
-        assert_eq!(d.get(STATE_VERSION).and_then(Json::as_f64), Some(2.0), "a fresh document is already stamped");
+        assert_eq!(d.get(STATE_VERSION).and_then(Json::as_f64), Some(3.0), "a fresh document is already stamped");
         assert_eq!(d.get("view").and_then(Json::as_str), Some("list"));
         assert_eq!(d.get("pickerView").and_then(Json::as_str), Some("list"));
         assert_eq!(d.get("density").and_then(Json::as_str), Some("compact"));
@@ -310,9 +321,13 @@ mod tests {
         assert_eq!(d.get("hiddenLast").and_then(Json::as_bool), Some(false));
         assert_eq!(d.get("rememberSort").and_then(Json::as_bool), Some(true));
         assert_eq!(d.get("folderSorts").and_then(Json::as_object).map(<[(String, Json)]>::len), Some(0));
+        assert_eq!(d.get("rememberViewPerFolder").and_then(Json::as_bool), Some(false));
+        assert_eq!(d.get("folderViews").and_then(Json::as_object).map(<[(String, Json)]>::len), Some(0));
         assert_eq!(d.get("dual").and_then(|s| s.get("paths")).and_then(Json::as_array).map(<[Json]>::len), Some(0));
         assert_eq!(d.get("dual").and_then(|s| s.get("focus")).and_then(Json::as_f64), Some(0.0));
-        // Directive 38 and GM's B1 ruling: the shelf ships off, and its switch is what installs the plugin.
+        // The left listing's share of the room right of the rail, in ten-thousandths: 5000 is the equal split 0.3.9 lays out.
+        assert_eq!(d.get("dual").and_then(|s| s.get("split")).and_then(Json::as_f64), Some(5000.0));
+        // The shelf ships off, and its switch is what installs the plugin.
         assert_eq!(d.get("shelf").and_then(|s| s.get("enabled")).and_then(Json::as_bool), Some(false));
         assert_eq!(d.get("shelf").and_then(|s| s.get("bar")).and_then(Json::as_bool), Some(true));
         assert_eq!(d.get("shelf").and_then(|s| s.get("rail")).and_then(Json::as_str), Some("off"));
@@ -327,16 +342,16 @@ mod tests {
         assert_eq!(d.get("places").and_then(|p| p.get("trashCount")).and_then(Json::as_bool), Some(false));
         // Sidebar040: Recent ships off, so a fresh rail names no recent file.
         assert_eq!(d.get("places").and_then(|p| p.get("showRecent")).and_then(Json::as_bool), Some(false));
-        // GM's 0.3.3 ruling: unmounted drives are on the rail unless the operator switches them off.
+        // Decided in 0.3.3: unmounted drives are on the rail unless the operator switches them off.
         assert_eq!(d.get("places").and_then(|p| p.get("showUnmounted")).and_then(Json::as_bool), Some(true));
         assert_eq!(d.get("preview").and_then(|p| p.get("loadOn")).and_then(Json::as_str), Some("automatic"));
         assert_eq!(d.get("preview").and_then(|p| p.get("thumbnails")).and_then(Json::as_str), Some("media"));
         assert_eq!(d.get("preview").and_then(|p| p.get("thumbSize")).and_then(Json::as_str), Some("medium"));
-        // ExtThumbs, GM's ruling of 2026-09-23: network shares and phones are off, USB drives are on.
+        // ExtThumbs, decided 2026-09-23: network shares and phones are off, USB drives are on.
         assert_eq!(d.get("preview").and_then(|p| p.get("thumbNetwork")).and_then(Json::as_bool), Some(false));
         assert_eq!(d.get("preview").and_then(|p| p.get("thumbPhone")).and_then(Json::as_bool), Some(false));
         assert_eq!(d.get("preview").and_then(|p| p.get("thumbUsb")).and_then(Json::as_bool), Some(true));
-        // GM 2026-10-03: the Markdown view is not a stored choice, so no leaf for it ships.
+        // Decided 2026-10-03: the Markdown view is not a stored choice, so no leaf for it ships.
         assert!(d.get("preview").and_then(|p| p.get("markdownView")).is_none());
         assert_eq!(d.get("display").and_then(|p| p.get("textSize")).and_then(|t| t.get("mode")).and_then(Json::as_str), Some("system"));
         let display: Vec<&str> = d.get("display").and_then(Json::as_object).expect("display").iter().map(|(k, _)| k.as_str()).collect();
@@ -362,7 +377,7 @@ mod tests {
             hidden,
             // Directive 38: every feature this release adds ships with its own id hidden, so a fresh
             // ui.json behaves as 0.2.1 did. placeMenu is the Places rows' own menu.
-            ["delete", "openTerminal", "placeMenu", "runScript", "moveto", "copyto", "properties", "permissions", "copyAs", "pasteAs", "invertSelection", "extThumbs"]
+            ["delete", "openTerminal", "placeMenu", "runScript", "moveto", "copyto", "properties", "permissions", "copyAs", "pasteAs", "invertSelection", "extThumbs", "run", "openAsText"]
         );
     }
 
@@ -407,6 +422,41 @@ mod tests {
         assert_eq!(map.len(), MAX_FOLDER_SORTS);
         assert!(map.iter().all(|(k, _)| k != "/d000" && k != "/d001"), "the two oldest go");
         assert!(map.iter().any(|(k, _)| k == "/d501"), "the newest stays");
+    }
+
+    // Folder views are opt-in and only name layouts one pane can draw. Dual is a window layout.
+    #[test]
+    fn folder_views_hold_places_to_browser_modes_and_heal_past_the_cap() {
+        let current = crate::uistate::from_file("{}");
+        let takes = |patch: &str| crate::uistate::patched(&current, &jsondoc::parse(patch).expect("patch parses"));
+        for good in [r#"{"rememberViewPerFolder":true}"#,
+                     r#"{"folderViews":{"/home/gm/Pictures":"grid","smb://nas/docs":"columns"}}"#] {
+            assert!(takes(good).is_ok(), "{} is a value its key takes", good);
+        }
+        for (bad, named) in [(r#"{"folderViews":[]}"#, "folderViews"),
+                             (r#"{"folderViews":{"Pictures":"grid"}}"#, "folderViews"),
+                             (r#"{"folderViews":{"/a":"dual"}}"#, "folderViews"),
+                             (r#"{"folderViews":{"/a":"tiles"}}"#, "folderViews"),
+                             (r#"{"rememberViewPerFolder":1}"#, "rememberViewPerFolder")] {
+            let message = takes(bad).expect_err("the patch must be refused");
+            assert!(message.contains(named), "{} should name {}, got {}", bad, named, message);
+        }
+        let read = crate::uistate::from_file(r#"{"folderViews":{"/home/gm/Pictures":"grid","Pictures":"list","/home/gm/Docs":"dual"},"hidden":true}"#);
+        let map = read.get("folderViews").and_then(Json::as_object).expect("folderViews");
+        assert_eq!(map.len(), 1, "only bad entries go");
+        assert_eq!(map.iter().next().map(|(key, value)| (key.as_str(), value.as_str())), Some(("/home/gm/Pictures", Some("grid"))));
+        assert_eq!(read.get("hidden").and_then(Json::as_bool), Some(true));
+        let mut big = String::from(r#"{"folderViews":{"#);
+        for i in 0..MAX_FOLDER_VIEWS + 2 {
+            if i > 0 { big.push(','); }
+            big.push_str(&format!(r#""/d{:03}":"grid""#, i));
+        }
+        big.push_str("}}");
+        let kept = takes(&big).expect("a long map still patches");
+        let map = kept.get("folderViews").and_then(Json::as_object).expect("folderViews");
+        assert_eq!(map.len(), MAX_FOLDER_VIEWS);
+        assert!(map.iter().all(|(key, _)| key != "/d000" && key != "/d001"));
+        assert!(map.iter().any(|(key, _)| key == "/d501"));
     }
 
     // The rules nothing else reached: an exact stop, a non-empty path, and the four shipped presets.

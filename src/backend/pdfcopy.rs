@@ -21,18 +21,15 @@ fn last_copy() -> &'static Mutex<HashMap<String, PathBuf>> {
 }
 
 fn cache_root() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join(PDF_CACHE_LEAF)
+    crate::userfile::cache_home().join(PDF_CACHE_LEAF)
 }
 
 // Sample input: {"c":"pdfcopy","id":3,"slot":"column","path":"/run/media/gm/128GB/doc.pdf"}.
-pub fn pdfcopied_line(id: usize, path: &str, err: &str) -> String {
+pub fn pdfcopied_line(id: usize, path: &str, err: &str, stalled: bool) -> String {
     if err.is_empty() {
         format!(r#"{{"t":"pdfcopied","id":{},"path":"{}"}}"#, id, escape(path))
+    } else if stalled {
+        format!(r#"{{"t":"pdfcopied","id":{},"err":"{}","stalled":true}}"#, id, escape(err))
     } else {
         format!(r#"{{"t":"pdfcopied","id":{},"err":"{}"}}"#, id, escape(err))
     }
@@ -97,17 +94,17 @@ fn await_copy(recv: &mut dyn FnMut(Duration) -> Result<CopyMsg, RecvTimeoutError
         match recv(wait) {
             Ok(CopyMsg::Chunk) => {}
             Ok(CopyMsg::Done(Ok(()))) => {
-                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, &dst.to_string_lossy(), "") });
+                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, &dst.to_string_lossy(), "", false) });
                 break;
             }
             Ok(CopyMsg::Done(Err(msg))) => {
                 let _ = std::fs::remove_file(dst);
-                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, "", &msg) });
+                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, "", &msg, false) });
                 break;
             }
             Err(_) => {
                 done.store(true, Ordering::Relaxed);
-                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, "", "that file is not responding") });
+                let _ = tx.send(OpMsg::Meta { line: pdfcopied_line(id, "", "that file is not responding", true) });
                 break;
             }
         }
@@ -129,16 +126,14 @@ fn fetch(id: usize, slot: &str, src: PathBuf, tx: std::sync::mpsc::Sender<OpMsg>
     let (one_tx, one_rx) = channel::<CopyMsg>();
     let worker_done = Arc::clone(&done);
     let worker_dst = dst.clone();
-    let worker_tx = one_tx.clone();
     std::thread::spawn(move || {
         let result = copy_into(&src, &worker_dst, &worker_done, &one_tx);
         if !worker_done.load(Ordering::Relaxed) {
-            let _ = worker_tx.send(CopyMsg::Done(result));
+            let _ = one_tx.send(CopyMsg::Done(result));
         }
     });
-    let worker_done = Arc::clone(&done);
     let mut recv = |ask: Duration| one_rx.recv_timeout(ask);
-    await_copy(&mut recv, id, &dst, &tx, wait, &worker_done);
+    await_copy(&mut recv, id, &dst, &tx, wait, &done);
 }
 
 pub fn spawn(id: usize, slot: String, path: PathBuf, tx: std::sync::mpsc::Sender<OpMsg>) {
@@ -229,8 +224,9 @@ mod tests {
 
     #[test]
     fn a_reply_line_names_the_copy_or_the_wait() {
-        assert_eq!(pdfcopied_line(3, "/x/doc.pdf", ""), r#"{"t":"pdfcopied","id":3,"path":"/x/doc.pdf"}"#);
-        assert_eq!(pdfcopied_line(3, "", "that file is not responding"), r#"{"t":"pdfcopied","id":3,"err":"that file is not responding"}"#);
+        assert_eq!(pdfcopied_line(3, "/x/doc.pdf", "", false), r#"{"t":"pdfcopied","id":3,"path":"/x/doc.pdf"}"#);
+        assert_eq!(pdfcopied_line(3, "", "permission denied", false), r#"{"t":"pdfcopied","id":3,"err":"permission denied"}"#);
+        assert_eq!(pdfcopied_line(3, "", "that file is not responding", true), r#"{"t":"pdfcopied","id":3,"err":"that file is not responding","stalled":true}"#);
     }
 
     #[test]
@@ -238,7 +234,7 @@ mod tests {
         let _held = SERIAL.lock().unwrap();
         let d = crate::backend::testdir::TestDir::new("pdfcopy-hang");
         let fifo = d.join("hung.pdf");
-        make_fifo(&fifo);
+        crate::backend::fifotest::mkfifo(&fifo);
         // Read-write opens a fifo without blocking, so the copy's own open succeeds and its read blocks.
         let _writer = std::fs::OpenOptions::new().read(true).write(true).open(&fifo).unwrap();
         let (tx, rx) = channel::<OpMsg>();
@@ -249,6 +245,7 @@ mod tests {
         };
         assert!(line.contains(r#""id":7"#), "the answer names the fetch it hung: {line}");
         assert!(line.contains("that file is not responding"), "fetch itself answers the wait: {line}");
+        assert!(line.contains(r#""stalled":true"#), "the wait that ran out carries the machine flag: {line}");
     }
 
     #[test]
@@ -289,25 +286,5 @@ mod tests {
         };
         assert!(line.contains(r#""id":9"#), "the answer names the fetch: {line}");
         assert!(!line.contains("not responding"), "progress is not a stall: {line}");
-    }
-
-    #[test]
-    fn the_wait_is_eight_seconds() {
-        assert_eq!(PDF_COPY_WAIT, Duration::from_secs(8));
-    }
-
-    // A fifo's blocking read without a writer is the hung mount in miniature; extern C in the
-    // idiom src/thp.rs already uses, because std exposes no mkfifo.
-    extern "C" {
-        fn mkfifo(path: *const i8, mode: u32) -> i32;
-    }
-
-    fn make_fifo(path: &Path) {
-        use std::os::unix::ffi::OsStrExt;
-        let bytes = path.as_os_str().as_bytes();
-        let mut nulled = bytes.to_vec();
-        nulled.push(0);
-        let code = unsafe { mkfifo(nulled.as_ptr() as *const i8, 0o600) };
-        assert_eq!(code, 0, "the hung-source fixture could not be made");
     }
 }

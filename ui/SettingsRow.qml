@@ -44,7 +44,7 @@ Item {
         && segment.implicitWidth + rowLabel.implicitWidth + root.segmentChrome <= root.width
     readonly property bool hasSteps: root.kind === "choice" && !root.hasSegment
     // The hover lift ui/MenuRow.qml uses, so a settings row and a menu row read alike.
-    readonly property real hoverOpacity: 0.08
+    readonly property real hoverOpacity: Theme.washHover
     // SettingsGrammar rule 7: a dependent greys in place while its parent is off, and an inert check the same way; the grey takes the row's handlers with it, because a control that cannot act must not answer a tap.
     readonly property bool greyed: root.row.available === false || root.hasBox && root.row.inert === true
     readonly property string boxValue: root.row.on === true ? "on" : "off"
@@ -81,7 +81,7 @@ Item {
                     height: parent.height
                     color: "transparent"
                     border.width: Theme.spacing.hairline
-                    border.color: Theme.color.muted
+                    border.color: Theme.color.mutedFrame
                     Text {
                         id: capText
                         anchors.fill: parent
@@ -104,7 +104,7 @@ Item {
                     width: visible ? Theme.chromeMarkSize : 0
                     height: width
                     name: binding.modelData.glyph || "file"
-                    color: Theme.color.muted
+                    color: Theme.color.mutedFrame
                 }
                 Text {
                     x: bindingMark.x + bindingMark.width + (bindingMark.visible ? Theme.spacing.gap : 0)
@@ -175,7 +175,7 @@ Item {
         width: parent.width
         height: Theme.spacing.hairline
         visible: root.isFooter || root.isGroup && !root.firstGroup
-        color: Theme.color.muted
+        color: Theme.color.mutedFrame
         opacity: 0.4
     }
 
@@ -220,35 +220,35 @@ Item {
             anchors.fill: parent
             visible: root.row.glyph !== undefined && root.row.mark === undefined
             name: root.row.glyph !== undefined ? root.row.glyph : "file"
-            color: root.isUrgent ? Theme.color.error : Theme.color.muted
+            color: root.isUrgent ? Theme.color.error : Theme.color.mutedFrame
         }
 
         Flea.TailscaleMark {
             anchors.centerIn: parent
             visible: root.row.mark === "tailscale"
             iconSize: Theme.markSize
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
 
         Flea.DropboxMark {
             anchors.centerIn: parent
             visible: root.row.mark === "dropbox"
             iconSize: Theme.markSize
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
 
         Flea.LocalSendMark {
             anchors.centerIn: parent
             visible: root.row.mark === "localsend"
             iconSize: Theme.markSize
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
 
         Flea.HyprlandMark {
             anchors.centerIn: parent
             visible: root.row.mark === "hyprland"
             iconSize: Theme.markSize
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
 
         // The shelf is Flea's own destination, so its switch carries Flea's own mark, the way ui/MenuRow.qml draws the row it governs.
@@ -257,7 +257,7 @@ Item {
             visible: root.row.mark === "flea"
             width: Theme.markSize
             height: Theme.markSize
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
     }
 
@@ -350,7 +350,7 @@ Item {
             width: visible ? Theme.markSize : 0
             height: Theme.markSize
             name: "chevron-right"
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
 
             TapHandler {
                 enabled: root.hasSteps
@@ -366,7 +366,7 @@ Item {
             width: root.isLock ? Theme.markSize : 0
             height: Theme.markSize
             name: "lock"
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
 
         Flea.CheckBox {

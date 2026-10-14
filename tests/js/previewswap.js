@@ -22,9 +22,8 @@ function column(state, extra) {
 }
 
 function run(check) {
-    check("a preview gets the listing swap's cap once its own work starts", PreviewSwap.capMs(false), Swap.HOLD_MS)
-    check("a PDF's cap starts after the document settle ui/PreviewPdf.qml waits",
-          PreviewSwap.capMs(true), Swap.HOLD_MS + PreviewSwap.DOCUMENT_SETTLE_MS)
+    check("a preview gets the listing swap's cap once its own work starts", PreviewSwap.capMs(false), Swap.CAP_MS)
+    check("a PDF gets the same cap, its document settle running under it", PreviewSwap.capMs(true), Swap.CAP_MS)
     check("a capture gives up before the preview column's own 120 ms settle would load under it",
           PreviewSwap.CAPTURE_MS < 120, true)
 
@@ -85,6 +84,7 @@ function run(check) {
     runPictureHoldLeak(check)
     runPreviewSettle(check)
     runE81(check)
+    runPdfIdle(check)
 }
 
 // The body of one QML function by brace count, so each check reads the arm it names and not a copy elsewhere.
@@ -266,7 +266,7 @@ function runPreviewSettle(check) {
         fireArm.indexOf("ExtThumbs.manualHold(") >= 0 && preview.indexOf("onTriggered: root.fireSettle()") >= 0, true)
     check("an unknown class still waits instead of loading",
         fireArm.indexOf("!root.pane.storageKnown") >= 0 && fireArm.indexOf("root.followSelection()") >= 0, true)
-    var loadArm = squashed(preview.substring(preview.indexOf("function load()"), preview.indexOf("function startSwap")))
+    var loadArm = squashed(preview.substring(preview.indexOf("function load()"), preview.indexOf("function askThumb()")))
     check("a load stamps no move clock", loadArm.indexOf("lastMoveAt") < 0 && loadArm.indexOf("lastMoveKey") < 0, true)
     check("the column names the queued load's key",
         preview.indexOf("property string loadQueuedKey") >= 0, true)
@@ -281,17 +281,70 @@ function runPreviewSettle(check) {
     var quick = Source.source("ui/Preview.qml")
     var followArm = squashed(bodyOf(quick, "function follow"))
     check("a pending repeat returns first",
-        followArm.indexOf("if (key === root.lastMoveKey && followSettle.running) return") >= 0, true)
+        followArm.indexOf("PreviewSettle.plan(now, root.lastMoveAt, root.followSettleMs, key, root.lastMoveKey, followSettle.running)") >= 0
+        && followArm.indexOf('if (decision === "same") return') >= 0, true)
     check("a settled revisit of the shown target stays put",
         followArm.indexOf("root.isShown(newPath, newIcon, newSize, newKind)") >= 0, true)
     var qHoldAt = followArm.indexOf("held.hold(null, newPath)")
-    var qIdleAt = followArm.indexOf("if (idle) {")
+    var qIdleAt = followArm.indexOf('if (decision === "now") {')
     check("Quick Look takes its picture before deciding", qHoldAt >= 0 && qIdleAt > qHoldAt, true)
+    var qShownAt = followArm.indexOf("if (root.revealedOpen) {")
+    check("a move during the hold takes no picture", qShownAt >= 0 && qShownAt < qHoldAt, true)
     check("an explicit open stamps the move", squashed(bodyOf(quick, "function open")).indexOf("root.lastMoveAt = Date.now()") >= 0, true)
     check("a close clears the move key", squashed(bodyOf(quick, "function close")).indexOf('root.lastMoveKey = ""') >= 0, true)
     var thumbs = Source.source("ui/ColumnPane.qml")
     check("thumbnail sweeps keep their own debounce, never the cursor helper",
         thumbs.indexOf("PreviewSettle") < 0, true)
+}
+
+// r35-pdfidle: an isolated press opens the document at once, a walk and a live render wait.
+function pdfOpenNow(now, lastRequestAt, intervalMs, renderLoading) {
+    if (typeof PreviewSettle.pdfOpenNow !== "function")
+        return "missing"
+    return PreviewSettle.pdfOpenNow(now, lastRequestAt, intervalMs, renderLoading)
+}
+
+function runPdfIdle(check) {
+    check("an isolated press opens at once", pdfOpenNow(1000, 0, 120, false), true)
+    check("a press one settle after the last opens at once", pdfOpenNow(120, 0, 120), true)
+    check("a press inside the settle waits for it", pdfOpenNow(50, 0, 120, false), false)
+    check("a live render blocks the switch even when idle", pdfOpenNow(1000, 0, 120, true), false)
+    check("a live render blocks the switch inside the settle too", pdfOpenNow(50, 0, 120, true), false)
+    check("a backwards clock reads idle, never wedged", pdfOpenNow(100, 200, 120, false), true)
+    var pdf = Source.source("ui/PreviewPdf.qml")
+    check("the document reaches PreviewSettle's idle rule",
+        pdf.indexOf('import "js/PreviewSettle.js" as PreviewSettle') >= 0, true)
+    check("a path or active change stamps the last request",
+        pdf.indexOf("root.lastRequestAt = now") >= 0, true)
+    var openAt = pdf.indexOf("function openPending()")
+    check("one opener serves the timer and the fast path",
+        openAt >= 0 && pdf.indexOf("function requestOpen()") >= 0
+        && pdf.indexOf("function openPending()", openAt + 1) < 0, true)
+    var ask = squashed(bodyOf(pdf, "function requestOpen"))
+    check("the fast path decides on idleness and a live render",
+        ask.indexOf("PreviewSettle.pdfOpenNow(") >= 0 && ask.indexOf("Image.Loading") >= 0, true)
+    check("the fast path waits for the next presented frame, never the end of the turn",
+        ask.indexOf("Qt.callLater") < 0 && ask.indexOf("root.fastArmed = PreviewSettle.pdfOpenNow(") >= 0, true)
+    check("a newer request cancels the deferred open",
+        ask.indexOf("var now = Date.now() root.fastArmed = PreviewSettle.pdfOpenNow(now, root.lastRequestAt, root.settleMs, page.status === Image.Loading) root.lastRequestAt = now") >= 0, true)
+    check("the settle stays as the backstop on the idle path",
+        ask.indexOf("pdfSettle.restart()") >= 0, true)
+    var fast = squashed(bodyOf(pdf, "function runFast"))
+    check("the deferred open runs once and opens through the shared opener",
+        fast.indexOf("root.fastArmed") >= 0 && fast.indexOf("root.openPending()") >= 0, true)
+    check("the deferred open stops the backstop it beat",
+        fast.indexOf("pdfSettle.stop()") >= 0, true)
+    var frame = squashed(Source.slice(pdf, "property bool fastArmed", "function requestOpen"))
+    check("one frame connection serves the deferred open and outlives nothing",
+        frame.indexOf("onFrameSwapped") >= 0 && frame.indexOf("root.Window.window") >= 0
+        && frame.indexOf("root.fastArmed ?") >= 0, true)
+    var settle = squashed(Source.slice(pdf, "id: pdfSettle", "id: renderCap"))
+    check("the settle opens through the shared opener whatever the render state",
+        settle.indexOf("root.openPending()") >= 0, true)
+    check("the settle disarms the deferred open it beat",
+        settle.indexOf("root.fastArmed = false") >= 0, true)
+    check("the settle carries no render gate of its own",
+        settle.indexOf("Image.Loading") < 0, true)
 }
 
 // A launch or folder move must never leave the third-column picture up: only a real file row takes one.
@@ -376,8 +429,13 @@ function runE81(check) {
         quick.indexOf("interimTurned") < 0 && image.indexOf("interimTurned") < 0, true)
     var pre = squashed(bodyOf(quick, "function maybePrefetch"))
     check("prefetch warms one cache entry on rest only",
-        pre.indexOf("ViewState.previewAutomatic") >= 0 && pre.indexOf("followSettle.running") >= 0 && pre.indexOf("ExtThumbs.manualHold(") >= 0
+        pre.indexOf("ViewState.previewAutomatic") >= 0 && pre.indexOf("followSettle.running") >= 0 && pre.indexOf("root.thumbClear(row)") >= 0
         && pre.indexOf("cacheOnly: true") >= 0 && pre.indexOf("backend.thumb(work.ask, true)") >= 0 && pre.indexOf("askMeta") < 0, true)
+    var clear = squashed(bodyOf(quick, "function thumbClear"))
+    check("the prefetch and the owed thumbnail share one gate: listing settled, class known, no manual hold, row allowed",
+        clear.indexOf("root.pane.listInFlight") >= 0 && clear.indexOf("!root.pane.storageKnown") >= 0 && clear.indexOf("ExtThumbs.manualHold(") >= 0
+        && clear.indexOf("Thumbs.allowed(row, ViewState.thumbnailMode)") >= 0
+        && squashed(bodyOf(quick, "function thumbOwed")).indexOf("root.thumbClear(") >= 0, true)
     check("the interim takes the upright original's rect, never the cache pixels",
         flat.indexOf("PreviewSwap.interimRect(panes.width, panes.height,") >= 0
         && flat.indexOf("root.interimBox !== null ? root.interimBox.x : 0") >= 0
@@ -390,19 +448,22 @@ function runE81(check) {
         flat.indexOf("if (root.isImage && row === root.imageRow && root.imageRowShown())") >= 0, true)
     check("the ask re-resolves a drifted index to the shown file",
         askArm.indexOf("root.resolveImageRow()") >= 0
-        && squashed(bodyOf(quick, "function resolveImageRow")).indexOf("root.imageRow = -1") >= 0, true)
+        && squashed(bodyOf(quick, "function resolveImageRow")).indexOf("root.namedRow(at, root.path) !== null ? at : -1") >= 0, true)
     var wire = Source.source("ui/PaneWire.qml")
+    var ext = Source.source("ui/js/ExtThumbs.js")
     check("a prefetch miss on a generating class returns to unasked",
-        wire.indexOf("Thumbs.CACHE_ASKED") >= 0 && wire.indexOf("Thumbs.miss(pane.thumbState, row, true, pane.thumbCap)") >= 0, true)
+        wire.indexOf("ExtThumbs.thumbReply(pane.thumbState, row, file, pane.thumbCap") >= 0
+        && ext.indexOf("Thumbs.CACHE_ASKED") >= 0 && ext.indexOf("Thumbs.miss(state, row, true, cap)") >= 0, true)
     check("the forgotten row is re-planned through the settled view",
-        wire.indexOf("if (pane.listArea) pane.listArea.restartSettle()") >= 0, true)
+        wire.indexOf("if (next.missed && pane.listArea) pane.listArea.restartSettle()") >= 0, true)
     var loadArm = squashed(sel.substring(sel.indexOf("function load()"), sel.indexOf("function askThumb")))
     check("the column single-row ask runs through its held gate",
         loadArm.indexOf("root.askThumb()") >= 0 && loadArm.indexOf("pane.backend.thumb(work.ask") < 0, true)
     var askThumbArm = squashed(bodyOf(sel, "function askThumb"))
     check("that ask waits for the storage class and carries it",
-        askThumbArm.indexOf("!pane.storageKnown") >= 0
-        && askThumbArm.indexOf("ExtThumbs.cacheOnly(pane.storageClass, ViewState.preview)") >= 0, true)
+        askThumbArm.indexOf("PreviewAsk.workFor(") >= 0
+        && askThumbArm.indexOf("storageKnown: pane.storageKnown") >= 0
+        && askThumbArm.indexOf("storageClass: pane.storageClass") >= 0, true)
     check("the class landing runs the held ask",
         sel.indexOf("function onStorageKnownChanged() { root.followSelection(); root.askThumb() }") >= 0, true)
 }

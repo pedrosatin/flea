@@ -1,7 +1,9 @@
 .pragma library
 
+.import "BackReturn.js" as BackReturn
 .import "DirSizes.js" as DirSizes
 .import "Nav.js" as Nav
+.import "Search.js" as Search
 .import "Thumbs.js" as Thumbs
 
 // Recent lists the history's paths under "/", newest first via mtime desc.
@@ -11,7 +13,7 @@ var RESULTS = "results"
 // One refusal for both paste routes: the menu reaches past key dispatch, so it shares this.
 function refusePaste(pane) {
     if (pane.recentMode.length > 0) {
-        pane.message("This listing is a history, and cannot take a paste.", false)
+        pane.message("Recent cannot take a paste. Open a folder first", false)
         return true
     }
     return false
@@ -19,9 +21,10 @@ function refusePaste(pane) {
 
 // Open keeps where the pane stood and asks the history's paths after the bounded jump; spanning mounts leaves fsinfo unknown.
 function run(pane, paths, visits) {
+    // The history takes the place of a listing out; its answer is dropped by the folder it names, see ui/js/Swap.js onListed.
     if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
+        pane.swap.stopWaiting()
+        BackReturn.dropOwed(pane)
     }
     // The standing order is kept for the way back, not the mtime it replaces.
     if (pane.recentMode.length === 0 && pane.backend) {
@@ -29,18 +32,10 @@ function run(pane, paths, visits) {
         pane.recentSortDesc = pane.backend.sortDesc === true
     }
     if (pane.recentFrom.length === 0) {
-        pane.recentFrom = pane.path
+        pane.recentFrom = Nav.place(pane)
     }
-    // A history replaces the standing listing, so a walk is cancelled first.
-    if (pane.searchRunning) {
-        pane.backend.searchcancel()
-    }
-    pane.searchMode = ""
-    pane.searchQuery = ""
-    pane.searchRunning = false
-    pane.searchCancelled = false
-    pane.searchFrom = ""
-    pane.searchScanned = 0
+    // A history replaces the standing listing, so a live session closes first.
+    Search.leaveWalk(pane)
     // The paths this listing stands on, so a refresh with the rail hidden still re-asks them.
     pane.recentPaths = paths || []
     pane.recentVisits = visits || ({})
@@ -50,12 +45,16 @@ function run(pane, paths, visits) {
     pane.recentMode = RESULTS
     pane.listingPath = "/"
     pane.storageClass = ""
+    // Recent rows span filesystems, so the Tags row stays and the backend refuses each filesystem that cannot hold tags by name.
+    pane.canTag = true
     pane.fsName = ""
     pane.fsFree = 0
+    // Recent asks for no figures, so its empty slot is an answer.
+    pane.fsAnswered = true
     var ask = {}
-    if (!pane.swap.hold(ask)) {
-        Nav.forget(pane)
-    }
+    // A walk closed above keeps its rows and its strip until the history lands.
+    if (pane.searchLeaving === true) ask.holdWalk = true
+    Nav.holdOrForget(pane, ask)
     pane.appliedListingPreferences = pane.listingPreferences
     pane.backend.listPaths(pane.recentPaths, pane.windowSize)
     // A deep anchored refresh asks its window only after the history's listpaths request.
@@ -68,17 +67,9 @@ function run(pane, paths, visits) {
 
 // Leaving Recent re-lists the folder it was opened over, pushing no history entry.
 function close(pane) {
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
-    }
     var back = pane.recentFrom.length > 0 ? pane.recentFrom : "/"
-    pane.recentMode = OFF
-    pane.recentFrom = ""
-    pane.recentPaths = []
-    pane.recentVisits = ({})
-    restoreSort(pane)
-    pane.openWithoutHistory(back)
+    leave(pane)
+    pane.openWithoutHistory(back, { supersede: true })
 }
 
 // The order run() replaced, handed back before the folder re-lists.
@@ -91,7 +82,7 @@ function restoreSort(pane) {
     pane.recentSortDesc = false
 }
 
-// A plain hop leaves Recent through one step, so every navigation restores the same order.
+// Every way out of Recent, a plain hop, Escape, a tab switch and reveal, leaves through this one step, so each restores the same order.
 function leave(pane) {
     if (pane.recentMode.length > 0) {
         restoreSort(pane)
@@ -104,6 +95,11 @@ function leave(pane) {
 
 // Refresh re-reads history after an operation, never re-listing "/" over it; an unloaded sidebar re-asks the standing paths.
 function refresh(pane, selectPath) {
+    // A re-ask of the history is no navigation, so it never takes the place of a listing out.
+    if (pane.listInFlight) {
+        pane.message("A directory is already loading.", false)
+        return
+    }
     pane.pendingSelect = selectPath ? selectPath : ""
     pane.pendingMenu = false
     if (pane.sidebar) {
@@ -132,11 +128,7 @@ function dropOverlay(pane) {
     if (pane.recentMode.length === 0) {
         return false
     }
-    pane.recentMode = OFF
-    pane.recentFrom = ""
-    pane.recentPaths = []
-    pane.recentVisits = ({})
-    restoreSort(pane)
+    leave(pane)
     return true
 }
 
@@ -156,11 +148,7 @@ function reveal(pane) {
         return
     }
     var dir = cut === 0 ? "/" : full.substring(0, cut)
-    pane.recentMode = OFF
-    pane.recentFrom = ""
-    pane.recentPaths = []
-    pane.recentVisits = ({})
-    restoreSort(pane)
+    leave(pane)
     pane.pendingSelect = full
     pane.openWithoutHistory(dir)
 }

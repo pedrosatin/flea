@@ -1,7 +1,7 @@
 // The ui.json merges with no disk in them: read a file onto the defaults, apply one caller patch,
 // and carry 0.1.3's view.json across.
 use crate::jsondoc::{self, Json};
-use crate::uischema::{defaults, Rule, COLUMN_KEYS, COLUMN_WIDTH_KEYS, COLUMN_WIDTH_MAX, COLUMN_WIDTH_MIN, MAX_LAST_TABS, OPTIONAL_COLUMNS, SCHEMA, TEXT_SIZE_STOPS, SIDEBAR_STOPS, SORT_KEYS, MAX_FOLDER_SORTS};
+use crate::uischema::{defaults, Rule, COLUMN_KEYS, COLUMN_WIDTH_KEYS, COLUMN_WIDTH_MAX, COLUMN_WIDTH_MIN, MAX_LAST_TABS, OPTIONAL_COLUMNS, SCHEMA, TEXT_SIZE_STOPS, SIDEBAR_STOPS, SORT_KEYS, MAX_FOLDER_SORTS, MAX_FOLDER_VIEWS};
 
 // Never fails: a file this cannot read is a file whose every key falls back to the shipped default.
 pub fn from_file(text: &str) -> Json {
@@ -12,7 +12,7 @@ pub fn from_file(text: &str) -> Json {
 }
 
 // 0.1.3's $XDG_CONFIG_HOME/flea/view.json. hiddenCols named what was hidden, so this inverts it;
-// uiScale is dropped on the operator's ruling, because the new design stores an Omarchy stop only.
+// uiScale is dropped deliberately, because the new design stores an Omarchy stop only.
 pub fn from_view_json(text: &str) -> Json {
     let mut out = defaults();
     let hidden: Vec<String> = match jsondoc::parse(text).ok().as_ref().and_then(|v| v.get("hiddenCols")).and_then(Json::as_array) {
@@ -64,6 +64,8 @@ fn check(pairs: &[(String, Json)], schema: &[(&str, Rule)], prefix: &str) -> Res
             Rule::Version => return Err(format!("{}{} is kept by Flea and no patch sets it", prefix, key)),
             // A null folderSorts entry forgets that path, and only a patch may send one.
             Rule::FolderSorts if is_folder_sorts_patch(value) => {}
+            // A null folderViews entry forgets that path, and only a patch may send one.
+            Rule::FolderViews if is_folder_views_patch(value) => {}
             _ if fits(rule, value) => {}
             _ => return Err(format!("{}{} does not take {}", prefix, key, one_line(value))),
         }
@@ -84,6 +86,7 @@ fn apply(current: &Json, patch: &Json, schema: &[(&str, Rule)]) -> Json {
             (Some(sub), Some(existing), _) => apply(&existing, value, sub),
             // A map patch merges per entry, so one window's write keeps what another wrote since its read.
             (None, held, Some(Rule::FolderSorts)) => merge_folder_sorts(held, value),
+            (None, held, Some(Rule::FolderViews)) => merge_folder_views(held, value),
             (None, held, Some(Rule::ColumnWidths)) => merge_column_widths(held, value),
             _ => normalized(rule, value),
         };
@@ -110,6 +113,7 @@ fn merge(default: &Json, found: &Json, schema: &[(&str, Rule)]) -> Json {
                 Rule::Group(sub) => merge(&fallback, value, sub),
                 // A hand-edited map heals one bad entry rather than losing the key.
                 Rule::FolderSorts => normalized(Some(rule), &clean_folder_sorts(value)),
+                Rule::FolderViews => normalized(Some(rule), &clean_folder_views(value)),
                 _ if fits(rule, value) => normalized(Some(rule), value),
                 _ => fallback,
             },
@@ -138,6 +142,20 @@ fn merge_folder_sorts(held: Option<Json>, patch: &Json) -> Json {
     normalized(Some(&Rule::FolderSorts), &Json::Obj(pairs))
 }
 
+// A folder-view patch names only what changed: each path is forgotten, then re-pushed newest.
+fn merge_folder_views(held: Option<Json>, patch: &Json) -> Json {
+    let mut pairs: Vec<(String, Json)> = held.as_ref().and_then(Json::as_object).map(<[(String, Json)]>::to_vec).unwrap_or_default();
+    if let Some(entries) = patch.as_object() {
+        for (path, view) in entries {
+            pairs.retain(|(k, _)| k != path);
+            if !matches!(view, Json::Null) {
+                pairs.push((path.clone(), view.clone()));
+            }
+        }
+    }
+    normalized(Some(&Rule::FolderViews), &Json::Obj(pairs))
+}
+
 // A widths patch replaces only the edges it names, leaving every other edge standing.
 fn merge_column_widths(held: Option<Json>, patch: &Json) -> Json {
     let mut pairs: Vec<(String, Json)> = held.as_ref().and_then(Json::as_object).map(<[(String, Json)]>::to_vec).unwrap_or_default();
@@ -159,11 +177,12 @@ fn normalized(rule: Option<&Rule>, value: &Json) -> Json {
         }
         return Json::Num(format!("{}", nearest));
     }
-    // The map is oldest first, so a write past the cap drops the longest-ago sort.
-    if matches!(rule, Some(Rule::FolderSorts)) {
+    // The maps are oldest first, so a write past their cap drops the longest-ago entry.
+    if matches!(rule, Some(Rule::FolderSorts) | Some(Rule::FolderViews)) {
         if let Json::Obj(pairs) = value {
-            if pairs.len() > MAX_FOLDER_SORTS {
-                return Json::Obj(pairs[pairs.len() - MAX_FOLDER_SORTS..].to_vec());
+            let cap = if matches!(rule, Some(Rule::FolderViews)) { MAX_FOLDER_VIEWS } else { MAX_FOLDER_SORTS };
+            if pairs.len() > cap {
+                return Json::Obj(pairs[pairs.len() - cap..].to_vec());
             }
         }
         return value.clone();
@@ -193,6 +212,7 @@ fn fits(rule: &Rule, value: &Json) -> bool {
         // The whole remembered strip stands or falls together, like lastPath does.
         Rule::LastTabs => is_last_tabs(value),
         Rule::FolderSorts => is_folder_sorts(value),
+        Rule::FolderViews => is_folder_views(value),
         Rule::ColumnWidths => is_column_widths(value),
         Rule::Count(low, high) => match value.as_f64() {
             Some(n) => n.fract() == 0.0 && n >= *low && n <= *high,
@@ -252,14 +272,14 @@ fn is_last_tabs(value: &Json) -> bool {
     if pairs.len() != 2 {
         return false;
     }
-    let paths = match pairs.iter().find(|(k, _)| k == "paths").map(|(_, v)| v) {
+    let paths = match value.get("paths") {
         Some(Json::Arr(items)) => items,
         _ => return false,
     };
     if paths.len() > MAX_LAST_TABS || !paths.iter().all(|p| p.as_str().map(is_a_place).unwrap_or(false)) {
         return false;
     }
-    match pairs.iter().find(|(k, _)| k == "index").map(|(_, v)| v).and_then(Json::as_f64) {
+    match value.get("index").and_then(Json::as_f64) {
         Some(n) if n.fract() == 0.0 && n >= 0.0 => {
             let at = n as usize;
             if paths.is_empty() { at == 0 } else { at < paths.len() }
@@ -304,6 +324,33 @@ fn clean_folder_sorts(value: &Json) -> Json {
         Some(pairs) => Json::Obj(pairs.iter().filter(|(path, order)| is_a_place(path) && is_sort_order(order)).map(|(path, order)| (path.clone(), order.clone())).collect()),
         None => Json::Obj(Vec::new()),
     }
+}
+
+// A patch may forget one path with null; a stored value is one of the three browser views.
+fn is_folder_views_patch(value: &Json) -> bool {
+    match value.as_object() {
+        Some(pairs) => pairs.iter().all(|(path, view)| is_a_place(path) && (matches!(view, Json::Null) || is_folder_view(view))),
+        None => false,
+    }
+}
+
+// The per-folder view map: each path holds a browser view, never the dual-pane window layout.
+fn is_folder_views(value: &Json) -> bool {
+    match value.as_object() {
+        Some(pairs) => pairs.iter().all(|(path, view)| is_a_place(path) && is_folder_view(view)),
+        None => false,
+    }
+}
+
+fn clean_folder_views(value: &Json) -> Json {
+    match value.as_object() {
+        Some(pairs) => Json::Obj(pairs.iter().filter(|(path, view)| is_a_place(path) && is_folder_view(view)).map(|(path, view)| (path.clone(), view.clone())).collect()),
+        None => Json::Obj(Vec::new()),
+    }
+}
+
+fn is_folder_view(value: &Json) -> bool {
+    value.as_str().is_some_and(|view| ["list", "columns", "grid"].contains(&view))
 }
 
 // Sample input: {"key": "size", "reverse": true}.
@@ -402,7 +449,7 @@ mod tests {
         assert_eq!(merged.get("places").and_then(|p| p.get("newLeaf")).and_then(Json::as_f64), Some(7.0));
     }
 
-    // GM 2026-10-03: preview.markdownView never shipped in a release and is no stored choice; a file that carries it still loads.
+    // As of 2026-10-03: preview.markdownView never shipped in a release and is no stored choice; a file that carries it still loads.
     #[test]
     fn a_state_file_holding_the_retired_markdown_view_loads_and_a_patch_for_it_is_refused() {
         let merged = from_file(r#"{"preview":{"markdownView":"source","thumbSize":"large"},"view":"columns"}"#);
@@ -495,6 +542,33 @@ mod tests {
         assert!(patched(&current, &fav).is_ok(), "a favourites list is any length");
     }
 
+    // The Dual divider's remembered share is a whole number of ten-thousandths, 0 to 10000, and 5000 is the equal split.
+    #[test]
+    fn dual_split_is_a_whole_share_and_a_bad_one_costs_that_leaf_alone() {
+        let current = from_file("{}");
+        for good in ["0", "5000", "10000"] {
+            let p = jsondoc::parse(&format!(r#"{{"dual":{{"split":{}}}}}"#, good)).expect("patch parses");
+            let stored = patched(&current, &p).expect("a share in range is stored");
+            assert_eq!(stored.get("dual").and_then(|d| d.get("split")).and_then(Json::as_f64), Some(good.parse::<f64>().unwrap()));
+        }
+        for bad in ["5000.5", "-1", "10001", r#""x""#] {
+            let p = jsondoc::parse(&format!(r#"{{"dual":{{"split":{}}}}}"#, bad)).expect("patch parses");
+            let message = patched(&current, &p).expect_err("the patch must be refused");
+            assert!(message.contains("dual.split"), "{} should name dual.split, got {}", bad, message);
+            let read = from_file(&format!(r#"{{"dual":{{"paths":["/tmp/left","/tmp/right"],"focus":1,"split":{}}}}}"#, bad));
+            let dual = read.get("dual").expect("dual group");
+            assert_eq!(dual.get("split").and_then(Json::as_f64), Some(5000.0), "{} reads back as the equal split", bad);
+            assert_eq!(dual.get("focus").and_then(Json::as_f64), Some(1.0));
+            assert_eq!(dual.get("paths").and_then(Json::as_array).map(<[Json]>::len), Some(2));
+        }
+        // The pane's own save is a {focus, paths} patch, and it must leave a stored share alone.
+        let held = from_file(r#"{"dual":{"split":6500}}"#);
+        let patch = jsondoc::parse(r#"{"dual":{"focus":1,"paths":["/tmp/left","/tmp/right"]}}"#).expect("patch parses");
+        let saved = patched(&held, &patch).expect("the pane's save is accepted");
+        assert_eq!(saved.get("dual").and_then(|d| d.get("split")).and_then(Json::as_f64), Some(6500.0));
+        assert_eq!(saved.get("dual").and_then(|d| d.get("focus")).and_then(Json::as_f64), Some(1.0));
+    }
+
     // keys.toml holds 48 unique action ids and 32 of them are camelCase, so a hideable row named
     // like one of those has to survive a read rather than take the whole array down with it.
     #[test]
@@ -503,8 +577,8 @@ mod tests {
         let hidden: Vec<&str> = merged
             .get("menu").and_then(|m| m.get("hidden")).and_then(Json::as_array).expect("menu.hidden")
             .iter().filter_map(Json::as_str).collect();
-        assert_eq!(hidden, ["delete", "newFolder", "copy-path", "copy_path", "pasteAs", "invertSelection"],
-            "the ids survive the read, and the 2.0 migration appends what the file never named");
+        assert_eq!(hidden, ["delete", "newFolder", "copy-path", "copy_path", "pasteAs", "invertSelection", "run", "openAsText"],
+            "the ids survive the read, and the 3.0 migration appends what the file never named");
         // Still bounded: anything that is not an id costs the key its own default, as it always did.
         let shipped = crate::uischema::defaults();
         let shipped = shipped
@@ -641,6 +715,38 @@ mod tests {
         assert!(message.contains("folderSorts"), "got {}", message);
     }
 
+    #[test]
+    fn folder_view_patches_merge_per_folder_and_can_forget_one() {
+        let current = from_file("{}");
+        let a = jsondoc::parse(r#"{"folderViews":{"/a":"grid"}}"#).expect("patch parses");
+        let b = jsondoc::parse(r#"{"folderViews":{"/b":"columns"}}"#).expect("patch parses");
+        let both = patched(&patched(&current, &a).expect("a lands"), &b).expect("b lands");
+        let map = both.get("folderViews").and_then(Json::as_object).expect("folderViews");
+        assert_eq!(map.len(), 2);
+        let forget = jsondoc::parse(r#"{"folderViews":{"/a":null}}"#).expect("patch parses");
+        let kept = patched(&both, &forget).expect("forget lands");
+        let map = kept.get("folderViews").and_then(Json::as_object).expect("folderViews");
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.iter().next().map(|(key, value)| (key.as_str(), value.as_str())), Some(("/b", Some("columns"))));
+    }
+
+    // A relaunch reads what the last write rendered: the switch and each folder's view come back in order, and a re-view is newest.
+    #[test]
+    fn folder_views_survive_a_write_and_a_read_and_a_bad_entry_costs_only_itself() {
+        let current = from_file("{}");
+        assert_eq!(current.get("rememberViewPerFolder").and_then(Json::as_bool), Some(false), "off until the operator opts in");
+        let first = jsondoc::parse(r#"{"rememberViewPerFolder":true,"folderViews":{"/a":"grid","/b":"list"}}"#).expect("patch parses");
+        let again = jsondoc::parse(r#"{"folderViews":{"/a":"columns"}}"#).expect("patch parses");
+        let written = patched(&patched(&current, &first).expect("first lands"), &again).expect("again lands");
+        let relaunched = from_file(&jsondoc::render(&written));
+        assert_eq!(relaunched.get("rememberViewPerFolder").and_then(Json::as_bool), Some(true));
+        let views = |doc: &Json| doc.get("folderViews").and_then(Json::as_object).expect("folderViews").iter().map(|(path, view)| format!("{}={}", path, view.as_str().unwrap_or(""))).collect::<Vec<_>>();
+        assert_eq!(views(&relaunched), ["/b=list", "/a=columns"], "both survive, the re-view newest");
+        let edited = from_file(r#"{"rememberViewPerFolder":"yes","folderViews":{"/a":"grid","/b":"dual","c":"list","/d":7,"/e":"columns"}}"#);
+        assert_eq!(views(&edited), ["/a=grid", "/e=columns"], "the dual layout, a relative path and a non-string go and the rest stay");
+        assert_eq!(edited.get("rememberViewPerFolder").and_then(Json::as_bool), Some(false), "a switch that is no boolean reads as off");
+    }
+
     // G1: two remembered folders both survive, a null forgets, a re-sort is newest; widths per key.
     #[test]
     fn map_patches_merge_per_entry_and_a_null_forgets() {
@@ -670,5 +776,35 @@ mod tests {
         let map = widths.get("columnWidths").and_then(Json::as_object).expect("columnWidths");
         assert_eq!(map.len(), 2, "both widths survive");
         assert!(map.iter().any(|(k, _)| k == "size"), "size survives date landing");
+    }
+
+    fn volume_of(doc: &Json) -> Option<f64> {
+        doc.get("preview").and_then(|p| p.get("volume")).and_then(Json::as_f64)
+    }
+
+    // preview.volume is the media level, 0 to 100, and 100 is the full-scale output a file without the key plays at.
+    #[test]
+    fn a_preview_volume_survives_a_write_and_a_file_without_one_reads_full_scale() {
+        assert_eq!(volume_of(&from_file("{}")), Some(100.0));
+        for level in ["0", "37", "100"] {
+            let patch = jsondoc::parse(&format!(r#"{{"preview":{{"volume":{}}}}}"#, level)).expect("patch parses");
+            let written = patched(&from_file("{}"), &patch).expect("a whole level lands");
+            let expected = level.parse::<f64>().ok();
+            assert_eq!(volume_of(&written), expected, "the patched document holds {}", level);
+            assert_eq!(volume_of(&from_file(&text(&written))), expected, "{} reads back after the file is written", level);
+        }
+    }
+
+    #[test]
+    fn a_preview_volume_that_is_not_a_whole_level_reads_full_scale_and_a_patch_for_it_is_refused() {
+        for bad in ["101", "-1", "37.5", r#""loud""#] {
+            let stored = format!(r#"{{"preview":{{"volume":{},"thumbSize":"large"}}}}"#, bad);
+            let read = from_file(&stored);
+            assert_eq!(volume_of(&read), Some(100.0), "{} falls back to full scale", bad);
+            assert_eq!(read.get("preview").and_then(|p| p.get("thumbSize")).and_then(Json::as_str), Some("large"));
+            let patch = jsondoc::parse(&format!(r#"{{"preview":{{"volume":{}}}}}"#, bad)).expect("patch parses");
+            let message = patched(&from_file("{}"), &patch).expect_err("a patch from Flea must be whole");
+            assert!(message.contains("volume"), "got {}", message);
+        }
     }
 }

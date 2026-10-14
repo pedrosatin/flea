@@ -63,6 +63,30 @@ function run(check) {
     check("and does not cancel the running search", full.searchRunning, true)
     check("and the search itself is still standing", full.searchMode, "results")
 
+    // A tab opened while typing drops the live session exactly as from results.
+    var typing = Fixture.pane("/")
+    typing.searchMode = "typing"
+    typing.searchQuery = "no"
+    typing.searchFrom = "/home/gm/Work"
+    typing.searchGen = 1
+    check("dropOverlay while typing drops the live session", Tabs.dropOverlay(typing), true)
+    check("and the drawn line waits for the landing", typing.searchMode + "|" + typing.searchQuery, "typing|no")
+    check("and a typing snapshot keeps no cursor or selection",
+          Tabs.snapshot(typing, "/home/gm/Work").cursorIndex, 0)
+    // An emptied query's own gen may not have landed yet, so the walk's rows can still be drawn.
+    var emptied = Fixture.pane("/tmp/same")
+    emptied.searchMode = "typing"
+    emptied.searchGen = 2
+    emptied.searchOpenedGen = 0
+    emptied.cursorIndex = 3
+    emptied.tabs = { items: [{ path: "/tmp/same" }, { path: "/tmp/same", history: [], cursorIndex: 1, viewMode: "list",
+                             showHidden: false, selected: [], sortBy: "name", sortDesc: false }],
+                     index: 0, pendingCursor: -1, pendingSortBy: "", pendingSortDesc: false }
+    Tabs.selectAt(emptied, 1)
+    check("a switch to a tab on the same folder after the query is emptied re-lists that folder",
+          emptied.listed.join(",") + "|" + emptied.searchMode, "/tmp/same|")
+    check("and the tab it left keeps no cursor read off the walk's rows", emptied.tabs.items[0].cursorIndex, 0)
+
     // selectAt got the same read-before-dropOverlay hoist, and nothing drove it from a search.
     var leaving = Fixture.pane("/")
     leaving.searchMode = "results"
@@ -151,12 +175,12 @@ function run(check) {
     Tabs.act("tabNext", cycling)
     check("next steps forward before wrapping", Tabs.currentIndex(cycling), 1)
     cycling.listInFlight = true
-    var heldTabs = cycling.tabs
     Tabs.act("tabPrevious", cycling)
+    check("previous while a listing is loading switches tab without refusing", Tabs.currentIndex(cycling) + "|" + cycling.said.join("|"), "0|")
+    cycling.superseded = false
     Tabs.act("tabNext", cycling)
-    check("both cycle directions retain tab ownership while a listing is loading", cycling.tabs === heldTabs, true)
-    check("both loading refusals explain why the key did not switch",
-          cycling.said.join("|"), "A directory is already loading.|A directory is already loading.")
+    check("next while a listing is loading switches tab without refusing", Tabs.currentIndex(cycling) + "|" + cycling.said.join("|"), "1|")
+    check("a tab switch asks for its folder as a navigation, so a listing out gives way", cycling.superseded, true)
 
     var single = Fixture.pane("/tmp/only")
     single.preview.active = true
@@ -171,12 +195,12 @@ function run(check) {
 
     var missing = Fixture.pane()
     Tabs.act("tab3", missing)
-    check("a digit with no such tab says so in words", missing.said.join(""), "No tab 3.")
+    check("a digit with no such tab says so in words", missing.said.join(""), "No tab 3")
 
     var last = Fixture.pane()
     Tabs.act("tabClose", last)
     check("w on the only tab refuses rather than closing the window",
-          last.said.join(""), "Can't close the last tab.")
+          last.said.join(""), "The last tab cannot be closed")
 
     var pair = Fixture.pane("/home/gm/a")
     Tabs.act("tabNew", pair)
@@ -195,8 +219,8 @@ function run(check) {
     var loading = Fixture.pane()
     loading.listInFlight = true
     Tabs.act("tabNew", loading)
-    check("t while a listing is in flight uses the same sentence navigation does",
-          loading.said.join(""), "A directory is already loading.")
+    check("t while a listing is in flight opens the tab, says nothing and lets that listing go",
+          Tabs.count(loading) + "|" + loading.said.join("") + "|" + loading.listed.join(",") + "|" + loading.superseded, "2||/home/gm/Work|true")
 
     var previewing = Fixture.pane()
     previewing.preview.active = true
@@ -229,6 +253,12 @@ function run(check) {
     check("and the new tab is shown", Tabs.currentIndex(folder), 1)
     check("and the tab left behind keeps its cursor", folder.tabs.items[0].cursorIndex, 2)
     check("and keeps its selection", folder.tabs.items[0].selected.join(","), "1")
+    var searchFolder = Fixture.pane("/tmp/base")
+    searchFolder.searchBase = "/tmp/scope"
+    searchFolder.cursorIndex = 2
+    searchFolder.rowFor = function (i) { return i === 2 ? { n: "deep/sub", d: true } : null }
+    Tabs.openCursorTab(searchFolder)
+    check("a search result folder opens its tab under the search base", searchFolder.tabs.items[1].path, "/tmp/scope/deep/sub")
     var filePane = Fixture.pane("/tmp/base")
     filePane.cursorIndex = 2
     filePane.selection.toggle(1)
@@ -363,9 +393,8 @@ function run(check) {
     check("this window's own drag never receives", Tabs.count(own), 1)
     var busyReceiver = Fixture.pane("/tmp/r")
     busyReceiver.listInFlight = true
-    check("a loading window refuses the drop", Tabs.receiveTab(busyReceiver, foreign, 0), false)
-    check("with navigation's own sentence",
-          busyReceiver.said[busyReceiver.said.length - 1], "A directory is already loading.")
+    check("a loading window takes the drop and says nothing", Tabs.receiveTab(busyReceiver, foreign, 0) + "|" + busyReceiver.said.join(""), "true|")
+    check("and the tab's listing takes the place of the one out", busyReceiver.listed[busyReceiver.listed.length - 1] + "|" + busyReceiver.superseded, "/tmp/folder|true")
     var fullReceiver = Fixture.pane("/tmp/r")
     var nineFull = []
     for (var f = 0; f < 9; f++) nineFull.push({ path: "/tmp/" + f })
@@ -395,10 +424,7 @@ function run(check) {
     Tabs.setOwnPid("")
     var kept = BarFixture.pair("/tmp/one")
     kept.listInFlight = true
-    check("a loading source keeps its tab", Tabs.closeTabAfterMove(kept, 0), "kept")
-    check("loading move keeps both tabs", Tabs.count(kept), 2)
-    Tabs.closeAt(kept, 0)
-    check("loading direct close keeps both tabs", Tabs.count(kept), 2)
+    check("a loading source closes the tab that moved", Tabs.closeTabAfterMove(kept, 0) + "|" + Tabs.count(kept), "closed|1")
     check("no such tab keeps everything", Tabs.closeTabAfterMove(pair, 5), "kept")
     check("no such tab keeps both tabs", Tabs.count(pair), 2)
 
@@ -615,7 +641,7 @@ function run(check) {
     loadingPane.listInFlight = true
     check("a loading listing refuses", Tabs.tearRefusal(loadingPane), "A directory is already loading.")
     check("a strip with room receives", Tabs.canReceive(Fixture.pane()), true)
-    check("a loading strip does not", Tabs.canReceive(loadingPane), false)
+    check("a loading strip receives too", Tabs.canReceive(loadingPane), true)
     check("a full strip does not", Tabs.canReceive(fullReceiver), false)
 
     // A foreign drag offers formats at enter with no payload until drop.
@@ -683,4 +709,90 @@ function run(check) {
     check("no payload takes nothing",
         Tabs.dropDecision(null, undefined, true, true), Tabs.DROP_IGNORE)
     Tabs.setOwnPid("")
+
+    // A tab-count verdict stands only until the count changes; anything else stands.
+    var lone = Fixture.pane("/tmp/lone")
+    Tabs.act("tabClose", lone)
+    check("the last-tab verdict stood", lone.statusBar.notice, "The last tab cannot be closed")
+    Tabs.act("tabNew", lone)
+    check("a new tab withdraws the standing last-tab verdict", lone.statusBar.notice, "")
+    check("and the new tab is still opened", Tabs.count(lone), 2)
+    var capPane = Fixture.pane("/tmp/cap")
+    for (var ci = 0; ci < 8; ci++) Tabs.act("tabNew", capPane)
+    Tabs.openNew(capPane)
+    check("the cap verdict stood", capPane.statusBar.notice, "Nine tabs is the most.")
+    Tabs.closeAt(capPane, 8)
+    check("closing a tab withdraws the standing cap verdict", capPane.statusBar.notice, "")
+    check("and the tab is still closed", Tabs.count(capPane), 8)
+    var selPane = Fixture.pane("/tmp/sel")
+    Tabs.openNew(selPane)
+    Tabs.selectAt(selPane, 7)
+    check("a missing tab still says its number", selPane.statusBar.notice, "No tab 8")
+    Tabs.closeAt(selPane, 1)
+    check("closing a tab withdraws the standing select verdict", selPane.statusBar.notice, "")
+    var closePane = Fixture.pane("/tmp/close")
+    Tabs.openNew(closePane)
+    Tabs.closeAt(closePane, 7)
+    check("a missing close still says its number", closePane.statusBar.notice, "No tab 8")
+    Tabs.openNew(closePane)
+    check("a new tab withdraws the standing close verdict", closePane.statusBar.notice, "")
+    Tabs.setOwnPid("111")
+    var recvPane = Fixture.pane("/tmp/recv")
+    for (var ri = 0; ri < 8; ri++) Tabs.act("tabNew", recvPane)
+    Tabs.receiveTab(recvPane, foreign, 0)
+    check("the receive cap verdict stood", recvPane.statusBar.notice, "Nine tabs is the most.")
+    Tabs.closeAt(recvPane, 0)
+    check("closing a tab withdraws the standing receive cap verdict", recvPane.statusBar.notice, "")
+    // A received tab lands under a standing count verdict, which it withdraws.
+    var landedPane = Fixture.pane("/tmp/landed")
+    Tabs.act("tabClose", landedPane)
+    landedPane.message("Copy failed.", true)
+    check("the count verdict stands before the landing", landedPane.statusBar.notice, "The last tab cannot be closed")
+    check("and it still names its notice", landedPane.tabCountNotice !== -1, true)
+    Tabs.receiveTab(landedPane, foreign, 0)
+    check("a received tab withdraws the standing count verdict", landedPane.statusBar.notice, "")
+    check("and the earlier error stands",
+          landedPane.statusBar.errors.length > 0 ? landedPane.statusBar.errors[0].text : "", "Copy failed.")
+    check("and the tab still landed", Tabs.count(landedPane), 2)
+    Tabs.setOwnPid("")
+    var filePane = Fixture.pane("/tmp/base")
+    filePane.cursorIndex = 2
+    filePane.rowFor = function () { return { n: "a.txt", d: false } }
+    Tabs.openCursorTab(filePane)
+    check("a plain refusal names no count notice", filePane.tabCountNotice, -1)
+    Tabs.act("tabNew", filePane)
+    check("an unrelated verdict survives a new tab",
+          filePane.statusBar.notice, "Only a folder opens in a new tab.")
+    check("and the new tab is still opened", Tabs.count(filePane), 2)
+    var loadPane = Fixture.pane("/tmp/loading")
+    Tabs.act("tabClose", loadPane)
+    loadPane.listInFlight = true
+    Tabs.act("tabNew", loadPane)
+    check("a new tab with a listing out withdraws the count verdict and says nothing",
+          loadPane.statusBar.notice + "|" + loadPane.tabCountNotice + "|" + Tabs.count(loadPane), "|-1|2")
+    // A withdrawal names its own notice, so an error and a later notice both stand through it.
+    var errPane = Fixture.pane("/tmp/err")
+    Tabs.act("tabClose", errPane)
+    errPane.message("Copy failed.", true)
+    Tabs.act("tabNew", errPane)
+    check("a new tab withdraws the count verdict but the error stands",
+          errPane.statusBar.errors.length > 0 ? errPane.statusBar.errors[0].text : "", "Copy failed.")
+    check("and the count verdict is gone", errPane.statusBar.notice, "")
+    check("and the new tab is still opened", Tabs.count(errPane), 2)
+    var otherPane = Fixture.pane("/tmp/other")
+    Tabs.openNew(otherPane)
+    Tabs.selectAt(otherPane, 7)
+    otherPane.message("Unrelated notice.", false)
+    Tabs.closeAt(otherPane, 1)
+    check("a close withdraws nothing once another notice replaced the count verdict",
+          otherPane.statusBar.notice, "Unrelated notice.")
+    check("and the tab is still closed", Tabs.count(otherPane), 1)
+    var expPane = Fixture.pane("/tmp/exp")
+    Tabs.openNew(expPane)
+    Tabs.selectAt(expPane, 7)
+    expPane.statusBar.notice = ""
+    expPane.message("Later notice.", false)
+    Tabs.act("tabNew", expPane)
+    check("an expired count verdict withdraws nothing, so the later notice stands",
+          expPane.statusBar.notice, "Later notice.")
 }

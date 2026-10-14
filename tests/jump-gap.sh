@@ -42,12 +42,13 @@ def lines_of(rel):
         fail('cannot read %s under %s: %s' % (rel, tree, e.strerror))
 
 chrome = lines_of('ui/ChromeBar.qml')
+entry = lines_of('ui/PathEntry.qml')
 jump = lines_of('ui/PathJump.qml')
 
 slot = after(chrome, 'id: pathArea', r'anchors\.bottomMargin:\s*(.+?)\s*$')
 slotTopHits = after(chrome, 'id: pathArea', r'anchors\.topMargin:\s*(.+?)\s*$')
-frame_top = after(chrome, "rename editor's own frame", r'anchors\.topMargin:\s*(.+?)\s*$')
-frame_bot = after(chrome, "rename editor's own frame", r'anchors\.bottomMargin:\s*(.+?)\s*$')
+frame_top = after(entry, "rename editor's own frame", r'anchors\.topMargin:\s*(.+?)\s*$')
+frame_bot = after(entry, "rename editor's own frame", r'anchors\.bottomMargin:\s*(.+?)\s*$')
 off = after(jump, 'y: root.parent', r'root\.parent\.height\s*\+\s*(.+?)\s*(?::\s*0\s*)?$')
 for label, hits in (('path slot bottom', slot), ('field top', frame_top),
                     ('field bottom', frame_bot), ('dropdown offset', off)):
@@ -57,6 +58,32 @@ if len(slotTopHits) > 1:
     fail('expected at most one path slot top margin, found %d' % len(slotTopHits))
 slotTop = mult(slotTopHits[0][1]) if slotTopHits else 0
 
+# Sample input: "id: entryLoader" in ChromeBar, whose block must only fill the slot or its margins join the sum.
+start = [n for n, line in enumerate(chrome) if 'id: entryLoader' in line]
+if len(start) != 1:
+    fail('expected one path entry in ChromeBar, found %d' % len(start))
+# Braces inside a quoted string or after // are text, not structure, so they never move the depth.
+# Sample input: "    Loader { id: entryLoader; property string mark: '}' // {" counts as one open brace.
+def braces(line):
+    code = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '""', line).split('//')[0]
+    return code.count('}') - code.count('{')
+# The scan stops on the brace that opens the block holding the id, the id's own line first, past any nested block.
+top, depth = start[0], braces(chrome[start[0]])
+while depth >= 0:
+    if top == 0:
+        fail('the path entry in ChromeBar sits in no block')
+    top -= 1
+    depth += braces(chrome[top])
+# The block ends on the line that closes that brace, past any nested block, and a block that never closes fails by name.
+bottom, depth = top, -braces(chrome[top])
+while depth > 0:
+    bottom += 1
+    if bottom == len(chrome):
+        fail('the path entry in ChromeBar sits in a block that never closes')
+    depth -= braces(chrome[bottom])
+block = chrome[top:bottom + 1]
+if any('margin' in line.lower() for line in block):
+    fail('the path entry in ChromeBar carries a margin of its own, so the field no longer sits where the board draws it')
 slotBot, frameTop, frameBot, dropOff = (mult(slot[0][1]), mult(frame_top[0][1]),
                                         mult(frame_bot[0][1]), mult(off[0][1]))
 gap = frameBot + dropOff

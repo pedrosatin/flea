@@ -52,6 +52,16 @@ function run(check) {
     check("and a name merely containing md is not markdown",
           Facts.state(named("amd.doc", "x-office-document"), 1, false, ""), "unsupported")
 
+    // Archives040: the widened formats draw the file or terminal mark, so the extension routes them.
+    check("a package draws the archive tile by its extension, not its file mark",
+          Facts.state(named("driver.deb", "application-x-generic"), 1, false, ""), "archive")
+    check("and so do the disk image and the appimage",
+          Facts.state(named("debian-13.iso", "application-x-generic"), 1, false, "") + "|"
+          + Facts.state(named("run.AppImage", "application-x-executable"), 1, false, ""), "archive|archive")
+    check("Quick Look routes the widened formats to the archive frame too",
+          Kinds.quickLookKind("application-x-generic", "driver.deb") + "|"
+          + Kinds.quickLookKind("application-x-generic", "debian-13.iso"), "archive|archive")
+
     // A symlink's own mode wins over whatever its name says it is.
     check("a symlink is a symlink whatever its name looks like",
           Facts.state(row("image-x-generic", 10, 41471), 0, false, ""), "symlink")
@@ -274,6 +284,9 @@ function run(check) {
     check("an icon classifies by its family, not by a list of the names seen so far",
           Kinds.kindState("text-x-generic-template") + "|" + Kinds.kindState("image-x-generic"),
           "text|image")
+    check("a 3D model a thumbnailer serves is an image, with none serving it takes the generic file pane, and only its suffix names a model",
+          [["part.STL", true], ["part.STL", false], ["part.STL"], ["photo.png", false]].map(function (a) { return Kinds.quickLookKind("image-x-generic", a[0], a[1]) }).join("|")
+          + "|" + ["part.STL", "a.3mf", "scene.glb", "photo.png", "stl", "a.stlx"].map(Kinds.isModel).join("|"), "image|unsupported|unsupported|image|true|true|true|false|false|false")
 
     // The Quick Look's one line under an archive's name, from the same meta the column's table reads.
     check("an archive's Quick Look line states the count and the unpacked size, and nothing before the index lands",

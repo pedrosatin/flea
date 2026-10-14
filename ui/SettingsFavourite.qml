@@ -1,5 +1,6 @@
 import QtQuick
 import "." as Flea
+import "js/Format.js" as Format
 
 // Favourite records keep their exact label/path; only the drag handle initiates reordering.
 Item {
@@ -11,6 +12,8 @@ Item {
     readonly property Item dragItem: grip
     readonly property Item removeItem: remove
     implicitHeight: Theme.railRowHeight
+    // The remove button's accessible name, filled by Format.fill.
+    readonly property string removeWord: "Remove %1"
 
     Flea.Glyph {
         id: icon
@@ -21,7 +24,7 @@ Item {
         width: Theme.markSize
         height: width
         name: root.row.glyph || "folder"
-        color: root.row.error ? Theme.color.error : Theme.color.muted
+        color: root.row.error ? Theme.color.error : Theme.color.mutedFrame
     }
     Text {
         anchors.left: icon.right
@@ -61,7 +64,7 @@ Item {
         width: Theme.hitMin
         height: Theme.hitMin
         Accessible.role: Accessible.Button
-        Accessible.name: "Remove " + (root.row.label || "")
+        Accessible.name: Format.fill(root.removeWord, root.row.label || "")
         Accessible.onPressAction: root.removed()
         HoverHandler { cursorShape: Qt.PointingHandCursor }
         TapHandler {
@@ -74,7 +77,7 @@ Item {
             width: Theme.markSize
             height: Theme.markSize
             name: "x"
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
     }
 
@@ -90,7 +93,7 @@ Item {
             width: Theme.markSize
             height: Theme.markSize
             name: "list"
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
         DragHandler {
             id: drag

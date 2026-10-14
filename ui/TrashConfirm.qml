@@ -1,15 +1,16 @@
 import QtQuick
 import qs.Commons
 import "." as Flea
-import "js/Format.js" as Format
-import "js/Keymap.js" as Keymap
-import "js/Ops.js" as Ops
+import "js/Trash.js" as Trash
 
 // The destructive choice must be reached deliberately; a reflexive Enter activates Cancel.
 FocusScope {
     id: root
     anchors.fill: parent
-    visible: opened
+    visible: opened || opacity > 0
+    // Closed means no input, even while the fade-out is still drawn.
+    enabled: opened
+    opacity: 0
     property bool opened: false
     property var snapshot: ({})
     property bool destructiveFocus: false
@@ -23,6 +24,7 @@ FocusScope {
     readonly property var cancelItem: cancelButton
     readonly property var dangerItem: dangerButton
     readonly property string titleText: title.text
+    readonly property string bodyText: bodyLabel.text
     function open(value) { snapshot = value; destructiveFocus = false; body.contentY = 0; opened = true; forceActiveFocus() }
     function close() { opened = false }
     function cancel() { close(); cancelled() }
@@ -32,6 +34,7 @@ FocusScope {
         close()
         confirmed(token)
     }
+    Flea.Reveal { target: root; shown: root.opened; lift: card }
     Keys.onPressed: function(event) {
         if (event.key === Qt.Key_Escape) root.cancel()
         else if (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) { event.accepted = true; return }
@@ -62,7 +65,7 @@ FocusScope {
         width: Theme.cardSpan(Math.round(340 * root.referenceScale * Theme.dialogWidthRatio) + 2 * root.cardPadding + 2 * Theme.spacing.hairline, root.width - 2 * Theme.spacing.gap)
         height: Theme.cardSpan(body.wanted + root.cardPadding + root.cardBottomPadding + 2 * Theme.spacing.hairline, root.height - 2 * Theme.spacing.gap)
         color: Theme.color.surface
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         border.width: Theme.spacing.hairline
         radius: Style.cornerRadius
         MouseArea {
@@ -71,60 +74,55 @@ FocusScope {
             acceptedButtons: Qt.LeftButton | Qt.RightButton
             onWheel: function(wheel) { wheel.accepted = true }
         }
-        Flea.CardScroll {
+        Flea.CardFrame {
             id: body
-            bleed: Theme.ringClearance
+            bleed: Theme.focusClearance
             anchors.fill: parent
-            anchors.leftMargin: root.cardPadding + Theme.spacing.hairline - Theme.ringClearance
-            anchors.rightMargin: root.cardPadding + Theme.spacing.hairline - Theme.ringClearance
-            anchors.topMargin: root.cardPadding + Theme.spacing.hairline - Theme.ringClearance
-            anchors.bottomMargin: root.cardBottomPadding + Theme.spacing.hairline - Theme.ringClearance
-            Column {
-                width: body.holderWidth
+            anchors.leftMargin: root.cardPadding + Theme.spacing.hairline - Theme.focusClearance
+            anchors.rightMargin: root.cardPadding + Theme.spacing.hairline - Theme.focusClearance
+            anchors.topMargin: root.cardPadding + Theme.spacing.hairline - Theme.focusClearance
+            anchors.bottomMargin: root.cardBottomPadding + Theme.spacing.hairline - Theme.focusClearance
+            title: Row {
+                width: parent.width
                 spacing: Theme.spacing.gap
-                Row {
-                    width: parent.width
-                    spacing: Theme.spacing.gap
-                    Flea.Glyph { id: alertMark; width: Theme.font.bodySmall * 1.3; height: title.height; name: "alert"; color: Theme.color.error }
-                    Text {
-                        id: title
-                        width: parent.width - alertMark.width - parent.spacing
-                        text: root.snapshot.all ? "Empty Trash?" : "Delete " + Ops.items(root.snapshot.count) + " permanently?"
-                        textFormat: Text.PlainText
-                        wrapMode: Text.Wrap
-                        color: Theme.color.foreground
-                        font { family: Theme.font.family; pixelSize: Theme.font.body; bold: true }
-                    }
-                }
+                Flea.Glyph { id: alertMark; width: Theme.font.bodySmall * 1.3; height: title.height; name: "alert"; color: Theme.color.error }
                 Text {
-                    width: parent.width
-                    text: root.snapshot.all
-                        ? Ops.deleteAllLine(root.snapshot.count, Format.size(root.snapshot.bytes || 0), Keymap.hintFor("undo"))
-                        : Ops.deleteScopeLine(root.scopeName, root.snapshot.count)
+                    id: title
+                    width: parent.width - alertMark.width - parent.spacing
+                    text: Trash.confirmTitle(root.snapshot)
                     textFormat: Text.PlainText
                     wrapMode: Text.Wrap
                     color: Theme.color.foreground
-                    font { family: Theme.font.family; pixelSize: Theme.font.body }
+                    font { family: Theme.font.family; pixelSize: Theme.font.body; bold: true }
                 }
-                Flow {
-                    width: Math.min(parent.width, cancelButton.implicitWidth + dangerButton.implicitWidth + spacing)
-                    anchors.right: parent.right
-                    spacing: Theme.spacing.gap
-                    Flea.DialogButton {
-                        id: cancelButton
-                        label: "Cancel"
-                        primary: true
-                        focused: !root.destructiveFocus
-                        onActivated: root.cancel()
-                    }
-                    Flea.DialogButton {
-                        id: dangerButton
-                        label: root.snapshot.all ? "Empty Trash" : "Delete"
-                        destructive: true
-                        focused: root.destructiveFocus
-                        onActivated: { root.destructiveFocus = true; root.activate() }
-                    }
+            }
+            buttons: Flow {
+                width: Math.min(parent.width, cancelButton.implicitWidth + dangerButton.implicitWidth + spacing)
+                anchors.right: parent.right
+                spacing: Theme.spacing.gap
+                Flea.DialogButton {
+                    id: cancelButton
+                    label: "Cancel"
+                    primary: true
+                    focused: !root.destructiveFocus
+                    onActivated: root.cancel()
                 }
+                Flea.DialogButton {
+                    id: dangerButton
+                    label: root.snapshot.all ? "Empty Trash" : "Delete"
+                    destructive: true
+                    focused: root.destructiveFocus
+                    onActivated: { root.destructiveFocus = true; root.activate() }
+                }
+            }
+            Text {
+                id: bodyLabel
+                width: parent.width
+                text: Trash.confirmBody(root.snapshot, root.scopeName)
+                textFormat: Text.PlainText
+                wrapMode: Text.Wrap
+                color: Theme.color.foreground
+                font { family: Theme.font.family; pixelSize: Theme.font.body }
             }
         }
     }

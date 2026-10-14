@@ -36,30 +36,59 @@ permissions_expect() {
         fi
         sleep 0.05
     done
-    fail "permissions: $reader expected $expected, observed $observed"
+    fail "permissions: $reader expected $expected, observed $observed (caller ${BASH_LINENO[0]})"
 }
 
 permissions_point() {
-    local centre="$1" button="${2:-left}" cx cy wx wy ww wh
+    local centre="$1" button="${2:-left}" cx cy wx wy ww wh scene
     read -r cx cy <<< "$centre"
     [[ "$cx" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || fail "permissions: native control has no centre"
     read -r wx wy ww wh < <(window_box) || fail "native window coordinates unavailable"
-    (( cx < ww && cy < wh )) || fail "permissions: control is outside the actual viewport"
+    # permissions_control names the control it clicks; a bare point reports as "control". Sizes are checked as numbers first, since a name in (( )) aborts under set -u.
+    if ! [[ "$ww" =~ ^[0-9]+$ && "$wh" =~ ^[0-9]+$ ]] || ! (( cx < ww && cy < wh )); then
+        scene=$(ipc windowSize 2>&1) || scene="unavailable"
+        fail "permissions: ${permissions_target:-control} centre $cx,$cy is outside the actual viewport ${ww}x${wh} (window at $wx,$wy; QML scene $scene)"
+    fi
     assert_focus
     omarchy-drive click "$((wx + cx))" "$((wy + cy))" "$button" >/dev/null \
         || fail "permissions: native pointer activation failed"
+}
+
+permissions_menu_point() {
+    local index="$1" model target cursor step steps centre cx cy fx fy fw fh permissions_target="menu row $1"
+    model=$(ipc contextMenuModel) || fail "permissions: menu inventory unavailable"
+    # A menu taller than the window scrolls its body, so the cursor moves onto the nearest row it can reach and brings the row into view first.
+    # Sample input: [{"action":"a"},{"separator":true},{"action":"permissions","disabled":true},{"action":"permissions"}] with index 3.
+    target=$(jq -er --argjson index "$index" '. as $rows | [range(0; length) | select($rows[.].separator != true and $rows[.].disabled != true)] | min_by((. - $index) | fabs)' <<< "$model") \
+        || fail "permissions: the menu has no row the cursor can reach"
+    steps=$(jq -er 'length' <<< "$model") || fail "permissions: menu inventory has no length"
+    for ((step = 0; step <= steps; step++)); do
+        cursor=$(ipc contextMenuCursor)
+        [[ "$cursor" == "$target" ]] && break
+        if (( cursor > target )); then key -k Up >/dev/null; else key -k Down >/dev/null; fi
+        settle
+    done
+    [[ "$cursor" == "$target" ]] || fail "permissions: menu cursor stalled at $cursor, short of row $target"
+    centre=$(ipc contextMenuRowCentre "$index")
+    # Sample input: 640 120 220 480 (contextMenuRect x y width height); a centre below the frame is a clipped row, and a click there closes the menu.
+    read -r cx cy <<< "$centre"
+    read -r fx fy fw fh <<< "$(ipc contextMenuRect)"
+    [[ "$fx $fy $fw $fh" =~ ^-?[0-9]+(\ -?[0-9]+){3}$ && "$cx" =~ ^[0-9]+$ && "$cy" =~ ^[0-9]+$ ]] || fail "permissions: menu row $index has no centre or the menu has no frame"
+    (( cx >= fx && cx < fx + fw && cy >= fy && cy < fy + fh )) || fail "permissions: menu row $index centre $cx,$cy is clipped outside the menu frame $fx,$fy,$fw,$fh"
+    permissions_point "$centre"
 }
 
 permissions_control() {
     local name="$1" centre
     centre=$(ipc permissionsState | jq -er --arg name "$name" '.controls[] | select(.name == $name and .visible) | .centre') \
         || fail "permissions: no visible $name control"
+    local permissions_target="$name"
     permissions_point "$centre"
 }
 
 permissions_viewport() {
     local target_width="${1:-1100}" target_height="${2:-800}"
-    local client address result wx wy width height end=$((SECONDS + 20))
+    local client address result wx wy width height scene end=$((SECONDS + 20))
     client=$(hyprctl clients -j | jq -ec --argjson pid "$(flea_pid)" '.[] | select(.pid == $pid)') \
         || fail "permissions: owned window unavailable"
     address=$(jq -er '.address' <<< "$client") || fail "permissions: owned window has no address"
@@ -72,10 +101,14 @@ permissions_viewport() {
     omarchy-drive window center "$address" || fail "permissions: owned window could not center"
     while (( SECONDS < end )); do
         read -r wx wy width height < <(window_box) || fail "native window coordinates unavailable"
-        [[ "$width" == "$target_width" && "$height" == "$target_height" ]] && return
+        if [[ "$width" == "$target_width" && "$height" == "$target_height" ]]; then
+            # Dialogs centre in the QML scene, so wait for the client to report the size hyprctl already shows.
+            scene=$(ipc windowSize 2>/dev/null) || scene=unavailable
+            [[ "$scene" == "$target_width $target_height" ]] && return
+        fi
         sleep 0.05
     done
-    fail "permissions: viewport did not reach ${target_width}x${target_height}"
+    fail "permissions: viewport did not reach ${target_width}x${target_height}: hyprctl ${width}x${height} at $wx,$wy, QML scene ${scene:-unread}"
 }
 
 permissions_setup() {
@@ -123,7 +156,7 @@ permissions_open() {
     ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled != true)' >/dev/null \
         || fail "permissions: single-item menu entry is missing or disabled"
     target=$(menu_row_index Permissions) || fail "permissions: no native Permissions row"
-    if [[ "$entry" == pointer ]]; then permissions_point "$(ipc contextMenuRowCentre "$target")"
+    if [[ "$entry" == pointer ]]; then permissions_menu_point "$target"
     else menu_seek Permissions; key -k Return >/dev/null; fi
     permissions_wait '.opened and (.busy == false)' "native $entry Permissions entry for $name"
     target=$(jq -cn --arg path "$permissions_listing/$name" '$path')
@@ -215,7 +248,7 @@ permissions_directory() {
     permissions_open site
     shot "permissions-$permissions_group-directory-baseline"
     permissions_wait '.facts.directory and .editable and ([.controls[] | select(.bit == 64 or .bit == 8 or .bit == 1) | .name] == ["Owner enter","Group enter","Everyone enter"])' 'directory traversal bits are labelled enter'
-    permissions_wait '.displayedSummary | contains("Scope this directory only") and contains("enclosed items unchanged") and contains("ownership unchanged")' 'directory summary excludes descendants and ownership'
+    permissions_wait '.displayedSummary | contains("Scope this folder only") and contains("enclosed items unchanged") and contains("ownership unchanged")' 'directory summary excludes descendants and ownership'
     permissions_mode 0755
     permissions_octal 0700
     permissions_apply "$permissions_listing/site" 700
@@ -257,7 +290,7 @@ permissions_readonly_controls() {
     permissions_wait '.opened and (.busy == false)' 'disabled Apply leaves dialog open'
     [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$path")" == "$before" ]] \
         || fail "permissions: read-only controls changed the item"
-    permissions_wait ".displayedSummary | contains(\"Current mode $mode\") and contains(\"No changes available\")" 'read-only summary reports the retained current mode'
+    permissions_wait ".displayedSummary | contains(\"Current mode $mode\") and contains(\"No changes to apply\")" 'read-only summary reports the retained current mode'
     permissions_wait 'any(.controls[]; .name == "Cancel" and .focused)' 'disabled controls do not steal initial Cancel focus'
     key -k Tab >/dev/null
     permissions_wait 'any(.controls[]; .name == "Close" and .focused)' 'read-only Tab reaches Close'
@@ -478,11 +511,11 @@ permissions_eligibility() {
             || fail "permissions: regular-file selection has no enabled Permissions row"
         index=$(menu_row_index Permissions) || fail "permissions: no batch Permissions row"
         if [[ "$dismissal" == Escape ]]; then menu_seek Permissions; key -k Return >/dev/null
-        else permissions_point "$(ipc contextMenuRowCentre "$index")"; fi
+        else permissions_menu_point "$index"; fi
         permissions_wait ".opened and (.busy == false) and .editable and .title == \"Permissions for $batch_count items\" and (.paths | sort) == $quoted_paths" 'batch card reviews both files with the exact title'
         permissions_wait 'any(.controls[]; .name == "Cancel" and .focused and .enabled)' 'batch opens with keyboard on Cancel'
         permissions_wait '[.controls[] | select(.bit != null) | .value] == ["on","on","some","on","off","some","on","off","some"]' 'batch grid shows all uniform and mixed boxes for 0644 and 0755'
-        permissions_wait '.displayedSummary | endswith("Mixed boxes keep each file\u0027s own bit unless you change them.")' 'batch displays the exact mixed-box note'
+        permissions_wait '.displayedSummary | endswith("Mixed boxes keep each item\u0027s setting unless you change them.")' 'batch displays the exact mixed-box note'
         permissions_wait 'all(.controls[] | select(.name == "Octal"); .visible == false) and any(.controls[]; .name == "Apply" and .visible and .enabled)' 'batch shows the grid without Octal and offers Apply'
         if [[ "$dismissal" == Cancel ]]; then shot "permissions-$permissions_group-multiselection"; fi
         permissions_control "Owner execute"
@@ -513,16 +546,21 @@ permissions_eligibility() {
         permissions_expect selectionCount "$batch_count"
     done
 
-    click_row "$first" left
+    # A click made while a re-read is out is refused as Loading, so it is repeated until one lands; a click made before the re-read keeps its mark.
+    for permissions_try in 1 2 3 4 5 6 7 8; do
+        click_row "$first" left
+        sleep 0.5
+        [[ "$(ipc selectionCount)" == 1 ]] && break
+    done
     permissions_expect selectionCount 1
     click_row "$(row_index_of link)" left --mods ctrl
     permissions_expect selectionCount "$batch_count"
     click_row "$first" right
     permissions_expect contextMenuVisible true
-    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == null)' >/dev/null \
-        || fail "permissions: file-plus-symlink selection does not read red with no sentence"
+    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' >/dev/null \
+        || fail "permissions: file-plus-symlink selection does not read red with the word symlink"
     index=$(menu_row_index Permissions) || fail "permissions: no refused batch Permissions row"
-    permissions_point "$(ipc contextMenuRowCentre "$index")"
+    permissions_menu_point "$index"
     permissions_wait '(.opened == false)' 'file-plus-symlink pointer activation cannot open Permissions'
     permissions_expect selectionCount "$batch_count"
     key -k Escape >/dev/null
@@ -532,11 +570,11 @@ permissions_eligibility() {
     before=$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")
     click_row "$(row_index_of link)" right
     permissions_expect contextMenuVisible true
-    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == null)' >/dev/null \
-        || fail "permissions: symlink entry does not read red with no sentence"
+    ipc contextMenuModel | jq -e 'any(.[]; .action == "permissions" and .disabled and .errored and .hint == "symlink")' >/dev/null \
+        || fail "permissions: symlink entry does not read red with the word symlink"
     shot "permissions-$permissions_group-symlink"
     index=$(menu_row_index Permissions)
-    permissions_point "$(ipc contextMenuRowCentre "$index")"
+    permissions_menu_point "$index"
     permissions_wait '(.opened == false)' 'symlink pointer activation cannot open Permissions'
     [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$permissions_listing/notes.md")" == "$before" ]] || fail "permissions: symlink eligibility changed target"
     key -k Escape >/dev/null
@@ -568,7 +606,7 @@ permissions_search() {
     click_row "$first" right
     permissions_expect contextMenuVisible true
     index=$(menu_row_index Permissions) || fail "permissions: no Permissions row on the Search results"
-    permissions_point "$(ipc contextMenuRowCentre "$index")"
+    permissions_menu_point "$index"
     permissions_wait ".opened and (.busy == false) and .editable and .title == \"Permissions for $batch_count items\" and (.paths | sort) == $quoted_paths" 'Search results open the batch card with both marked files'
     cursor=$(ipc cursor)
     scroll=$(ipc listContentY)
@@ -724,7 +762,7 @@ PY
         permissions_octal "$wanted"
         permissions_wait '.editable and any(.controls[]; .name == "Apply" and .enabled)' 'owned read-only mount reaches normal Apply'
         permissions_control Apply
-        permissions_wait ".opened and (.busy == false) and .editable and .mode == \"$wanted\" and .displayedError == \"Could not change mode: filesystem is read-only. No change was applied.\"" 'real kernel refusal retains editable fields and reports one sentence'
+        permissions_wait ".opened and (.busy == false) and .editable and .mode == \"$wanted\" and .displayedError == \"Could not change mode: the drive is read-only. No change was applied.\"" 'real kernel refusal retains editable fields and reports one sentence'
         [[ "$(stat -c '%d:%i:%u:%g:%a:%s' "$PERMISSIONS_BIND_FILE")" == "$before" \
             && "$(sha256sum < "$PERMISSIONS_BIND_FILE")" == "$contents" ]] || fail "permissions: refused mode write changed the fixture"
         shot "permissions-$permissions_group-erofs-$wanted"
@@ -817,9 +855,9 @@ permissions_backenddeath() {
         permissions_stopped=""
         trap - EXIT
         if [[ "$phase" == applying ]]; then
-            expected='(.displayedError | contains("outcome is unknown") and contains("check the current mode"))'
+            expected='(.displayedError | contains("may not have finished") and contains("reopen Permissions to check"))'
         else
-            expected='(.displayedError | contains("Permissions is unavailable") and contains("restart Flea"))'
+            expected='(.displayedError | contains("Permissions is unavailable") and contains("Restart Flea"))'
         fi
         permissions_wait ".opened and (.busy == false) and (.editable == false) and .mode == \"$wanted\" and $expected" "$phase backend death retains the draft and reports the actual failure"
         permissions_wait 'all(.controls[] | select(.bit != null or .name == "Octal" or .name == "Apply"); .enabled == false)' 'lost descriptor disables every mutation control'

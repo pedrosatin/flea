@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 use std::sync::OnceLock;
+use super::scan::{S_IFMT, S_IFREG};
 
 // One gio row's figures in 24 bytes, keyed by its span's name offset, which every sort carries along.
 #[derive(Clone, Copy, Debug)]
@@ -86,6 +87,13 @@ impl Listing {
         self.gio_targets.binary_search_by_key(&name_off, |t| t.name_off).ok().map(|at| self.gio_targets[at].target.as_str()).unwrap_or("")
     }
 
+    // The first row that is a plain file, never a folder, symlink or special file a gvfs row names by its mode.
+    pub fn first_plain_file(&self) -> Option<&str> {
+        (0..self.len())
+            .find(|&i| !self.spans[i].is_dir && !self.spans[i].is_symlink && self.gio_for(i).map_or(true, |m| m.mode & S_IFMT == S_IFREG))
+            .map(|i| self.name(i))
+    }
+
     pub fn len(&self) -> usize {
         self.spans.len()
     }
@@ -94,6 +102,15 @@ impl Listing {
     pub fn index_of(&self, base: &Path, path: &Path) -> Option<usize> {
         let name = relative_name(base, path)?;
         (0..self.len()).find(|&index| self.name(index) == name)
+    }
+
+    // Where a list's first window starts: row 0, unless the row to select sorts past that window, which then holds it near its middle.
+    // Sample input: on 668 rows with first 330, "/d/north-300.txt" at row 667 answers 338 and a name at row 167 answers 0.
+    pub fn first_start(&self, base: &Path, select: Option<&str>, first: usize) -> usize {
+        match select.and_then(|path| self.index_of(base, Path::new(path))) {
+            Some(at) if first > 0 && at >= first => at.saturating_sub(first / 2).min(self.len() - first),
+            _ => 0,
+        }
     }
 
     pub fn indices_of<'a>(&self, base: &Path, paths: &'a [String]) -> Vec<(&'a str, usize)> {
@@ -181,6 +198,22 @@ mod tests {
     }
 
     #[test]
+    fn the_first_plain_file_skips_folders_symlinks_and_special_files() {
+        let mut l = Listing::new();
+        l.push("bin", true);
+        l.push("pipe", false);
+        l.push("link", false);
+        l.spans[2].is_symlink = true;
+        l.push("notes.txt", false);
+        l.gio_meta.push(GioMeta { name_off: l.spans[1].off, mode: 0o10644, size: 0, mtime: 0 });
+        l.gio_meta.push(GioMeta { name_off: l.spans[3].off, mode: 0o100644, size: 3, mtime: 0 });
+        assert_eq!(l.first_plain_file(), Some("notes.txt"));
+        let mut folders = Listing::new();
+        folders.push("only", true);
+        assert_eq!(folders.first_plain_file(), None, "a folder of folders has no file to open");
+    }
+
+    #[test]
     fn a_new_listing_is_empty() {
         let l = Listing::new();
         assert_eq!(l.len(), 0);
@@ -199,6 +232,24 @@ mod tests {
             assert_eq!(listing.index_of(base, Path::new(path)), None, "{path}");
         }
         assert_eq!(listing.index_of(Path::new(""), Path::new("/first.txt")), None);
+    }
+
+    #[test]
+    fn a_select_past_the_first_window_moves_the_window_onto_it() {
+        let base = Path::new("/d");
+        let mut listing = Listing::new();
+        for i in 0..668 { listing.push(&format!("row-{i:03}"), false); }
+        assert_eq!(listing.first_start(base, None, 330), 0);
+        assert_eq!(listing.first_start(base, Some("/d/row-167"), 330), 0, "a row inside the first window keeps row 0");
+        assert_eq!(listing.first_start(base, Some("/d/row-329"), 330), 0);
+        assert_eq!(listing.first_start(base, Some("/d/row-330"), 330), 165, "the first row past it sits mid-window");
+        assert_eq!(listing.first_start(base, Some("/d/row-400"), 330), 235);
+        assert_eq!(listing.first_start(base, Some("/d/row-667"), 330), 338, "the last row clamps to a full window");
+        for path in ["/d/missing", "/e/row-400", "row-400", ""] {
+            assert_eq!(listing.first_start(base, Some(path), 330), 0, "{path}");
+        }
+        assert_eq!(listing.first_start(base, Some("/d/row-400"), 0), 0, "a list asking no rows starts nowhere else");
+        assert_eq!(listing.first_start(base, Some("/d/row-400"), 1), 400);
     }
 
     #[test]

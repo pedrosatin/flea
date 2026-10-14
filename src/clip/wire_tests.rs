@@ -17,9 +17,7 @@ fn a_string_round_trips_with_its_padding() {
 
 #[test]
 fn a_null_string_is_a_zero_length_and_reads_as_empty() {
-    let mut out = Vec::new();
-    put_null_string(&mut out);
-    assert_eq!(out, vec![0, 0, 0, 0]);
+    let out = vec![0, 0, 0, 0];
     let mut at = 0;
     assert_eq!(get_string(&out, &mut at).as_deref(), Some(""));
 }
@@ -84,6 +82,17 @@ fn five_and_twenty_eight_descriptors_arrive_whole_in_one_sendmsg() {
             assert_eq!((m.dev(), m.ino()), (*dev, *ino));
         }
     }
+}
+
+#[test]
+fn the_socket_path_prefers_an_absolute_display() {
+    use std::ffi::OsString;
+    let name = |v: &str| Some(OsString::from(v));
+    assert_eq!(socket_path_in(name("/tmp/abs-wayland-0"), None).unwrap(), std::path::PathBuf::from("/tmp/abs-wayland-0"));
+    assert_eq!(socket_path_in(name("/tmp/abs-wayland-0"), name("/run/user/7")).unwrap(), std::path::PathBuf::from("/tmp/abs-wayland-0"));
+    assert_eq!(socket_path_in(name("wayland-0"), name("/run/user/7")).unwrap(), std::path::PathBuf::from("/run/user/7/wayland-0"));
+    assert_eq!(socket_path_in(name("wayland-0"), None).unwrap_err(), "XDG_RUNTIME_DIR is not set, so the display socket cannot be found");
+    assert_eq!(socket_path_in(None, name("/run/user/7")).unwrap_err(), "WAYLAND_DISPLAY is not set, so there is no clipboard to use");
 }
 
 #[test]

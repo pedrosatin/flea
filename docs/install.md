@@ -80,6 +80,8 @@ uncommitted edits are what gets packaged.
 | `/usr/share/dbus-1/services/com.thisisgm.flea.FileManager1.service` | what D-Bus activates that with |
 | `/usr/share/xdg-desktop-portal/portals/flea.portal` | what registers that backend with xdg-desktop-portal |
 | `/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.flea.service` | what D-Bus activates it with |
+| `/usr/lib/flea/flea-gio-auth` | the mount helper, which answers one GIO mount password prompt |
+| `/usr/lib/flea/flea-udisks` | the udisks helper, which the flasher runs to write an image to a drive |
 | `/usr/share/applications/com.thisisgm.flea.desktop` | the desktop entry |
 | `/usr/share/icons/hicolor/scalable/apps/com.thisisgm.flea.svg` | the icon |
 | `/usr/share/libalpm/hooks/flea.hook` | the removal note, which prints the per-user undo commands below |
@@ -90,6 +92,20 @@ whenever a component is added, so a figure pinned in this paragraph would be sta
 `packaging/flea-package-test` reads the count out of the archive and fails if the fake root does not
 hold exactly that many. The two symlinks are why `omarchy` is a hard dependency: they point into a
 directory that package owns.
+
+## An iPhone's tethering connection
+
+Pairing an iPhone also switches it to its tethering USB configuration, so iOS shows Personal Hotspot
+as active while it is plugged in; Flea does not use that connection. To keep this machine from routing
+through the phone, tell NetworkManager, which Omarchy runs, to leave that interface alone, for example in
+`/etc/NetworkManager/conf.d/90-ipheth-unmanaged.conf`:
+
+```ini
+[keyfile]
+unmanaged-devices=driver:ipheth
+```
+
+Then run `sudo systemctl restart NetworkManager`.
 
 ## Uninstall
 
@@ -192,7 +208,7 @@ take one to name which program and here the program is Flea. The files it writes
    **This step is the skipped-not-failed one, and no other step is.** It needs
    `flea.portal`, which only the package installs. Run a binary you built with `cargo build` on a
    box whose installed package predates the chooser, which is every box updating from 0.1.3, and
-   the command prints `flea: no portal backend is installed, so the file chooser step was skipped`
+   the command prints `flea: no file chooser service is installed, so Flea could not become the file chooser`
    and carries on. On such a box the honest-about-state line above is a claim about the steps that
    ran alone: the chooser was never claimed, so a second run cannot say it is already Flea's. That
    box has no packaged `com.thisisgm.flea.FileManager1.service` either, and step 2 says so and fails

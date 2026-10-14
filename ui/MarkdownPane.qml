@@ -30,17 +30,13 @@ Item {
     readonly property string status: doc.status
     readonly property string lineLabel: doc.lineLabel
     // The view the body draws, which Quick Look's IPC reads rather than the property that asks for it.
-    readonly property string shownView: doc.view
+    readonly property string shownView: doc.shownView
     // Quick Look's seam reads figures through this pane, so it forwards the document's blocks.
     readonly property var blockList: doc.blockList
     function figureInfo(i) { return doc.figureInfo(i) }
     function blockItem(i) { return doc.blockItem(i) }
     readonly property bool contentReady: doc.contentReady
     readonly property bool firstScreen: doc.firstScreen
-    readonly property bool loading: doc.loading
-    readonly property bool blank: doc.blank
-    // The page is the chrome surface, so code sits on the window colour (md_rendered code_bg).
-    readonly property color codeSurface: doc.codeSurface
 
     // The render suite reads the bar's order off these rects, the way PdfViewer.buttonFor opens its buttons.
     function barGeometry() {
@@ -66,12 +62,12 @@ Item {
             opacity: bar.ruleOpacity
         }
 
-        // The Markdown mark of the LanguageMarks set, in foreground like the PDF viewer's kind mark.
+        // The Markdown mark of the LanguageMarks set, in foreground and centred above the rule like the PDF viewer's kind mark.
         Flea.Glyph {
             id: barMark
             anchors.left: parent.left
             anchors.leftMargin: Theme.spacing.rowPaddingX
-            anchors.verticalCenter: parent.verticalCenter
+            y: Math.round((parent.height - Theme.spacing.hairline - height) / 2)
             width: Theme.chromeMarkSize
             height: Theme.chromeMarkSize
             name: "markdown"
@@ -133,6 +129,7 @@ Item {
         truncate: root.truncate
         blockPath: root.blockPath
         shareParse: true
+        // The page is the chrome surface, so code sits on the window colour (md_rendered code_bg).
         codeSurface: Theme.color.background
     }
 }

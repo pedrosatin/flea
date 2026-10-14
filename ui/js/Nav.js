@@ -6,56 +6,43 @@
 .import "Thumbs.js" as Thumbs
 .import "Search.js" as Search
 .import "ColumnMenu.js" as ColumnMenu
+.import "BackReturn.js" as BackReturn
 .import "Anchor.js" as Anchor
 .import "MouseNav.js" as MouseNav
+.import "Swap.js" as Swap
 
 // Where the pane has been and how it gets back, taking ui/Pane.qml's root the way Search.js and
 // Ops.js do: the pane holds the state, this holds what the state does.
 
-// A new destination discards the forward branch; refreshing the same directory preserves it.
+// A listing inside its deadline refuses a row action; a waiting one is let go by the navigation itself, see ui/Pane.qml openWithoutHistory.
+function loading(pane) { return pane.listInFlight && pane.listingState !== "waiting" }
+
+// While a listing is out, the folder it asked for is the pane's current place for every navigation, and the drawn path only until its answer lands.
+function place(pane) { return pane.listInFlight && !!pane.listingPath ? pane.listingPath : pane.path }
+
+// A new destination discards the forward branch and pushes the drawn place unless the listing out already did; a re-read keeps both.
 function open(pane, newPath) {
-    // The guard runs before the push for the same reason back()'s runs before the pop: the listing
-    // is refused while one is loading, and by then the entry pushed was a duplicate of the directory
-    // the pane never left, which the next back press then went "back" to.
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
-    }
-    if (pane.path.length > 0 && newPath !== pane.path) {
-        pane.history = pane.history.concat([pane.path])
+    if (place(pane).length > 0 && newPath !== place(pane)) {
+        if (!BackReturn.pending(pane))
+            pane.history = pane.history.concat([BackReturn.capture(pane)])
+        // A Back out pushed the drawn place onto the forward branch cleared below, so history takes it instead.
+        else if (BackReturn.pushedOnto(pane) === "forwardHistory")
+            pane.history = pane.history.concat([BackReturn.drawn(pane)])
         pane.forwardHistory = []
     }
-    pane.openWithoutHistory(newPath)
+    pane.openWithoutHistory(newPath, { supersede: true })
 }
 
 function back(pane) {
     if (pane.history.length === 0) {
         return
     }
-    // The guard runs before the pop and not only inside openWithoutHistory: that call refuses the
-    // listing while one is loading, and the entry was already gone by then, so a back taken during
-    // a listing threw the place away and went nowhere. parent() below guards the same way.
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
-    }
-    var target = pane.history[pane.history.length - 1]
-    pane.forwardHistory = (pane.forwardHistory || []).concat([pane.path])
-    // The pop happens before the open, because open() is what would otherwise push it straight back on.
-    pane.history = pane.history.slice(0, pane.history.length - 1)
-    pane.openWithoutHistory(target)
+    BackReturn.travel(pane, "history", "forwardHistory")
 }
 
 function forward(pane) {
     if (!pane.forwardHistory || pane.forwardHistory.length === 0) return
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
-    }
-    var target = pane.forwardHistory[pane.forwardHistory.length - 1]
-    pane.history = pane.history.concat([pane.path])
-    pane.forwardHistory = pane.forwardHistory.slice(0, -1)
-    pane.openWithoutHistory(target)
+    BackReturn.travel(pane, "forwardHistory", "history")
 }
 
 // The mouse back button follows history, or climbs when no history exists.
@@ -75,9 +62,16 @@ function mouseBack(pane) {
 // tab switches, Back, Up, rail clicks and jumps all funnel through here.
 function openWithoutHistory(pane, newPath, options) {
     Anchor.clearWaiting(pane)
+    var ask = options || {}
     if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
+        // Only a navigation takes the place of a listing out; a re-list of the folder shown must not undo it.
+        if (ask.supersede !== true) {
+            pane.message("A directory is already loading.", false)
+            return
+        }
+        // The listing let go answers into nothing: its listed line names another folder and its rows follow it, see ui/js/Swap.js onListed.
+        pane.swap.stopWaiting()
+        BackReturn.dropOwed(pane)
     }
     // A hop elsewhere drops a waiting background menu, while the armed hop keeps its own request.
     if (pane.pendingBackground && pane.pendingBackground.length > 0 && !ColumnMenu.samePath(newPath, pane.pendingBackground))
@@ -85,6 +79,10 @@ function openWithoutHistory(pane, newPath, options) {
     Search.leaveWalk(pane)
     pane.listInFlight = true
     pane.listedSeen = false
+    // A hop into another view clears at once like a tab switch, so held rows never draw in a view they were not listed in.
+    var shown = pane.viewMode
+    if (pane.restoreView)
+        pane.restoreView(newPath)
     // A manual reload's notice belongs to its own re-read: a navigation that lands first spends it.
     pane.reloadFrom = -1
     // The path is not written here. A refused listing never answers a listed line, so leaving the
@@ -94,24 +92,39 @@ function openWithoutHistory(pane, newPath, options) {
     // the directory being left; ui/Pane.qml dropPath reads it and only while this listing is out.
     if (newPath !== pane.path) pane.linkTargetPendingId = 0 // A waiting Show original belongs to the listing being left, so leaving it drops the reveal.
     pane.listingPath = newPath
-    // The class below is the directory being left until fsinfo answers for this one, and a
-    // settle firing in between would spend it; a re-read of the same path keeps its class.
-    if (newPath !== pane.path) { pane.storageClass = ""; pane.storageKnown = false }
-    var ask = options || {}
-    // A settled listing stays drawn until the new rows land, see AGENTS.md "The listing swap".
-    if (!pane.swap.hold(ask))
-        forget(pane, ask.keptQuery)
+    // Verdicts stay the left directory's until fsinfo answers, so re-read keeps them.
+    if (newPath !== pane.path) { pane.storageClass = ""; pane.storageKnown = false; pane.fsAnswered = false; pane.systemVolume = false; pane.canTag = false }
+    if (pane.viewMode !== shown) ask.clearAtOnce = true
+    // A walk closed above keeps its rows and its strip until this listing lands.
+    if (pane.searchLeaving === true) ask.holdWalk = true
     // A filter line held with its rows gives up the caret, so keys typed meanwhile meet the gate, not a query the swap forgets.
-    else if (pane.filterTyping)
+    if (holdOrForget(pane, ask, ask.keptQuery) && pane.filterTyping)
         Filter.commit(pane)
     pane.appliedListingPreferences = pane.listingPreferences
-    pane.backend.list(newPath, pane.windowSize, pane.showHidden, ask.wantChanged === true)
+    // leaveWalk above has closed or is closing any search, so the armed row is this listing's to find; a path in another folder names none.
+    pane.backend.list(newPath, pane.windowSize, pane.showHidden, ask.wantChanged === true, pane.pendingSelect)
     // One statfs per directory, not per row: the bar's right half only changes when the pane moves.
     pane.backend.askFsInfo()
 }
 
+// A settled listing stays drawn until the new rows land, see AGENTS.md "The listing swap"; true when held, else forgotten at once, and a fallen-back loading mark stays through the newest request.
+function holdOrForget(pane, ask, keptQuery) {
+    var fell = pane.swap.fellBack === true
+    var held = pane.swap.hold(ask)
+    if (!held) {
+        forget(pane, keptQuery)
+        if (fell) pane.swap.phase = Swap.expired(pane.swap.phase)
+    }
+    return held
+}
+
 // Everything a fresh listing forgets, written once: at the request, or by ui/PaneSwap.qml when held rows go.
 function forget(pane, keptQuery) {
+    // An exit landing clears the drawn search state in the same turn its rows do.
+    if (pane.searchLeaving === true) Search.closeLeaving(pane)
+    // The editor row and the held sort belong to the replaced listing, so both go with it, before the count drops.
+    pane.pendingSort = null
+    pane.renamingIndex = -1
     pane.total = 0
     pane.held = 0
     pane.rows = []
@@ -120,9 +133,6 @@ function forget(pane, keptQuery) {
     pane.dirSizeState = DirSizes.empty()
     pane.cursorIndex = 0
     pane.trashArmedAt = 0
-    // The editor row and the held sort belong to the replaced listing, so both go with it.
-    pane.pendingSort = null
-    pane.renamingIndex = -1
     // A re-list puts a different file at that index, so the tap record goes with the rename.
     if (pane.cancelSlowClick) pane.cancelSlowClick()
     // A filter narrows the rows already listed, so a new listing forgets it unless ui/js/Anchor.js hands it back.
@@ -168,10 +178,10 @@ function refresh(pane, selectPath, keepSelection) {
     pane.openWithoutHistory(pane.path, { inPlace: true })
 }
 
-// Only the first rows response looks for the target, then it is forgotten either way, so a later
-// directory change never re-reveals it; the target matches by listed name, so NFC finds NFD.
+// The list request names the target, so its first rows answer alone looks for it at any depth, by listed name (NFC finds NFD).
 function applyPendingSelect(pane) {
-    if (pane.pendingSelect.length === 0) {
+    // A search arms its return while the query stands, so its own landings skip it until Esc.
+    if (pane.pendingSelect.length === 0 || (pane.searchMode || "").length > 0) {
         return
     }
     var target = pane.pendingSelect
@@ -199,34 +209,49 @@ function clearPendingBackground(pane) { ColumnMenu.clearPendingBackground(pane) 
 // The deferred neighbour background, consumed on every landing by identity.
 function applyPendingBackground(pane) { ColumnMenu.applyPendingBackground(pane) }
 
-// Enter on the cursor row: a directory navigates, an archive opens Flea's own view, anything else
-// goes to the opener. The in-flight guard is what stops a second Enter queueing a second listing.
-function openCursor(pane, opener) {
-    if (pane.listInFlight) {
+// The cursor row once Enter's three guards pass, else null with the reason shown; the in-flight guard stops a second Enter queueing a second listing.
+function openableRow(pane) {
+    if (loading(pane)) {
         pane.message("A directory is already loading.", false)
-        return
+        return null
     }
     var row = pane.rowFor(pane.cursorIndex)
     if (!row) {
         pane.message("That row has not loaded yet.", false)
-        return
+        return null
     }
     if (!Filter.cursorShown(pane)) {
         pane.message("That row is hidden by the filter.", false)
-        return
+        return null
     }
-    var path = pane.join(pane.path, row.n)
+    return row
+}
+
+// Enter on the cursor row: a directory navigates, an archive opens Flea's own view, anything else goes to the opener.
+function openCursor(pane, opener) {
+    var row = openableRow(pane)
+    if (!row) return
+    var path = pane.join(Search.baseOf(pane), row.n)
     if (row.d) {
         pane.open(path)
         return
     }
-    // Handing an archive on opens another file manager, and this is ui/Preview.qml's own classifier.
-    if (Kinds.quickLookKind(row.i, path) === Kinds.ARCHIVE) {
+    // Handing an archive on opens another file manager, and this is ui/Preview.qml's own classifier; an AppImage is a program first, so it asks on the run card.
+    if (Kinds.quickLookKind(row.i, path) === Kinds.ARCHIVE && !/\.appimage$/i.test(row.n)) {
         pane.quickLook().open(path, row.i, row.s, pane.kindNames[row.k] || "",
             pane.thumbState && pane.thumbState.file ? Thumbs.fileFor(pane.thumbState, pane.cursorIndex) : "")
         return
     }
     opener.open(path)
+}
+
+// The run card's entrances always reach the opener, so Run asks through flea --open like Enter does.
+function runCursor(pane, opener, verb) {
+    var row = openableRow(pane)
+    if (!row) return
+    var path = pane.join(Search.baseOf(pane), row.n)
+    if (verb === "open") opener.open(path)
+    else pane.runText(path)
 }
 
 // The folder the Locked tile names, for its own menu and every row that menu offers: the
@@ -257,17 +282,14 @@ function leafOf(path) {
     return cut < 0 || cut === text.length - 1 ? text : text.substring(cut + 1)
 }
 
-// Backspace, h, and the chrome's up arrow. The root has no parent, so it is where climbing stops.
-// pendingSelect is the directory being left, so the parent listing puts the cursor on it rather than
-// on its first row; applyPendingSelect reads the window the listing answered with, so a child
-// sorted past that first screenful is not found and the cursor stays where a climb always left it.
+// Issue 193: a hop that is out, refused or waiting climbs from the folder it asked for; ui/Pane.qml canGoUp reads it too.
+function climbsFromListing(pane) {
+    return (pane.listInFlight || pane.listingState === "locked" || pane.listingState === "waiting") && !!pane.listingPath && pane.listingPath !== pane.path
+}
+
+// Backspace, h and the chrome's up arrow, stopping at the root; the parent lands on the directory left, at any depth.
 function parent(pane) {
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return
-    }
-    // Issue 193: a refused hop climbs from the folder it asked for, trailing slash trimmed, selecting the refused row.
-    if (pane.listingState === "locked" && pane.listingPath !== pane.path) {
+    if (climbsFromListing(pane)) {
         pane.pendingSelect = trimSlash(pane.listingPath)
         pane.open(parentOf(pane.listingPath))
         return

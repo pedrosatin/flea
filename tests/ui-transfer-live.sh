@@ -123,17 +123,50 @@ transferlive_seconds() {
     esac
 }
 
-# Every exit path: stop any payload writer, drain the window, drop the private bus, and delete every payload byte.
+# Each y starts a detached flea --clip-own (src/clip/own.rs spawn_owner) that holds the selection until a newer copy cancels it, so kill_flea never drains it.
+transferlive_stop_owners() {
+    local pid pids result=0 deadline=$((SECONDS + drain_wait_s))
+    local -a owned=() alive=()
+    pids=$(pgrep -x flea) || result=$?
+    (( result <= 1 )) || return 1
+    for pid in $pids; do
+        # Sample cmdline: "/usr/bin/flea\0--clip-own\0", which tr reads as "/usr/bin/flea --clip-own ".
+        [[ "$(tr '\0' ' ' 2>/dev/null < "/proc/$pid/cmdline")" == *" --clip-own " ]] || continue
+        flea_process_owned "$pid" || continue
+        owned+=("$pid")
+        kill "$pid" 2>/dev/null || true
+    done
+    while (( ${#owned[@]} > 0 )); do
+        alive=()
+        for pid in "${owned[@]}"; do
+            if flea_process_owned "$pid"; then alive+=("$pid"); fi
+        done
+        owned=("${alive[@]}")
+        (( ${#owned[@]} > 0 )) || break
+        (( SECONDS < deadline )) || fail "transferlive: clipboard owner ${owned[*]} survived for $drain_wait_s s after SIGTERM"
+        sleep 0.05
+    done
+}
+
+# Every exit path: stop any payload writer, drain the window and its clipboard owners, drop the private bus, and delete every payload byte.
 transferlive_teardown() {
     local pid drained=1
     for pid in "${transferlive_writer_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
     for pid in "${transferlive_writer_pids[@]}"; do wait "$pid" 2>/dev/null || true; done
     transferlive_writer_pids=()
     ( kill_flea ) || drained=0
+    ( transferlive_stop_owners ) || drained=0
     if [[ -n "$transferlive_bus_pid" ]]; then kill "$transferlive_bus_pid" 2>/dev/null || true; fi
     transferlive_bus_pid=""
     if [[ -n "$transferlive_root" ]]; then sandbox_remove "$transferlive_root"; fi
-    (( drained )) || fail "transferlive: the window did not drain at teardown; the payload was deleted anyway"
+    (( drained )) || fail "transferlive: the window or a clipboard owner did not drain at teardown; the payload was deleted anyway"
+}
+
+# A diagnostic for a transfer that stalls: FLEA_TRANSFERLIVE_SYNC=1 waits for the fixture's own writeback before each launch.
+transferlive_sync() {
+    if [[ "${FLEA_TRANSFERLIVE_SYNC:-}" == 1 ]]; then
+        sync -f "$transferlive_root" || fail "transferlive: sync -f $transferlive_root failed"
+    fi
 }
 
 # Writes random bytes into each FILE MIB pair, several dd writers per file at their own offsets, and waits for all of them.
@@ -203,6 +236,7 @@ transferlive_prepare() {
     began=$(date +%s%3N)
     transferlive_fill "$payload/full.bin" "$mib" "$payload/half.bin" "$((mib / 2))"
     filled_ms=$(( $(date +%s%3N) - began ))
+    transferlive_sync
     [[ "$(stat -c %s "$payload/full.bin")" == "$transferlive_full_bytes" && "$(stat -c %s "$payload/half.bin")" == "$transferlive_half_bytes" ]] \
         || fail "transferlive: the payload files are not the sizes written: $(stat -c '%n %s' "$payload/full.bin" "$payload/half.bin")"
     printf 'TRANSFERLIVE_PAYLOAD full=%s (%s) half=%s (%s) random_fill_ms=%s writers_per_file=%s\n' \
@@ -261,11 +295,14 @@ transferlive_check_rate() {
     fi
     transferlive_harness_rate "$at" "$transferlive_rate_window_ms" || return 0
     low=$transferlive_harness_low high=$transferlive_harness_high spans=$transferlive_harness_span
-    if transferlive_harness_rate "$at" "$((transferlive_rate_window_ms + transferlive_rate_reach_ms))"; then
-        (( transferlive_harness_low >= low )) || low=$transferlive_harness_low
-        (( transferlive_harness_high <= high )) || high=$transferlive_harness_high
-        spans="$spans and $transferlive_harness_span"
+    # The card's window can start at the transfer's zero-byte first sample, which no reading matches, so judge only past it.
+    if ! transferlive_harness_rate "$at" "$((transferlive_rate_window_ms + transferlive_rate_reach_ms))"; then
+        transferlive_seen_rate_unproven=$((transferlive_seen_rate_unproven + 1))
+        return 0
     fi
+    (( transferlive_harness_low >= low )) || low=$transferlive_harness_low
+    (( transferlive_harness_high <= high )) || high=$transferlive_harness_high
+    spans="$spans and $transferlive_harness_span"
     if (( (speed + speed_slack) * transferlive_rate_band_percent < low * 100 || (speed - speed_slack) * 100 > high * transferlive_rate_band_percent )); then
         fail "transferlive: $leg: the card says $(transferlive_size "$speed")/s, the moved figure grew $(transferlive_size "$low")/s to $(transferlive_size "$high")/s over $spans ms: [$line]"
     fi
@@ -506,6 +543,7 @@ transferlive_one() {
     transferlive_holds "$dir/to" "big.bin"
     menus_same_file "one: the copy is byte-identical to its source" "$dir/big.bin" "$dir/to/big.bin"
     sandbox_remove "$dir"
+    transferlive_sync
 }
 
 # Leg two: three big files, one already in the destination, pasted with Skip; the batch total leaves the skipped one out.
@@ -537,7 +575,7 @@ transferlive_batch() {
     transferlive_enter_to "$dir" 1
     key p >/dev/null
     menus_expect collideState '.opened and .title == "b.bin already exists in to" and .names == ["b.bin"] and .more == ""
-        and .focus == "keep" and ([.buttons[].visible] | all)' "batch: the paste asks once about b.bin, on Keep both, with every button up"
+        and .focus == "keep" and ([.buttons[] | select(.name != "merge") | .visible] | all) and ([.buttons[] | select(.name == "merge") | .visible] == [false])' "batch: the paste asks once about b.bin, on Keep both, with every file button up and Merge hidden"
     key h >/dev/null
     menus_expect collideState '.opened and .focus == "skip"' "batch: h moves the focus to Skip"
     key -k Return >/dev/null
@@ -555,12 +593,15 @@ transferlive_batch() {
         menus_same_file "batch: $name is byte-identical to its source" "$dir/$name" "$dir/to/$name"
     done
     sandbox_remove "$dir"
+    transferlive_sync
 }
 
 # Leg three: one big file onto a name that exists, with Replace; the old item lands in this case's own Trash.
 transferlive_replace() {
-    local dir="$transferlive_root/replace" want
+    local dir="$transferlive_root/replace" want replace_trash
     sandbox_scratch "$dir"
+    # GLib trashes to the home store or the fixture mount's top trash by device.
+    replace_trash=$(sandbox_trash_files_dir "$dir") || fail "transferlive: replace: no GLib trash directory for $dir"
     mkdir "$dir/to" || fail "transferlive: replace: no destination folder"
     ln "$transferlive_root/payload/full.bin" "$dir/big.bin" || fail "transferlive: replace: the source could not be linked in"
     printf 'there\n' > "$dir/to/big.bin" || fail "transferlive: replace: the item to replace could not be written"
@@ -574,22 +615,28 @@ transferlive_replace() {
     transferlive_enter_to "$dir" 1
     key p >/dev/null
     menus_expect collideState '.opened and .title == "big.bin already exists in to" and .names == ["big.bin"] and .more == ""
-        and .focus == "keep" and ([.buttons[].visible] | all)' "replace: the paste asks about big.bin, on Keep both, with every button up"
+        and .focus == "keep" and ([.buttons[] | select(.name != "merge") | .visible] | all) and ([.buttons[] | select(.name == "merge") | .visible] == [false])' "replace: the paste asks about big.bin, on Keep both, with every file button up and Merge hidden"
     key l >/dev/null
     menus_expect collideState '.opened and .focus == "replace"' "replace: l moves the focus to Replace"
+    trash_trap_own "$replace_trash" "$dir" "transferlive: replace" big.bin
     key -k Return >/dev/null
     transferlive_watch replace "$want" 1 'big\.bin'
     transferlive_settled replace "Copied 1 item · z undoes"
     transferlive_sample_replace="[$transferlive_seen_first] [$transferlive_seen_last]"
     kill_flea
-    [[ "$(cat "$XDG_DATA_HOME/Trash/files/big.bin" 2>/dev/null)" == there ]] \
-        || fail "transferlive: replace: the replaced big.bin is not in this case's Trash: $(ls -A "$XDG_DATA_HOME/Trash/files" 2>&1)"
+    [[ "$(cat "$replace_trash/big.bin" 2>/dev/null)" == there ]] \
+        || fail "transferlive: replace: the replaced big.bin is not in $replace_trash: $(ls -A "$replace_trash" 2>&1)"
     transferlive_holds "$dir/to" "big.bin"
     menus_same_file "replace: the incoming big.bin is byte-identical to its source" "$dir/big.bin" "$dir/to/big.bin"
+    # A mount-top trash is shared, so only this run's own entry goes, each pair checked in the command.
+    if [[ "$replace_trash" != "$XDG_DATA_HOME/Trash/files" ]]; then
+        sandbox_trash_remove_own "$replace_trash" "$dir" big.bin \
+            || fail "transferlive: replace: owned entries could not be removed from $replace_trash"
+    fi
     sandbox_remove "$dir"
 }
 
-# Issue: GM asked that the transfer card be proven on a real copy, speed and time left included, and operationslive
+# Issue: the transfer card must be proven on a real copy, speed and time left included, and operationslive
 # misses its window because its 1 GiB sparse file copies before the harness looks. This case sizes a random payload
 # from a throughput sample taken on the fixture filesystem itself, then drives three pastes through the real
 # clipboard: one big file into an empty folder, a batch with Skip whose total must leave the skipped file out, and a

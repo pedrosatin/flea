@@ -14,6 +14,10 @@ pub enum Request {
     Search { path: String, query: String, hidden: bool },
     // Unlike thumbcancel there is no rows form: one walk runs at a time, so a cancel can only mean that one.
     SearchCancel,
+    // A live session: the scope walks once, each query answers from the index with its own generation.
+    SearchOpen { path: String, hidden: bool, folder: String },
+    SearchQuery { query: String, gen: usize, count: Option<usize>, sizes: Option<usize> },
+    SearchClose,
     // cacheOnly answers from the shared cache alone and never starts a decoder, for a
     // storage class whose switch is off; absent is today's full path, see docs/protocol.md "thumb".
     Thumb { rows: Vec<usize>, cache_only: bool },
@@ -24,11 +28,15 @@ pub enum Request {
     // The five write operations and their cancel, per the operations design's own wire.
     Transfer { op: String, paths: Vec<String>, rows: Vec<usize>, dest: String, menu_id: usize, shelf: String,
                collide: super::collide::Ask },
-    // Which incoming names dest already holds, asked before a transfer; see docs/protocol.md "collisions".
-    Collisions { id: usize, paths: Vec<String>, rows: Vec<usize>, dest: String, menu_id: usize },
+    // Which incoming names dest already holds, asked before a transfer, or after Merge for the folders it merges; see docs/protocol.md "collisions".
+    Collisions { id: usize, paths: Vec<String>, rows: Vec<usize>, dest: String, menu_id: usize, merge: bool, fat: Option<super::fatnames::Choice> },
+    // A clipboard image as a named file; see docs/protocol.md "pasteimage".
+    PasteImage(super::pasteimage::Ask),
     TransferCancel { id: usize },
     Trash { paths: Vec<String>, rows: Vec<usize>, menu_id: usize },
     Rename { path: String, to: String, menu_id: usize },
+    // Bulk rename: parallel paths and bare new names, validated whole before any rename.
+    BulkRename { paths: Vec<String>, names: Vec<String> },
     Duplicate { path: String, menu_id: usize },
     // One new empty directory inside parent path; an empty name asks for the first free "New Folder".
     MkDir { path: String, name: String },
@@ -44,14 +52,20 @@ pub enum Request {
     Meta { row: usize, text: bool, media: bool, archive: bool, token: usize },
     // The cursor row's two-byte shebang probe for the Make executable row; see docs/protocol.md "shebang".
     Shebang { path: String, id: usize },
+    // One tag change across rows of the listing in force: add, remove, toggle or clear.
+    SetTags { rows: Vec<usize>, op: String, tag: String },
+    // Which of Flea's seven tags those rows all carry or some carry, read only; see docs/protocol.md "tagstates".
+    TagStates { rows: Vec<usize>, id: usize },
     // The status bar's filesystem line for the directory the pane is on.
     FsInfo,
     // A read-only look at a directory that is not the current listing; the columns view's ancestors.
-    Peek { path: String, first: usize, hidden: bool, hidden_last: bool, focus: String, watch: bool, keep: Vec<String> },
+    Peek { path: String, first: usize, hidden: bool, hidden_last: bool, focus: String, watch: bool, keep: Vec<String>, by: Option<String>, desc: bool },
     // A PDF fetched into a session-private copy under a deadline, so a hung mount never freezes the window.
     PdfCopy { id: usize, slot: String, path: String },
     // op is "compress" or "extract"; a compress names paths and a format, an extract names one path.
-    Archive { op: String, paths: Vec<String>, path: String, dest: String, format: String, menu_id: usize },
+    // password travels this stdin wire and leaves it only on the tool's own stdin pipe, never in argv.
+    Archive { op: String, paths: Vec<String>, path: String, dest: String, format: String, menu_id: usize,
+              password: String, encrypt_names: bool },
     Convert { path: String, dest: String, strip: bool, menu_id: usize, request_id: usize, check: bool },
     // Which archive formats this box actually offers, and whether a converter is installed at all.
     Formats { id: usize },
@@ -71,6 +85,8 @@ pub enum Request {
     // Directive 71: op is "peers" for the flyout's own list and "send" for the transfer it chooses.
     LocalSend { op: String, peer: String, paths: Vec<String>, id: usize },
     TrashBrowse { line: String },
+    // The device of each path named, symlinks followed, for the drop verb of a target that is not the listing; see docs/protocol.md "devs".
+    Devs { paths: Vec<String> },
     // The path bar's folder jump: the favourites and recent files the client read, joined with zoxide's ranking.
     Jump { id: usize, ranking: usize, favourites: Vec<String>, recent: Vec<String> },
     // The system clipboard for files, owned across windows; see docs/protocol.md "clip".
@@ -78,6 +94,8 @@ pub enum Request {
     ClipGet,
     ClipClear { token: String, cut: Vec<String> },
     ClipWatch,
+    // The image flasher's backend; the five requests live in flash::Req beside their wire.
+    Flash(super::flash::Req),
     Quit,
     Unknown,
 }
@@ -134,6 +152,20 @@ pub fn parse_request(line: &str) -> Request {
             hidden: field_bool(line, "hidden"),
         },
         Some("searchcancel") => Request::SearchCancel,
+        Some("searchopen") => Request::SearchOpen {
+            path: field_str(line, "path").unwrap_or_default(),
+            hidden: field_bool(line, "hidden"),
+            folder: field_str(line, "folder").unwrap_or_default(),
+        },
+        Some("searchquery") => Request::SearchQuery {
+            query: field_str(line, "query").unwrap_or_default(),
+            // Absent is never newer, so a query without a generation answers nothing.
+            gen: field_usize(line, "gen").unwrap_or(0),
+            // Absent is the list's own first-window default, read where the answer is built.
+            count: field_usize(line, "count"),
+            sizes: field_usize(line, "sizes"),
+        },
+        Some("searchclose") => Request::SearchClose,
         Some("thumb") => Request::Thumb { rows: field_usize_array(line, "rows"),
             cache_only: field_bool(line, "cacheOnly") },
         Some("thumbcancel") => Request::ThumbCancel { rows: field_usize_array(line, "rows") },
@@ -152,13 +184,16 @@ pub fn parse_request(line: &str) -> Request {
             // Absent is today's refusal of an existing name, so an older client's transfer is unchanged.
             collide: super::collide::Ask::parse(line),
         },
-        Some("collisions") => Request::Collisions {
+        Some(word @ ("collisions" | "mergecollisions")) => Request::Collisions {
             id: field_usize(line, "id").unwrap_or(0),
             paths: field_str_array(line, "paths"),
             rows: field_usize_array(line, "rows"),
             dest: field_str(line, "dest").unwrap_or_default(),
             menu_id: field_usize(line, "menuId").unwrap_or(0),
+            merge: word == "mergecollisions",
+            fat: super::fatnames::Choice::parse(line),
         },
+        Some("pasteimage") => Request::PasteImage(super::pasteimage::Ask::parse(line)),
         Some(TRANSFER_CANCEL) => Request::TransferCancel { id: field_usize(line, "id").unwrap_or(0) },
         Some("trash") => Request::Trash {
             paths: field_str_array(line, "paths"),
@@ -169,6 +204,11 @@ pub fn parse_request(line: &str) -> Request {
             path: field_str(line, "path").unwrap_or_default(),
             to: field_str(line, "to").unwrap_or_default(),
             menu_id: field_usize(line, "menuId").unwrap_or(0),
+        },
+        // Sample input: {"c":"bulkrename","paths":["/d/a.txt","/d/b.txt"],"names":["b.txt","a.txt"]}
+        Some("bulkrename") => Request::BulkRename {
+            paths: field_str_array(line, "paths"),
+            names: field_str_array(line, "names"),
         },
         Some("duplicate") => Request::Duplicate { path: field_str(line, "path").unwrap_or_default(), menu_id: field_usize(line, "menuId").unwrap_or(0) },
         Some("mkdir") => Request::MkDir { path: field_str(line, "path").unwrap_or_default(), name: field_str(line, "name").unwrap_or_default() },
@@ -195,6 +235,9 @@ pub fn parse_request(line: &str) -> Request {
             path: field_str(line, "path").unwrap_or_default(),
             dest: field_str(line, "dest").unwrap_or_default(),
             format: field_str(line, "format").unwrap_or_default(),
+            // Absent is no password, so every older client keeps today's path.
+            password: field_str(line, "password").unwrap_or_default(),
+            encrypt_names: field_bool(line, "encryptNames"),
         },
         Some("convert") => Request::Convert {
             request_id: field_usize(line, "requestId").unwrap_or(0),
@@ -222,6 +265,9 @@ pub fn parse_request(line: &str) -> Request {
             watch: field_bool(line, "watch"),
             // Sample input: "keep":["/home","/home/gm"], every column directory the view draws; the rest stop being watched.
             keep: field_str_array(line, "keep"),
+            // Absent is name order, so an older client's peek reads as it did.
+            by: field_str(line, "by"),
+            desc: field_bool(line, "desc"),
         },
         Some("meta") => Request::Meta {
             token: field_usize(line, "token").unwrap_or(0),
@@ -234,6 +280,13 @@ pub fn parse_request(line: &str) -> Request {
             path: field_str(line, "path").unwrap_or_default(),
             id: field_usize(line, "id").unwrap_or(0),
         },
+        Some("settags") => Request::SetTags {
+            rows: field_usize_array(line, "rows"),
+            op: field_str(line, "op").unwrap_or_default(),
+            tag: field_str(line, "tag").unwrap_or_default(),
+        },
+        Some("tagstates") => Request::TagStates { rows: field_usize_array(line, "rows"), id: field_usize(line, "id").unwrap_or(0) },
+        Some("devs") => Request::Devs { paths: field_str_array(line, "paths") },
         Some("jump") => Request::Jump { id: field_usize(line, "id").unwrap_or(0), ranking: field_usize(line, "ranking").unwrap_or(0), favourites: field_str_array(line, "favourites"), recent: field_str_array(line, "recent") },
         Some("clipSet") => Request::ClipSet {
             op: field_str(line, "op").unwrap_or_default(),
@@ -245,6 +298,7 @@ pub fn parse_request(line: &str) -> Request {
             cut: field_str_array(line, "cut"),
         },
         Some("clipWatch") => Request::ClipWatch,
+        Some(c) if c.starts_with("flash") => super::flash::parse(c, line).map_or(Request::Unknown, Request::Flash),
         Some("quit") => Request::Quit,
         _ => Request::Unknown,
     }
@@ -265,6 +319,15 @@ pub fn located_many_line(directory: &str, id: usize, transfer_id: usize, matches
 
 pub fn listed_line(n: usize, read_ms: f64, sort_ms: f64, dev: u64, path: &str, writable: bool) -> String {
     say_listed(n, read_ms, sort_ms, dev, path, writable)
+}
+
+// A session answer's listed line, carrying the query gen so a late line lands on no folder.
+pub fn listed_gen_line(n: usize, read_ms: f64, sort_ms: f64, dev: u64, path: &str, writable: bool, gen: usize) -> String {
+    let mut line = say_listed(n, read_ms, sort_ms, dev, path, writable);
+    if line.ends_with('}') {
+        line.insert_str(line.len() - 1, &format!(",\"gen\":{}", gen));
+    }
+    line
 }
 
 // `w` is whether this user can create or delete entries here; a drag from one that cannot copies.
@@ -326,7 +389,7 @@ pub fn paths_line(paths: &[String]) -> String {
     out
 }
 
-// Sample output: {"t":"slow","op":"rename","path":"/hung/a.txt","msg":"/hung is slow. The rename continues and will finish on its own."}
+// Sample output: {"t":"slow","op":"rename","path":"/hung/a.txt","msg":"/hung is slow. The rename will finish on its own."}
 pub fn slow_line(op: &str, path: &str, msg: &str) -> String {
     format!(r#"{{"t":"slow","op":"{}","path":"{}","msg":"{}"}}"#, escape(op), escape(path), escape(msg))
 }
@@ -374,6 +437,17 @@ pub fn error_line_with_mode(e: &FleaError, mode: u32) -> String {
         escape(&e.path),
         escape(&e.msg),
         mode
+    )
+}
+
+// A refusal the UI words itself: the code names the cause, and msg stays for a client that ignores it.
+pub fn error_line_with_code(e: &FleaError, code: &str) -> String {
+    format!(
+        r#"{{"t":"error","where":"{}","path":"{}","msg":"{}","code":"{}"}}"#,
+        escape(&e.where_),
+        escape(&e.path),
+        escape(&e.msg),
+        escape(code)
     )
 }
 

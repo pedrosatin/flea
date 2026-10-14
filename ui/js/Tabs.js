@@ -2,24 +2,29 @@
 
 .import "Filter.js" as Filter
 .import "Format.js" as Format
+.import "Nav.js" as Nav
 .import "RecentMode.js" as RecentMode
 .import "Search.js" as Search
 .import "Sort.js" as Sort
 .import "Startup.js" as Startup
 .import "TabMove.js" as TabMove
 
+// The sentence a digit key answers with when no tab sits there, filled by Format.fill.
+var WORDS = {
+    noTab: "No tab %1",
+    lastTab: "The last tab cannot be closed"
+}
+
 // Hidden tabs are snapshots, so the pane and backend still own only one listing.
 // The nine-tab cap matches TUI's direct digit selection; GUI shortcuts cycle through the same state.
 
 var MAX = 9
 
-// Where a tab snapshotted now should reopen: a search sets pane.path to the scope it walks, so the
-// directory the user was in is searchFrom, and every caller reads this BEFORE dropOverlay clears it.
-// A history is not a directory, so a pane standing on one records the folder it was opened over.
+// Where a snapshotted tab reopens: the folder a search or a history was opened over, else the path.
 function restingPath(pane) {
     if (pane.searchMode === "results" && (pane.searchFrom || "").length > 0)
         return pane.searchFrom
-    return RecentMode.restingPath(pane) || pane.path
+    return RecentMode.restingPath(pane) || Nav.place(pane)
 }
 
 var nextTabIdentity = 0
@@ -30,11 +35,11 @@ function cursorFile(pane) {
     return row && typeof row.n === "string" ? row.n : ""
 }
 
-function snapshot(pane, path, identity) {
+function snapshot(pane, path, identity, dropped) {
     var where = path === undefined ? restingPath(pane) : path
     // A cursor and a selection read off a search's own listing name nothing in the directory the
     // tab records, so a tab stepping back out of a search starts at its first row with none.
-    var elsewhere = where !== pane.path
+    var elsewhere = where !== pane.path || Search.live(pane) || dropped === true
     return {
         tabIdentity: identity || ++nextTabIdentity,
         path: where,
@@ -56,8 +61,9 @@ function snapshot(pane, path, identity) {
     }
 }
 
-function pack(items, index) {
-    return {
+// keep is the tabs object whose landing the current tab still owes, for a pack that leaves the current tab's listing out.
+function pack(items, index, keep) {
+    var tabs = {
         items: items,
         index: index,
         pendingCursor: -1,
@@ -66,6 +72,14 @@ function pack(items, index) {
         pendingSortBy: "",
         pendingSortDesc: false
     }
+    if (keep) {
+        tabs.pendingCursor = keep.pendingCursor
+        tabs.pendingCursorName = keep.pendingCursorName
+        tabs.pendingLocatePath = keep.pendingLocatePath
+        tabs.pendingSortBy = keep.pendingSortBy
+        tabs.pendingSortDesc = keep.pendingSortDesc
+    }
+    return tabs
 }
 
 function label(path, home) {
@@ -115,7 +129,7 @@ function currentIndex(pane) {
 
 // Search and Recent replace the listing; Trash only covers it, so closing Trash alone needs no re-list.
 function dropOverlay(pane) {
-    var dropped = pane.searchMode === "results" || RecentMode.dropOverlay(pane)
+    var dropped = Search.live(pane) || Search.owesRelist(pane) || RecentMode.dropOverlay(pane)
     if (pane.trash) pane.trash.close()
     Search.leaveWalk(pane)
     Filter.close(pane)
@@ -127,12 +141,20 @@ function closePreview(pane) {
         pane.preview.close()
 }
 
-function busy(pane) {
-    if (pane.listInFlight) {
-        pane.message("A directory is already loading.", false)
-        return true
-    }
-    return false
+// The mark names a standing notice's serial, never its sentence; a count change withdraws it.
+function sayCount(pane, text) {
+    pane.message(text, false)
+    pane.tabCountNotice = pane.statusBar ? pane.statusBar.noticeSerial : -1
+}
+// Any other verdict from here replaces a standing count one, so no later change withdraws it.
+function sayPlain(pane, text) {
+    pane.tabCountNotice = -1
+    pane.message(text, false)
+}
+// The count changed under a standing count verdict, so it is withdrawn; anything else stands.
+function dropCount(pane) {
+    if (pane.tabCountNotice !== -1 && pane.statusBar) pane.statusBar.withdraw(pane.tabCountNotice)
+    pane.tabCountNotice = -1
 }
 
 // Only ever called for a switch that re-listed nothing; the clamp is the belt on top of that, since
@@ -158,13 +180,16 @@ function restoreSelection(pane, selected, follows) {
 }
 
 function apply(pane, item, dropped, cursor) {
-    // Issue 93: a search dropped onto the scope it walked leaves rows that are not that directory's.
-    var same = pane.path === item.path && pane.showHidden === item.showHidden && dropped !== true && cursor === undefined
+    // Issue 93: rows from a search dropped onto its scope, or a listing still out, are not the rows this tab left.
+    var same = pane.path === item.path && pane.showHidden === item.showHidden && dropped !== true && cursor === undefined && !pane.listInFlight
     if (pane.tabs) pane.tabs.pendingCursorName = cursor === undefined ? null : cursor
-    var viewChanged = pane.viewMode !== item.viewMode
+    var shown = pane.viewMode
     pane.history = item.history.slice()
     pane.forwardHistory = (item.forwardHistory || []).slice()
     pane.viewMode = item.viewMode
+    // A tab's view becomes the standing one unless its folder keeps its own; ui/Pane.qml adoptView decides.
+    if (pane.adoptView)
+        pane.adoptView(item.path, item.viewMode)
     pane.showHidden = item.showHidden
     if (same) {
         if (pane.backend && (pane.backend.sortBy !== item.sortBy || pane.backend.sortDesc !== item.sortDesc)) {
@@ -182,12 +207,13 @@ function apply(pane, item, dropped, cursor) {
         pane.clearSelection()
         return
     }
+    // The listing keeps the tab's own dotfile answer restored above; a tab in another view clears at once, as its rows were never listed there.
+    pane.openWithoutHistory(item.path, { keepHidden: true, clearAtOnce: pane.viewMode !== shown, supersede: true })
+    // After the request: letting a listing go clears what an earlier switch owed, and this one is owed to the listing just asked for.
+    pane.tabs.pendingCursorName = cursor === undefined ? null : cursor
     pane.tabs.pendingCursor = cursor === undefined ? item.cursorIndex : 0
     pane.tabs.pendingSortBy = item.sortBy
     pane.tabs.pendingSortDesc = item.sortDesc
-    // The tab's own dotfile answer is restored above, so the listing keeps it rather than taking the
-    // standing preference. A tab in another view clears at once: these rows were never listed in that view.
-    pane.openWithoutHistory(item.path, { keepHidden: true, clearAtOnce: viewChanged })
 }
 
 function applyPending(pane) {
@@ -265,11 +291,9 @@ function currentItems(pane, here) {
 // A caller may name where the new tab lands, which is what the Places row menu's own row does;
 // without one it is Settings, View, Opening that decides, and that still defaults to this folder.
 function openNew(pane, where) {
-    if (busy(pane))
-        return
     // Before the preview and the search go: a refused tenth tab must cost the user nothing.
     if (count(pane) >= MAX) {
-        pane.message("Nine tabs is the most.", false)
+        sayCount(pane, "Nine tabs is the most.")
         return
     }
     var here = restingPath(pane)
@@ -280,13 +304,13 @@ function openNew(pane, where) {
     var target = where || Startup.newTabPath(pane.uiState, here, pane.home)
     var items = currentItems(pane, here)
     var index = currentIndex(pane)
-    items[index] = snapshot(pane, here, items[index].tabIdentity)
-    items.push(snapshot(pane, target))
+    items[index] = snapshot(pane, here, items[index].tabIdentity, dropped)
+    items.push(snapshot(pane, target, undefined, dropped))
     pane.tabs = pack(items, items.length - 1)
-    // dropOverlay clears the search but leaves the pane on the scope it walked and its rows on that
-    // walk's results, so a target equal to the scope still has to be listed again. Escape already does.
-    if (pane.path !== target || dropped)
-        pane.openWithoutHistory(target)
+    dropCount(pane)
+    // dropOverlay clears the search while its rows still stand, and a listing still out belongs to the tab being left, so both list the target again, the one out let go.
+    if (pane.path !== target || dropped || pane.listInFlight)
+        pane.openWithoutHistory(target, { supersede: true })
 }
 
 // Ctrl+Return on the cursor row, the keyboard twin of Tap.tappedTab's middle
@@ -294,20 +318,18 @@ function openNew(pane, where) {
 function openCursorTab(pane) {
     var row = pane.rowFor ? pane.rowFor(pane.cursorIndex) : null
     if (!row || !row.d || typeof row.n !== "string") {
-        pane.message("Only a folder opens in a new tab.", false)
+        sayPlain(pane, "Only a folder opens in a new tab.")
         return
     }
-    var base = pane.path
+    var base = Search.baseOf(pane)
     openNew(pane, base === "/" ? "/" + row.n : base + "/" + row.n)
 }
 
 function selectAt(pane, i) {
-    if (busy(pane))
-        return
     var here = restingPath(pane)
     var items = currentItems(pane, here)
     if (i < 0 || i >= items.length) {
-        pane.message("No tab " + (i + 1) + ".", false)
+        sayCount(pane, Format.fill(WORDS.noTab, i + 1))
         return
     }
     var index = currentIndex(pane)
@@ -315,21 +337,19 @@ function selectAt(pane, i) {
         return
     closePreview(pane)
     var dropped = dropOverlay(pane)
-    items[index] = snapshot(pane, here, items[index].tabIdentity)
+    items[index] = snapshot(pane, here, items[index].tabIdentity, dropped)
     pane.tabs = pack(items, i)
     apply(pane, items[i], dropped)
 }
 
 function closeAt(pane, i) {
-    if (busy(pane))
-        return
     var items = currentItems(pane)
     if (items.length <= 1) {
-        pane.message("Can't close the last tab.", false)
+        sayCount(pane, WORDS.lastTab)
         return
     }
     if (i < 0 || i >= items.length) {
-        pane.message("No tab " + (i + 1) + ".", false)
+        sayCount(pane, Format.fill(WORDS.noTab, i + 1))
         return
     }
     var index = currentIndex(pane)
@@ -345,19 +365,19 @@ function closeAt(pane, i) {
         pane.tabs = pack(items, next)
         apply(pane, items[next], dropped)
     } else {
-        pane.tabs = pack(items, next)
+        pane.tabs = pack(items, next, pane.tabs)
     }
+    dropCount(pane)
 }
 
+// A move lists nothing, so the listing out lands for the tab it belongs to and that tab keeps what the landing owes.
 function move(pane, from, to) {
-    if (busy(pane))
-        return
     var items = currentItems(pane)
     if (items.length < 2)
         return
     var index = currentIndex(pane)
     items[index] = snapshot(pane, restingPath(pane), items[index].tabIdentity)
-    pane.tabs = pack(items, TabMove.reorder(items, from, to, index))
+    pane.tabs = pack(items, TabMove.reorder(items, from, to, index), pane.tabs)
 }
 
 // Tabs040 callout 1: { and } move the current tab with no re-list.
@@ -581,9 +601,9 @@ function catcherOutcome(rect, strip, x, y, tabWidth, tabCount) {
     return { outcome: "cancel", at: -1 }
 }
 
-// A listing in flight or a full strip refuses incoming tabs.
+// A full strip refuses incoming tabs; a listing out is let go by the tab received.
 function canReceive(pane) {
-    if (!pane || pane.listInFlight)
+    if (!pane)
         return false
     return count(pane) < MAX
 }
@@ -595,10 +615,8 @@ function receiveTab(pane, payload, at) {
     var info = parseTabMime(payload)
     if (!info || isOwnTab(info))
         return false
-    if (busy(pane))
-        return false
     if (count(pane) >= MAX) {
-        pane.message("Nine tabs is the most.", false)
+        sayCount(pane, "Nine tabs is the most.")
         return false
     }
     closePreview(pane)
@@ -606,8 +624,8 @@ function receiveTab(pane, payload, at) {
     var here = restingPath(pane)
     var items = currentItems(pane, here)
     var index = currentIndex(pane)
-    items[index] = snapshot(pane, here, items[index].tabIdentity)
-    var snap = snapshot(pane, info.path)
+    items[index] = snapshot(pane, here, items[index].tabIdentity, dropped)
+    var snap = snapshot(pane, info.path, undefined, dropped)
     if (TAB_VIEWS.indexOf(info.view) >= 0)
         snap.viewMode = info.view
     if (info.cursor.length > 0)
@@ -615,6 +633,7 @@ function receiveTab(pane, payload, at) {
     var place = at >= 0 && at <= items.length ? at : items.length
     items.splice(place, 0, snap)
     pane.tabs = pack(items, place)
+    dropCount(pane)
     apply(pane, snap, dropped, info.cursor)
     return true
 }
@@ -657,8 +676,6 @@ function closeTabAfterMove(pane, index) {
         return "kept"
     var total = count(pane)
     if (index < 0 || index >= total)
-        return "kept"
-    if (busy(pane))
         return "kept"
     if (total <= 1)
         return "kept"

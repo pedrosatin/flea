@@ -3,6 +3,8 @@ import Quickshell
 import Quickshell.Io
 import "js/Errors.js" as Errors
 import "js/Cloud.js" as Cloud
+import "js/Crumbs.js" as Crumbs
+import "js/Format.js" as Format
 import "js/Mounts.js" as Mounts
 import "js/Protocols.js" as Protocols
 import "js/Dropbox.js" as Dropbox
@@ -13,8 +15,20 @@ Item {
     id: root
 
     property string bookmarksText: ""
+    property var savedFavourites: []
+    onSavedFavouritesChanged: root.rebuild()
     property var backend: null
     property var entries: []
+    // Retained across unmounts: the same GVFS path denotes the same share; navigation still uses the real path.
+    property var pathAliases: []
+    property var _aliasLabels: ({})
+    // A bridge wait outlives _pending*, so the identity it opened under waits here by path until the check lands.
+    property var _bridgeIdentities: ({})
+    function pathAlias(path) { return Crumbs.aliasAt(path, root.pathAliases) }
+    function rememberPathAlias(path, label, uri) {
+        var key = Mounts.normalize(uri)
+        root.pathAliases = Crumbs.rememberAlias(root.pathAliases, path, root._aliasLabels[key] || label, key)
+    }
     // Secrets live only here for this QML process lifetime; the map is never serialized or exposed.
     property var _passwords: ({})
     property string result: "idle"
@@ -28,12 +42,15 @@ Item {
     signal message(string text, bool isError)
     // The bridge wait's own sticky line, cleared with "" when the folder lands or fails.
     signal sticky(string text, var origin)
+    // The GVFS bridge's Starting line, which the status bar marks busy; a clear still goes through sticky.
+    signal startingBridge(string text, var origin)
     // Client-side only, see "listShares" below: ui/ShareBrowser.qml renders these as pane rows.
     signal sharesListed(string baseUri, string baseLabel, var names, var origin)
     // Fired once ui/NetworkPlaces.qml's write has actually landed, so a caller's reload reads it.
     signal renamed()
     signal retryRequested(string uri, string label, string password, string reason, bool failedConnect, var origin)
-    signal completed(string requestId, string uri, bool success, string reason)
+    // connectFailed says the connection itself failed (refused, unanswered, no folder), so the dialog marks the location unacknowledged without reading the sentence.
+    signal completed(string requestId, string uri, bool success, string reason, bool connectFailed)
 
     // Hyprland has no auth portal here, so "gio mount" on a share that wants a credential prompt
     // hangs forever with no stdin to answer it, and "gio info" on a location gvfs cannot reach does
@@ -91,6 +108,8 @@ Item {
     property string dropboxPath: ""
     onDropboxPathChanged: root.rebuild()
     property string dropboxReason: "Checking Dropbox"
+    // What state the reason is, for logic: ui/js/Dropbox.js names the codes.
+    property string dropboxCode: ""
     property bool dropboxChecking: false
     property bool _dropboxAwaitingStart: false
     property string _dropboxOutput: ""
@@ -110,8 +129,10 @@ Item {
         if (!facts || facts.dropboxInfo === undefined) return
         root.dropboxAnswered = true
         var account = Dropbox.account(facts.dropboxInfo, facts.dropboxError)
-        if (dropboxPath !== account.path || account.reason)
+        if (dropboxPath !== account.path || account.reason) {
             dropboxReason = account.reason || "Checking Dropbox"
+            dropboxCode = account.code
+        }
         dropboxPath = account.path
     }
 
@@ -148,6 +169,7 @@ Item {
         if (dropboxChecking) return false
         var provider = facts.dropbox || {}
         root.readDropboxAccount(facts)
+        if (provider.reason || dropboxPath) dropboxCode = ""
         dropboxReason = provider.reason || (dropboxPath ? "Checking Dropbox" : dropboxReason)
         if (!provider.command || !dropboxPath) { root.dropboxAnswered = true; return true }
         dropboxChecking = true
@@ -169,14 +191,17 @@ Item {
             if (root._dropboxAwaitingStart && !running) {
                 root._dropboxAwaitingStart = false
                 root.dropboxChecking = false
-                root.dropboxReason = "Dropbox status helper could not start"
+                root.dropboxReason = "Dropbox could not be checked"
+                root.dropboxCode = ""
                 root.dropboxRefreshed()
             }
         }
         onExited: function(exitCode) {
             root._dropboxAwaitingStart = false
-            root.dropboxReason = exitCode === 137 || exitCode === 9 ? "Dropbox status was interrupted or timed out"
+            var answer = exitCode === 137 || exitCode === 9 ? { reason: "Dropbox did not answer in time", code: "statusFailed" }
                 : Dropbox.status(dropboxOut.text || root._dropboxOutput, exitCode, dropboxErr.text || root._dropboxError)
+            root.dropboxReason = answer.reason
+            root.dropboxCode = answer.code
             root.dropboxChecking = false
             root.dropboxRefreshed()
         }
@@ -276,11 +301,11 @@ Item {
             bridgeLoader.active = true
         return bridgeLoader.item
     }
-    // A null bridge is a missing component, not a refused mount, so it names the file it failed to build.
+    // A null bridge is a missing component, not a refused mount, so the reason says Flea did not load.
     function bridgeMissingReason() {
-        return "Could not open " + (root._pendingLabel || root._pendingUri) + ": GvfsBridge.qml did not load"
+        return Format.fill(Mounts.WORDS.bridgeMissing, root._pendingLabel || root._pendingUri)
     }
-    // The Loader status is the cause, so it is warned with the file named and the wait ends with no retry.
+    // The log warning names the file and the Loader status, and the wait ends with no retry.
     function failBridgeMissing() {
         console.warn("GvfsBridge.qml did not load: Loader status " + bridgeLoader.status)
         if (root._requestPassword.length > 0) root.remember(root._pendingUri, root._requestPassword)
@@ -307,13 +332,16 @@ Item {
                 return
             }
             root.sticky("", origin)
+            var held = root._bridgeIdentities[path]
+            delete root._bridgeIdentities[path]
             if (!isDir) {
                 root.openFileRequested(path, origin)
                 return
             }
+            if (held) root.rememberPathAlias(path, held.label, held.uri)
             root.opened(path, origin)
         }
-        function onStarting(text, origin) { root.sticky(text, origin) }
+        function onStarting(text, origin) { root.startingBridge(text, origin) }
         function onFailed(text, origin) {
             if (root._repairWaiting) {
                 root._repairWaiting = false
@@ -340,7 +368,7 @@ Item {
 
     // Three sources, deduped on the normalized uri (see ui/js/Mounts.js "normalize"): a live gio mount wins over a bookmark for the same share even when the trailing slash differs.
     // The bookmark's own label wins on that merged row, or a rename of a mounted share would be written to the file and never drawn again; see ui/js/Mounts.js "railLabel".
-    function rebuild() {
+    function rebuild(mountinfoText) {
         var out = []
         var seen = {}
         var mounts = Mounts.parseMounts(root._mountListing)
@@ -370,25 +398,43 @@ Item {
         if (root.dropboxPath.length > 0) {
             out.push({ path: root.dropboxPath, label: "Dropbox", group: "network", kind: "dropbox", uri: "", mounted: true, glyph: "" })
         }
-        // CloudMounts: a FUSE mount inside the home folder shows under its folder's name,
-        // the way gio lists its own mounts. No menu at defaults, like Dropbox's row: the
-        // tool that made the mount owns it, so Flea never mounts, unmounts or configures it.
-        var clouds = Cloud.parseCloudMounts(cloudFile.text(), Quickshell.env("HOME"))
+        // Cloud rows show a FUSE mount under its folder's name with no menu; mountinfoText is the tests' seam, live callers pass nothing.
+        var infoText = mountinfoText === undefined ? cloudFile.text() : mountinfoText
+        var clouds = Cloud.parseCloudMounts(infoText, Quickshell.env("HOME"))
         var seenPath = {}
         for (var c = 0; c < clouds.length; c++) {
             seenPath[clouds[c].path] = true
             out.push({ path: clouds[c].path, label: Mounts.leaf(clouds[c].path), group: "network",
                        kind: "cloud", uri: "", mounted: true, glyph: "server" })
         }
-        // Kernel NFS and CIFS mounts and network FUSE mounts outside home show the same way, read without a per-row stat.
-        var nets = Cloud.parseNetworkMounts(cloudFile.text(), Quickshell.env("HOME"))
-        for (var v = 0; v < nets.length; v++) {
-            if (seenPath[nets[v].path])
-                continue
-            seenPath[nets[v].path] = true
-            out.push({ path: nets[v].path, label: Mounts.leaf(nets[v].path), group: "network",
-                       kind: "cloud", uri: "", mounted: true, glyph: "server" })
+        // Every mountinfo kernel row stays; a gio line at its mountpoint lends name and release spelling, the rest keep the leaf and unmount by path.
+        var kernels = Cloud.parseNetworkMounts(infoText)
+        var gioRows = Mounts.gioKernelMounts(root._mountListing)
+        var gioByPath = {}
+        for (var g = 0; g < gioRows.length; g++) {
+            if (!gioByPath[gioRows[g].path])
+                gioByPath[gioRows[g].path] = gioRows[g]
         }
+        for (var v = 0; v < kernels.length; v++) {
+            if (seenPath[kernels[v].path])
+                continue
+            seenPath[kernels[v].path] = true
+            var lent = gioByPath[kernels[v].path]
+            out.push({ path: kernels[v].path, label: lent ? lent.label : Mounts.leaf(kernels[v].path),
+                       group: "network", kind: "share", uri: lent ? lent.uri : kernels[v].path,
+                       fstype: kernels[v].fstype, mounted: true, glyph: "server", editable: false })
+        }
+        // Only persisted names may relabel an alias; live gio labels are deliberately excluded.
+        var labelSources = []
+        for (var s = 0; s < marks.length; s++)
+            labelSources.push({ uri: marks[s].uri, label: marks[s].label, saved: true })
+        for (var f = 0; root.savedFavourites && f < root.savedFavourites.length; f++) {
+            var favourite = root.savedFavourites[f]
+            if (favourite && favourite.path && favourite.label)
+                labelSources.push({ path: favourite.path, label: favourite.label, saved: true })
+        }
+        root._aliasLabels = Crumbs.labelsByKey(labelSources, Mounts.normalize)
+        root.pathAliases = Crumbs.relabelAliases(root.pathAliases, root._aliasLabels)
         // Every five seconds forever, so an unchanged poll must not assign: see Mounts.sameEntries.
         if (!Mounts.sameEntries(root.entries, out))
             root.entries = out
@@ -406,6 +452,11 @@ Item {
             return
         }
         if (e.kind === "share") {
+            // A kernel mount's path is already real, so it opens with no gio round trip; a gvfs share carries no path and rides openShare below.
+            if (e.path && e.path.length > 0) {
+                root.opened(e.path, origin === undefined ? root.origin : origin)
+                return
+            }
             root.openShare(e.uri, e.mounted, e.label, false, { origin: origin === undefined ? root.origin : origin })
             return
         }
@@ -451,8 +502,8 @@ Item {
         // touches no flight state.
         if (mountProcess.running || authProcess.running || infoProcess.running || listSharesProcess.running || root._repairActive || root._repairWaiting) {
             // A guard that returns in silence names nothing at all, and a leg can hold it 15 s.
-            var reason = "Another network location is still opening; give it a moment."
-            if (request.id) root.completed(request.id, Mounts.normalize(uri), false, reason)
+            var reason = Mounts.WORDS.anotherOpening
+            if (request.id) root.completed(request.id, Mounts.normalize(uri), false, reason, false)
             else root.message(reason, false)
             return
         }
@@ -514,7 +565,7 @@ Item {
         // prompt at all, which is how a domain account locks itself out.
         if (refused === true) root.forgetPassword(root._pendingUri)
         else if (attempted.length > 0) root.remember(root._pendingUri, attempted)
-        if (!root.finishRequest(false, reason))
+        if (!root.finishRequest(false, reason, missing !== true))
             root.retryRequested(root._pendingUri, root._pendingLabel, attempted, reason,
                                 missing !== true, root._pendingOrigin)
     }
@@ -529,8 +580,8 @@ Item {
         root._repairBridged = false
         root._repairRoot = ""
         root._repairPath = ""
-        if (refused) root.failMount("Connect failed: network location was refused", root.passwordFor(uri))
-        else root.failMount("Connect failed: location has no browsable folder", root.passwordFor(uri))
+        if (refused) root.failMount(Errors.WORDS.connectRefused, root.passwordFor(uri))
+        else root.failMount(Errors.WORDS.connectNoFolder, root.passwordFor(uri))
     }
 
     // Issue 194's repair, answered through backend.peek: gio's own folder first, then every
@@ -544,13 +595,15 @@ Item {
         if (path === root._repairPath) {
             if (!readFailed) {
                 var openPath = root._repairPath
+                var openOrigin = root._pendingOrigin
                 mountTimeout.stop()
                 root._repairActive = false
                 root._repairBridged = false
                 root._repairPath = ""
                 root.result = "mounted"
+                root.rememberPathAlias(openPath, root._pendingLabel, root._pendingUri)
                 root.finishRequest(true, "")
-                root.opened(openPath, root._pendingOrigin)
+                root.opened(openPath, openOrigin)
                 return
             }
             var cut = root._repairPath.indexOf("/gvfs/")
@@ -588,26 +641,28 @@ Item {
         root._repairRoot = ""
         root._repairPath = ""
         if (picked.path.length > 0) {
+            var pickedOrigin = root._pendingOrigin
             root.result = "mounted"
+            root.rememberPathAlias(picked.path, root._pendingLabel, root._pendingUri)
             root.finishRequest(true, "")
-            root.opened(picked.path, root._pendingOrigin)
+            root.opened(picked.path, pickedOrigin)
             return
         }
         if (picked.users.length > 0) {
-            root.failMount("Connect failed: that share is mounted as " + picked.users.join(", "),
+            root.failMount(Format.fill(Errors.WORDS.connectMountedAs, picked.users.join(", ")),
                            root.passwordFor(root._repairUri))
             return
         }
         root.repairFailed()
     }
 
-    function finishRequest(success, reason) {
+    function finishRequest(success, reason, connectFailed) {
         var requestId = root._requestId
         if (!requestId) return false
         root._requestId = ""
         if (success) root.remember(root._pendingUri, root._requestPassword)
         root._requestPassword = ""
-        root.completed(requestId, root._pendingUri, success, reason || "")
+        root.completed(requestId, root._pendingUri, success, reason || "", connectFailed === true)
         return true
     }
 
@@ -654,7 +709,11 @@ Item {
         var e = root.entries[index]
         if (!e || e.kind !== "share" || !e.mounted || unmountProcess.running) return
         root._pendingUnmountLabel = e.label
-        unmountProcess.command = ["gio", "mount", "-u", e.mountUri || e.uri]
+        // A user FUSE mount answers to its own unmounter; the exit status below decides.
+        if (e.fstype && String(e.fstype).indexOf("fuse.") === 0)
+            unmountProcess.command = ["fusermount3", "-u", e.path]
+        else
+            unmountProcess.command = ["gio", "mount", "-u", e.mountUri || e.uri]
         unmountProcess.running = true
     }
 
@@ -692,8 +751,8 @@ Item {
             // tests/ui.sh presses l on the rail the instant this fires. An address that never
             // answered has no credential to correct anyway.
             root.result = "failed"
-            root.message("Connect failed: host did not respond", true)
-            root.finishRequest(false, "Connect failed: host did not respond")
+            root.message(Errors.WORDS.connectNoAnswer, true)
+            root.finishRequest(false, Errors.WORDS.connectNoAnswer, true)
         }
     }
 
@@ -714,7 +773,7 @@ Item {
         onRunningChanged: {
             if (root._authAwaitingStart && !authProcess.running) {
                 root._authAwaitingStart = false
-                root.failMount("Connect failed: authentication helper is unavailable",
+                root.failMount(Errors.WORDS.connectNoPrompt,
                                root.passwordFor(root._pendingUri))
             }
         }
@@ -728,7 +787,7 @@ Item {
             // 124 is a host that never answered and 126/127 a helper that could not start; neither
             // is the server turning the credential down, so neither invalidates it.
             var refused = exitCode !== 124 && exitCode !== 126 && exitCode !== 127
-            root.failMount(Errors.connectFailure(exitCode, root._pendingUri),
+            root.failMount(Errors.connectFailure(exitCode),
                            root.passwordFor(root._pendingUri), refused)
         }
     }
@@ -787,9 +846,14 @@ Item {
                     root.failBridgeMissing()
                     return
                 }
+                // Capture before emitting completion or waiting: a later open may replace _pending* before onReady.
+                var bridgeLabel = root._pendingLabel
+                var bridgeUri = root._pendingUri
+                var bridgeOrigin = root._pendingOrigin
+                root._bridgeIdentities[path] = { label: bridgeLabel, uri: bridgeUri }
                 root.result = "mounted"
                 root.finishRequest(true, "")
-                openBridge.ensure(path, root._pendingLabel, root._pendingOrigin)
+                openBridge.ensure(path, bridgeLabel, bridgeOrigin)
                 return
             }
             // A refused keyless sftp attempt is a missing credential and not a refused location, sftp only.
@@ -805,11 +869,11 @@ Item {
                 return
             }
             if (failed) {
-                root.failMount("Connect failed: network location was refused",
+                root.failMount(Errors.WORDS.connectRefused,
                                root.passwordFor(root._pendingUri))
                 return
             }
-            root.failMount("Connect failed: location has no browsable folder", root.passwordFor(root._pendingUri))
+            root.failMount(Errors.WORDS.connectNoFolder, root.passwordFor(root._pendingUri))
         }
     }
 
@@ -825,7 +889,7 @@ Item {
             var body = String(listSharesOut.text || root._listSharesOutput || "")
             var names = body.split("\n").map(function (s) { return s.trim() }).filter(function (s) { return s.length > 0 })
             if (exitCode !== 0 || names.length === 0) {
-                root.failMount("Connect failed: location has no browsable folder", root.passwordFor(root._pendingUri))
+                root.failMount(Errors.WORDS.connectNoFolder, root.passwordFor(root._pendingUri))
                 return
             }
             root.result = "mounted"
@@ -842,7 +906,7 @@ Item {
             root.result = exitCode === 0 ? "unmounted" : "failed"
             // Replace the arm prompt immediately after successful unmount.
             root.message(exitCode === 0
-                ? "Unmounted " + root._pendingUnmountLabel + "."
+                ? Format.fill(Mounts.WORDS.unmountedLine, root._pendingUnmountLabel)
                 : "That share could not be unmounted; it may still be in use.", exitCode !== 0)
         }
     }

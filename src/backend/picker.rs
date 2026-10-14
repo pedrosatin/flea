@@ -52,8 +52,8 @@ impl Picker {
         }
         if let Err(error) = self.requests.try_send(line) {
             let (line, message) = match error {
-                TrySendError::Full(line) => (line, "A picker check is still running; try again."),
-                TrySendError::Disconnected(line) => (line, "The picker check stopped; reopen this request."),
+                TrySendError::Full(line) => (line, "Flea is still checking this item; try again."),
+                TrySendError::Disconnected(line) => (line, "The check stopped; open the file chooser again."),
             };
             let _ = self.replies.send(OpMsg::Meta { line: response(&line, Err(message.into())) });
         }
@@ -73,8 +73,15 @@ impl Held {
     fn open(path: &Path, follow: bool) -> Result<Self, String> {
         if !path.is_absolute() { return Err("Picker paths must be absolute.".into()); }
         let file = OpenOptions::new().read(true).custom_flags(O_PATH | if follow { 0 } else { crate::oflags::O_NOFOLLOW })
-            .open(path).map_err(|error| format!("Could not inspect {}: {}", path.display(), io_message(&error)))?;
+            .open(path).map_err(|error| format!("Could not inspect {}: {}.", path.display(), io_message(&error)))?;
         Ok(Self { path: path.into(), file, follow, target: None })
+    }
+    fn is_dir(&self) -> Result<bool, String> {
+        let metadata = self.current()?;
+        match &self.target {
+            Some(target) => target_is_dir(target, &self.path),
+            None => Ok(metadata.is_dir()),
+        }
     }
     fn current(&self) -> Result<Metadata, String> {
         let before = self.file.metadata().map_err(|error| io_message(&error))?;
@@ -95,13 +102,26 @@ impl Held {
 }
 fn target_is_dir(target: &File, path: &Path) -> Result<bool, String> {
     target.metadata().map(|metadata| metadata.is_dir())
-        .map_err(|error| format!("Could not inspect {}: {}", path.display(), io_message(&error)))
+        .map_err(|error| format!("Could not inspect {}: {}.", path.display(), io_message(&error)))
 }
-fn inspect_added_path(path: &Path, mut open: impl FnMut(&Path, bool) -> Result<Held, String>) -> Result<(Held, bool), String> {
+// A path held for its own kind, with the link's target held beside it when it is one; the metadata is the first check's.
+fn open_held(path: &Path, mut open: impl FnMut(&Path, bool) -> Result<Held, String>) -> Result<(Held, Metadata), String> {
     let mut held = open(path, false)?;
-    if held.current()?.file_type().is_symlink() {
+    let first = held.current()?;
+    if first.file_type().is_symlink() {
         held.target = Some(open(path, true)?.file);
     }
+    Ok((held, first))
+}
+// The kind of what a mark or save target points at, worded without the path prefix target_is_dir adds.
+fn held_is_dir(held: &Held, metadata: &Metadata) -> Result<bool, String> {
+    match &held.target {
+        Some(target) => target.metadata().map(|target| target.is_dir()).map_err(|error| io_message(&error)),
+        None => Ok(metadata.is_dir()),
+    }
+}
+fn inspect_added_path(path: &Path, open: impl FnMut(&Path, bool) -> Result<Held, String>) -> Result<(Held, bool), String> {
+    let (held, _) = open_held(path, open)?;
     let is_dir = match &held.target {
         Some(target) => target_is_dir(target, path)?,
         None => held.current()?.is_dir(),
@@ -130,15 +150,9 @@ impl State {
                 if let Some(index) = self.marks.iter().position(|item| item.path == path) {
                     self.marks.remove(index);
                 } else {
-                    let mut held = Held::open(&path, false)?;
-                    if held.current()?.file_type().is_symlink() {
-                        held.target = Some(Held::open(&path, true)?.file);
-                    }
+                    let (held, _) = open_held(&path, Held::open)?;
                     let metadata = held.current()?;
-                    let directory = match &held.target {
-                        Some(target) => target.metadata().map_err(|error| io_message(&error))?.is_dir(),
-                        None => metadata.is_dir(),
-                    };
+                    let directory = held_is_dir(&held, &metadata)?;
                     if directory != field_bool(line, "directory") { return Err("This item is not the requested file type.".into()); }
                     if !field_bool(line, "multiple") { self.marks.clear(); }
                     self.marks.push(held);
@@ -155,26 +169,18 @@ impl State {
                 self.save = None;
                 let path = PathBuf::from(field_str(line, "folder").unwrap_or_default());
                 let name = field_str(line, "name").unwrap_or_default();
-                if !super::ops::valid_name(&name) { return Err("Use a filename without a separator.".into()); }
+                if let Some(refusal) = super::ops::name_refusal_sentence(&name) { return Err(refusal); }
                 let folder = Held::open(&path, true)?;
-                if !folder.current()?.is_dir() { return Err("The selected save location is not a directory.".into()); }
+                if !folder.current()?.is_dir() { return Err("The selected save location is not a folder.".into()); }
                 let path = path.join(name);
                 let target = match path.symlink_metadata() {
                     Ok(_) => {
-                        let mut held = Held::open(&path, false)?;
-                        let metadata = held.current()?;
-                        if metadata.file_type().is_symlink() {
-                            held.target = Some(Held::open(&path, true)?.file);
-                        }
-                        let directory = match &held.target {
-                            Some(target) => target.metadata().map_err(|error| io_message(&error))?.is_dir(),
-                            None => metadata.is_dir(),
-                        };
-                        if directory { return Err("This output name is a directory; choose a filename.".into()); }
+                        let (held, metadata) = open_held(&path, Held::open)?;
+                        if held_is_dir(&held, &metadata)? { return Err("A folder has this name; choose another name.".into()); }
                         Some(held)
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(format!("Could not inspect output location: {}", io_message(&error))),
+                    Err(error) => return Err(format!("Could not inspect output location: {}.", io_message(&error))),
                 };
                 if let Some(target) = &target { target.current()?; }
                 let result = format!(r#""review":{},"path":"{}","collision":{}"#, id, escape(&path.to_string_lossy()), target.is_some());
@@ -190,8 +196,8 @@ impl State {
                 } else {
                     match review.path.symlink_metadata() {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                        Ok(_) => return Err("An item appeared at this output location; review it again.".into()),
-                        Err(error) => return Err(format!("Could not inspect output location: {}", error)),
+                        Ok(_) => return Err("An item with this name just appeared there; review it again.".into()),
+                        Err(error) => return Err(format!("Could not inspect output location: {}.", io_message(&error))),
                     }
                 }
                 Ok(format!(r#""path":"{}","collision":{}"#, escape(&review.path.to_string_lossy()), review.target.is_some()))
@@ -206,12 +212,7 @@ impl State {
         let mut wanted: HashSet<_> = paths.iter().collect();
         for held in &self.marks {
             if !wanted.contains(&held.path) { continue; }
-            let metadata = held.current()?;
-            let is_dir = match &held.target {
-                Some(target) => target_is_dir(target, &held.path)?,
-                None => metadata.is_dir(),
-            };
-            if is_dir != directory { wanted.remove(&held.path); }
+            if held.is_dir()? != directory { wanted.remove(&held.path); }
         }
         let mut seen: HashSet<_> = self.marks.iter().map(|held| held.path.clone()).collect();
         let mut added = Vec::new();
@@ -223,7 +224,8 @@ impl State {
                 Ok(inspected) => inspected,
                 Err(error) => {
                     let prefix = format!("Could not inspect {}: ", path.display());
-                    let why = error.strip_prefix(&prefix).unwrap_or(&error);
+                    // The picker joins this clause into its own sentence, so it carries neither the prefix nor the closing period.
+                    let why = error.strip_prefix(&prefix).unwrap_or(&error).trim_end_matches('.');
                     skipped.push(format!(r#"{{"path":"{}","why":"{}"}}"#, escape(&path.to_string_lossy()), escape(why)));
                     continue;
                 }
@@ -253,8 +255,7 @@ impl State {
         }
         if descriptors > budget {
             let count = paths.iter().collect::<HashSet<_>>().len();
-            return Err(format!("Cannot select {} items: {} descriptors exceed the selection limit of {} (open-file limit {}, {} reserved).",
-                count, descriptors, budget, soft, limits::DESCRIPTOR_RESERVE));
+            return Err(format!("Cannot select {} items. The file chooser takes at most {}.", count, budget));
         }
         Ok(())
     }
@@ -301,3 +302,7 @@ pub fn filter_listing(listing: &mut Listing, db: &Db, line: &str) {
 #[cfg(test)]
 #[path = "picker_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "picker_wording_tests.rs"]
+mod wording;

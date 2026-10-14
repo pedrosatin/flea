@@ -1,11 +1,12 @@
 // src/gvfsprefetch.rs's tests, kept beside it so that file stays a mechanism file.
 use super::*;
 use crate::backend::testdir::TestDir;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::sync::{Mutex, MutexGuard};
 
-// Process-wide XDG_RUNTIME_DIR setters hold this; the _in variants take the dir and skip it.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+// Held by the tests that touch the process-wide CONSUMED flag; no test writes the environment.
+static CONSUMED_LOCK: Mutex<()> = Mutex::new(());
 
 // A literal gvfs path, so is_gvfs answers without reading the environment.
 const SHARE: &str = "/run/user/1000/gvfs/smb-share:server=t,share=u/dir";
@@ -43,29 +44,9 @@ fn fresh_start_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 - 1000
 }
 
-// Save the four variables env tests touch; restored on drop, never the real runtime dir.
-struct EnvGuard {
-    saved: Vec<(String, Option<String>)>,
-}
-
-fn hold_env() -> (MutexGuard<'static, ()>, EnvGuard) {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = ["XDG_RUNTIME_DIR", PREFETCH_ENV, PATH_ENV, START_ENV]
-        .iter()
-        .map(|k| (k.to_string(), std::env::var(k).ok()))
-        .collect();
-    (guard, EnvGuard { saved })
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (k, v) in self.saved.drain(..) {
-            match v {
-                Some(v) => std::env::set_var(&k, v),
-                None => std::env::remove_var(&k),
-            }
-        }
-    }
+// The once flag is process-wide, so every test that spends or reads it holds this for its whole run.
+fn hold_consumed() -> MutexGuard<'static, ()> {
+    CONSUMED_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn reset_consumed() {
@@ -89,6 +70,7 @@ fn a_file_published_while_waiting_is_not_refused_as_stale() {
     assert!(out.is_some(), "a file published while the backend waits adopts, got None");
     assert!(!dest.exists(), "the dest is claimed away so a second reader finds the claim");
     assert!(claimed_path(&dest).exists(), "the claim stays for the second reader and the sweeper");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
 }
 
 #[test]
@@ -102,6 +84,7 @@ fn a_failing_gio_publishes_a_marker_and_adoption_ends_at_once() {
     let start_ms = dest.metadata().unwrap().modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 - 500;
     assert!(adopt_in(SHARE, false, &dest, live_deadline(), start_ms, Some(&runtime)).is_none());
     assert!(t.elapsed() < Duration::from_secs(1), "a failure marker ends the wait, not the 15 s deadline");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
 }
 
 #[test]
@@ -115,26 +98,28 @@ fn a_second_reader_finds_the_claim_and_returns_at_once() {
     assert!(second.is_none(), "the second reader finds the claimed sibling, got Some");
     assert!(t.elapsed() < Duration::from_secs(5), "the second reader never waits out the deadline");
     assert!(!dest.exists() && claimed_path(&dest).exists(), "claim, not delete: dest gone, claim kept");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
 }
 
 #[test]
 fn a_completed_prefetch_adopts_through_scan_with_no_gio_child() {
-    let (_lock, _env) = hold_env();
+    let _lock = hold_consumed();
     reset_consumed();
     let dir = TestDir::new("gvfs-adopt");
     let runtime = dir.path().join("runtime/flea");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::env::set_var("XDG_RUNTIME_DIR", dir.path().join("runtime"));
+    let runtime_root = dir.path().join("runtime");
     let marker = dir.path().join("gio-ran");
     let gio = fake_gio(&dir, "gio", &format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()));
     let dest = write_prefetch(&runtime, "gvfs-1.list", TWO_ROWS);
     let mtime_ms = dest.metadata().unwrap().modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     let prefetch = Prefetch { dest: dest.clone(), path: SHARE.to_string(), start_ms: mtime_ms - 1000 };
-    let (listing, _) = crate::backend::scan::scan_with(SHARE, false, Some(prefetch), &gio).unwrap();
+    let (listing, _) = crate::backend::scan::scan_in(SHARE, false, Some(prefetch), &gio, &|| Some(runtime_root.join("flea"))).unwrap();
     assert_eq!((listing.len(), listing.name(0)), (1, "a.txt"), "the hidden row is filtered at parse time");
     assert!(!marker.exists(), "adoption through scan_with spawns no gio child at all");
     assert!(!dest.exists(), "the file is claimed on read and never read again");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
     reset_consumed();
 }
 
@@ -152,6 +137,7 @@ fn garbage_is_refused_and_claimed_so_the_scan_lists_itself() {
     let dest = write_prefetch(&runtime, "gvfs-1.list", "this is not a gio line\n");
     assert!(adopt_in(SHARE, false, &dest, live_deadline(), 0, Some(&runtime)).is_none());
     assert!(!dest.exists(), "garbage is claimed, not left for the next listing");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
 }
 
 #[test]
@@ -162,6 +148,7 @@ fn a_stale_file_is_refused_and_kept_as_a_claim() {
     let start_ms = mtime_ms + (STALE_SECS + 10) * 1000;
     assert!(adopt_in(SHARE, false, &dest, live_deadline(), start_ms, Some(&runtime)).is_none());
     assert!(!dest.exists() && claimed_path(&dest).exists(), "a refused file is kept as a claim for the sweeper");
+    assert_eq!(std::fs::metadata(claimed_path(&dest)).unwrap().len(), 0, "the claim is truncated to its marker");
 }
 
 // Runs adopt_in on a thread so a wait that never ends fails the test instead of hanging it; answers the result and how long it took.
@@ -198,6 +185,22 @@ fn a_claim_landing_mid_wait_ends_the_wait() {
     let _ = claimer.join();
     assert_eq!(answer, Some(false), "another reader's claim ends the wait long before the 15 s deadline");
     assert!(took >= Duration::from_millis(80), "an answer after {:?} came before the claim landed at 100 ms", took);
+}
+
+#[test]
+fn a_fifo_at_the_dest_never_blocks_the_scan() {
+    let (_dir, runtime) = runtime_fixture("gvfs-fifo");
+    let dest = runtime.join("gvfs-1.list");
+    assert!(std::process::Command::new("mkfifo").arg(&dest).status().unwrap().success());
+    // A held reader lets a non-blocking write-open succeed, and Linux raises POLLHUP on it once that writer closes.
+    let reader = std::fs::OpenOptions::new().read(true).custom_flags(crate::oflags::O_NONBLOCK).open(&dest).unwrap();
+    let (answer, took) = adopt_within(dest.clone(), runtime, short_deadline(), Duration::from_secs(5));
+    assert_eq!(answer, Some(false), "a fifo at the dest adopts nothing");
+    assert!(took < Duration::from_secs(5), "the scan answers inside the bound instead of hanging");
+    let kind = std::fs::symlink_metadata(claimed_path(&dest)).unwrap().file_type();
+    assert!(kind.is_fifo(), "the fifo is never truncated or replaced");
+    let mut fds = crate::backend::child::PollFd { fd: reader.as_raw_fd(), events: 0, revents: 0 };
+    assert_eq!(unsafe { crate::backend::child::poll(&mut fds, 1, 0) }, 0, "the claim is never opened for write, revents {}", fds.revents);
 }
 
 #[test]
@@ -320,42 +323,41 @@ fn the_sweeper_reaps_only_old_prefetch_files() {
 
 #[test]
 fn a_different_path_never_spends_the_once_flag() {
-    let (_lock, _env) = hold_env();
+    let _lock = hold_consumed();
     reset_consumed();
     let (_dir, runtime) = runtime_fixture("gvfs-other-path");
-    std::env::set_var("XDG_RUNTIME_DIR", _dir.path().join("runtime"));
     let dest = write_prefetch(&runtime, "gvfs-1.list", TWO_ROWS);
     let mtime_ms = dest.metadata().unwrap().modified().unwrap().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
     let other = Prefetch { dest: dest.clone(), path: SHARE.to_string(), start_ms: mtime_ms - 1000 };
-    assert!(adopt_matching("/run/user/1000/gvfs/smb-share:server=t,share=u/other", false, &other).is_none());
+    assert!(adopt_matching_in("/run/user/1000/gvfs/smb-share:server=t,share=u/other", false, &other, Some(&runtime)).is_none());
     assert!(!CONSUMED.load(Ordering::SeqCst), "a path that never matched spends no once flag");
     assert!(dest.exists(), "another path takes today's gio path and leaves the file");
     let matching = Prefetch { dest: dest.clone(), path: SHARE.to_string(), start_ms: mtime_ms - 1000 };
-    assert!(adopt_matching(SHARE, false, &matching).is_some(), "the matching path still adopts after the miss");
+    assert!(adopt_matching_in(SHARE, false, &matching, Some(&runtime)).is_some(), "the matching path still adopts after the miss");
     reset_consumed();
 }
 
 #[test]
 fn the_scan_adopts_once_then_falls_back_to_gio() {
-    let (_lock, _env) = hold_env();
+    let _lock = hold_consumed();
     reset_consumed();
     let dir = TestDir::new("gvfs-once");
     let runtime = dir.path().join("runtime/flea");
     std::fs::create_dir_all(&runtime).unwrap();
     std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::env::set_var("XDG_RUNTIME_DIR", dir.path().join("runtime"));
+    let runtime_root = dir.path().join("runtime");
     let marker = dir.path().join("gio-ran");
     let gio = fake_gio(&dir, "gio", &format!("#!/bin/sh\ntouch {}\nprintf 'smb://h/share/from-gio.txt\\t5\\t(regular)\\ttime::modified=7\\n'\n", marker.display()));
     let start_ms = fresh_start_ms();
     let dest = runtime.join("gvfs-1.list");
     std::fs::write(&dest, TWO_ROWS).unwrap();
     let prefetch = Prefetch { dest: dest.clone(), path: SHARE.to_string(), start_ms };
-    let (first, _) = crate::backend::scan::scan_with(SHARE, false, Some(prefetch), &gio).unwrap();
+    let (first, _) = crate::backend::scan::scan_in(SHARE, false, Some(prefetch), &gio, &|| Some(runtime_root.join("flea"))).unwrap();
     assert_eq!((first.len(), first.name(0)), (1, "a.txt"), "the first scan of the path spawns no gio child");
     assert!(!marker.exists());
     std::fs::write(&dest, TWO_ROWS).unwrap();
     let again = Prefetch { dest, path: SHARE.to_string(), start_ms };
-    let (second, _) = crate::backend::scan::scan_with(SHARE, false, Some(again), &gio).unwrap();
+    let (second, _) = crate::backend::scan::scan_in(SHARE, false, Some(again), &gio, &|| Some(runtime_root.join("flea"))).unwrap();
     assert_eq!((second.len(), second.name(0)), (1, "from-gio.txt"));
     assert!(marker.exists(), "the second listing takes today's gio path");
     reset_consumed();
@@ -363,31 +365,34 @@ fn the_scan_adopts_once_then_falls_back_to_gio() {
 
 #[test]
 fn the_launcher_arms_only_a_gvfs_path() {
-    let (_lock, _env) = hold_env();
     let dir = TestDir::new("gvfs-prepare");
     let root = dir.path().join("runtime");
-    std::fs::create_dir_all(&root).unwrap();
-    std::env::set_var("XDG_RUNTIME_DIR", &root);
-    assert!(prepare("/home/gm").is_none(), "a local launch does nothing new");
-    let (dest, start_ms) = prepare(SHARE).expect("a gvfs launch names its file");
+    let runtime = runtime_dir_from(Some(root.clone().into_os_string()));
+    assert_eq!(runtime, Some(root.join("flea")), "the session's runtime root names Flea's own dir under it");
+    assert!(runtime_dir_from(Some("".into())).is_none() && runtime_dir_from(None).is_none(), "a session naming no runtime root names no dir");
+    // prepare_for is the gate prepare runs with the session's dir, so both arms are driven here.
+    assert!(prepare_for("/home/gm", runtime.clone()).is_none(), "a local launch does nothing new");
+    assert!(!root.exists(), "a local launch makes no directory");
+    assert!(prepare_for(SHARE, None).is_none(), "a gvfs launch in a session without a runtime dir arms nothing");
+    let (dest, start_ms) = prepare_for(SHARE, runtime).expect("a gvfs launch names its file");
     assert!(start_ms > 0);
-    assert_eq!(dest.parent(), Some(runtime_dir().as_deref().unwrap()));
+    assert_eq!(dest.parent(), Some(root.join("flea").as_path()));
     assert!(dest.file_name().unwrap().to_string_lossy().starts_with("gvfs-"));
     assert_eq!(dest.parent().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o700);
 }
 
 #[test]
 fn the_environment_names_all_three_or_nothing() {
-    let (_lock, _env) = hold_env();
-    let dir = TestDir::new("gvfs-env");
-    let root = dir.path().join("runtime");
-    std::fs::create_dir_all(&root).unwrap();
-    std::env::set_var("XDG_RUNTIME_DIR", &root);
-    std::env::set_var(PREFETCH_ENV, root.join("flea/gvfs-1.list"));
-    std::env::set_var(PATH_ENV, SHARE);
-    std::env::set_var(START_ENV, "12345");
-    let named = env_prefetch().expect("three set variables read as one prefetch");
+    let env = |start: &'static str, path: bool| move |name: &str| -> Option<std::ffi::OsString> {
+        match name {
+            PREFETCH_ENV => Some("/run/user/1000/flea/gvfs-1.list".into()),
+            PATH_ENV if path => Some(SHARE.into()),
+            START_ENV => Some(start.into()),
+            _ => None,
+        }
+    };
+    let named = env_prefetch_from(env("12345", true)).expect("three set variables read as one prefetch");
     assert_eq!((named.path.as_str(), named.start_ms), (SHARE, 12345));
-    std::env::set_var(START_ENV, "not-a-number");
-    assert!(env_prefetch().is_none(), "an unparsable start is no prefetch");
+    assert!(env_prefetch_from(env("not-a-number", true)).is_none(), "an unparsable start is no prefetch");
+    assert!(env_prefetch_from(env("12345", false)).is_none(), "a missing path is no prefetch");
 }

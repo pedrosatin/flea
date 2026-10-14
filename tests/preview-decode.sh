@@ -74,6 +74,20 @@ magick -size 3000x100 xc:gray60 "$photos/banner.png" \
     || { echo "preview-decode.sh: banner generation failed"; exit 1; }
 magick -size 120x68 xc:gray40 "$photos/small.png" \
     || { echo "preview-decode.sh: small fixture generation failed"; exit 1; }
+# An ASCII STL no Qt plugin decodes, its valid cache thumbnail, and two undecodable PNGs with no thumbnail.
+printf 'solid stl-fallback-fixture\nendsolid stl-fallback-fixture\n' > "$photos/model.stl" \
+    || { echo "preview-decode.sh: stl fixture generation failed"; exit 1; }
+magick -size 256x192 xc:gray40 "$photos/stl-cache.png" \
+    || { echo "preview-decode.sh: stl cache generation failed"; exit 1; }
+printf 'not a png\n' > "$photos/bad.png" \
+    || { echo "preview-decode.sh: bad-png fixture generation failed"; exit 1; }
+# Two more models, shown by the Columns preview: one with no thumbnail on offer, one whose thumbnail is still to come.
+printf 'solid columns-fixture\nendsolid columns-fixture\n' > "$photos/mount.stl" \
+    || { echo "preview-decode.sh: columns stl fixture generation failed"; exit 1; }
+cp "$photos/mount.stl" "$photos/pending.stl" \
+    || { echo "preview-decode.sh: pending stl fixture generation failed"; exit 1; }
+printf 'not a png\n' > "$photos/late.png" \
+    || { echo "preview-decode.sh: late-png fixture generation failed"; exit 1; }
 # The interim's own cache files: the small one draws at the original's pixels, the large one at 256 wide.
 cp "$photos/small.png" "$photos/smallcache.png" \
     || { echo "preview-decode.sh: small cache generation failed"; exit 1; }
@@ -223,6 +237,164 @@ else
         *"shown=false ready=false status=loading"*) ok "a missing cache file shows no interim and Quick Look keeps waiting on the final" ;;
         *) bad "the heldbad phase did not wait on the final: '$heldbad' (log $log)" ;;
     esac
+    # Sample input: 'PREVIEW REOPEN held' is the close/open while the final still decodes, landed on the interim without the cap.
+    if grep -a -q "PREVIEW REOPEN held" "$log"; then
+        ok "a reopen while the final decodes lands on the interim without the cap"
+    else
+        bad "the reopen never landed on the interim (log $log)"
+    fi
+    # The STL fallback keeps the cache thumbnail as its picture at the column's fit, and no status change carries the sentence.
+    # Sample input: 'PREVIEW STLFALLBACK status=image sawfailure=false frect=52,0,516,388 thumb=256x192 box=620x388 handed=false'.
+    stl=$(grep -a "PREVIEW STLFALLBACK " "$log" | head -1)
+    stl_thumb=$(printf '%s' "$stl" | sed -n 's/.* thumb=\([0-9]*x[0-9]*\).*/\1/p')
+    stl_frect=$(printf '%s' "$stl" | sed -n 's/.* frect=\([0-9,]*\).*/\1/p')
+    stl_box=$(printf '%s' "$stl" | sed -n 's/.* box=\([0-9]*x[0-9]*\).*/\1/p')
+    stl_status=$(printf '%s' "$stl" | sed -n 's/.* status=\(image\|This image could not be read\.\).*/\1/p')
+    case "$stl_status" in
+        image) ok "Quick Look draws the STL cache thumbnail as its picture" ;;
+        *) bad "Quick Look settled the STL as '$stl_status', want image (log $log)" ;;
+    esac
+    case "$stl" in
+        *" sawfailure=false"*) ok "no status change carried the failure sentence" ;;
+        *) bad "a status change carried the failure sentence before the thumbnail (log $log)" ;;
+    esac
+    # awk because the fit is float arithmetic, which bash lacks: it repeats the Thumbs fitScale rule (a 256 CACHE_SIZE entry fills the box aspect-fit, a smaller one draws own-size; 1e18 is Infinity).
+    stl_exp=$(printf '%s' "$stl_thumb $stl_box" | awk -F'[x ]' 'NF==4 && $1>0 && $2>0 && $3>0 && $4>0 {tw=$1; th=$2; bw=$3; bh=$4; long=(tw>th?tw:th); lim=(long<256?1:1e18);
+        s=bw/tw; t=bh/th; if (t<s) s=t; if (lim<s) s=lim; w=int(tw*s+0.5); h=int(th*s+0.5);
+        printf "%d,%d,%d,%d", int((bw-w)/2+0.5), int((bh-h)/2+0.5), w, h}')
+    if [ -n "$stl_frect" ] && [ -n "$stl_exp" ] && rect_ok "$stl_frect" "$stl_exp"; then
+        ok "the STL thumbnail draws at the column size ($stl_frect)"
+    else
+        bad "the STL thumbnail drew $stl_frect, want the column size $stl_exp (log $log)"
+    fi
+    case "$stl" in
+        *" handed=false"*) ok "no Image is handed the STL itself when its thumbnail stands in" ;;
+        *) bad "an Image held model.stl as its source: '$stl' (log $log)" ;;
+    esac
+    # The same STL on a row no thumbnailer serves takes the generic file pane, and still no Image is handed it.
+    # Sample input: 'PREVIEW STLNOTHUMB status=This file cannot be previewed. kind=unsupported handed=false'.
+    stl_none=$(grep -a "PREVIEW STLNOTHUMB " "$log" | head -1)
+    case "$stl_none" in
+        *"status=This file cannot be previewed. kind=unsupported handed=false"*) ok "an STL no thumbnailer serves takes the generic file pane and no Image is handed it" ;;
+        *) bad "the STL no thumbnailer serves: '$stl_none', want the generic file pane and handed=false (log $log)" ;;
+    esac
+    # The control: an undecodable PNG with no cache thumbnail keeps today's sentence.
+    stl_ctl=$(grep -a "PREVIEW STLCONTROL " "$log" | head -1)
+    case "$stl_ctl" in
+        *"status=This image could not be read."*) ok "an undecodable PNG with no thumbnail keeps the sentence" ;;
+        *) bad "the control did not keep the sentence: '$stl_ctl' (log $log)" ;;
+    esac
+    # Qt has no plugin for a 3D model, so Quick Look asks it to decode none; the undecodable PNG still reaches it.
+    # Sample input: 'WARN scene: QML Image at file:///src/ui/PreviewImage.qml[79:5]: Error decoding: file:///t/photos/model.stl: Unsupported image format'.
+    # grep -c prints 0 and exits 1 on no match, the pass case, and prints nothing on an unreadable log.
+    stl_decodes=$(grep -a -c 'Error decoding: .*/model\.stl' "$log" 2>/dev/null) || true
+    png_decodes=$(grep -a -c 'Error decoding: .*/bad\.png' "$log" 2>/dev/null) || true
+    if [ -z "$stl_decodes" ] || [ -z "$png_decodes" ]; then
+        bad "the decode warnings could not be counted, the log is missing or unreadable (log $log)"
+    else
+        if [ "$stl_decodes" -eq 0 ]; then
+            ok "Quick Look asks Qt to decode no STL"
+        else
+            bad "Qt was asked to decode model.stl $stl_decodes time(s) (log $log)"
+        fi
+        if [ "$png_decodes" -ge 1 ]; then
+            ok "and the pattern matches the warning Qt logged for the PNG that cannot decode"
+        else
+            bad "the log carries no decode warning for bad.png, so the pattern may not match Qt's warning (log $log)"
+        fi
+    fi
+    # The Columns preview frame refuses a thumbnail-less model the same way, and settles on the sentence a refused decode shows.
+    # Sample input: 'PREVIEW COLMODEL source= seen=false status=3 note=no preview could be made ready=true' where status 3 is Image.Error.
+    colmodel=$(grep -a "PREVIEW COLMODEL " "$log" | head -1)
+    case "$colmodel" in
+        *"PREVIEW COLMODEL source= seen=false "*) ok "the Columns frame never gives mount.stl to its picture" ;;
+        *) bad "the Columns frame was given mount.stl as its source: '$colmodel' (log $log)" ;;
+    esac
+    colmodel_decodes=$(grep -a -c 'Error decoding: .*/mount\.stl' "$log")
+    if [ "$colmodel_decodes" -eq 0 ]; then
+        ok "the Columns preview asks Qt to decode no STL"
+    else
+        bad "Qt was asked to decode mount.stl $colmodel_decodes time(s) (log $log)"
+    fi
+    case "$colmodel" in
+        *" status=3 note=no preview could be made ready=true"*) ok "and the frame settles on the sentence a refused decode shows, ready for the swap" ;;
+        *) bad "the Columns frame did not settle on a refused decode: '$colmodel' (log $log)" ;;
+    esac
+    # A model whose thumbnail is still to come is not settled: the frame reads Null, shows no sentence, and the swap keeps waiting.
+    # Sample input: 'PREVIEW COLPENDING status=0 note= ready=false sawerror=false sawsentence=false' where status 0 is Image.Null.
+    colpending=$(grep -a "PREVIEW COLPENDING " "$log" | head -1)
+    case "$colpending" in
+        *" status=0 note= ready=false sawerror=false sawsentence=false") ok "a model with its thumbnail pending reads no Error and shows no sentence, so the swap keeps waiting" ;;
+        *) bad "the Columns frame settled on a model whose thumbnail is pending: '$colpending' (log $log)" ;;
+    esac
+    # Sample input: 'PREVIEW COLLAND status=1 source=stl-cache.png note= ready=true sawerror=false sawsentence=false' where status 1 is Image.Ready.
+    colland=$(grep -a "PREVIEW COLLAND " "$log" | head -1)
+    case "$colland" in
+        *" status=1 source=stl-cache.png note= ready=true sawerror=false sawsentence=false") ok "and the frame draws the thumbnail once it lands" ;;
+        *) bad "the Columns frame did not draw the thumbnail that landed: '$colland' (log $log)" ;;
+    esac
+    # #263: Quick Look opened before the row's thumbnail exists asks for it once the decode fails, and waits on the loading state.
+    # Sample input: 'PREVIEW LATE landed pend=loading asks=0 pendsaw=false pendframes=0 total=1 rows=7 end=image saw=false frames=0 fallback=true'.
+    late() { grep -a "PREVIEW LATE $1 " "$log" | head -1; }
+    late_has() { case " $(late "$1") " in *" $2 "*) return 0 ;; esac; return 1; }
+    late_all() { local leg=$1; shift; for want in "$@"; do late_has "$leg" "$want" || return 1; done; }
+    if late_all model pend=loading asks=0 total=1 rows=7 end=image saw=false frames=0 pendsaw=false pendframes=0 fallback=true; then
+        ok "a 3D model a thumbnailer serves opens the image pane before its thumbnail, asks for it, and ends on the picture"
+    else
+        bad "the model leg: '$(late model)', want the image pane, one ask for row 7, loading throughout, then the picture (log $log)"
+    fi
+    if late_all landed pend=loading asks=0 total=1 rows=7 end=image saw=false frames=0 pendsaw=false pendframes=0 fallback=true; then
+        ok "a cache-only mark waits for its reply, then asks in full, and a thumbnail that lands ends on the picture with no frame of the sentence"
+    else
+        bad "the landed leg: '$(late landed)', want no ask while the cache-only reply was owed, one ask for row 7, loading throughout, then the picture (log $log)"
+    fi
+    if late_all refused pend=loading asks=0 total=1 rows=7 end=sentence pendsaw=false pendframes=0; then
+        ok "a refused reply ends on the sentence after the loading state"
+    else
+        bad "the refused leg: '$(late refused)', want loading while the reply was owed, then the sentence (log $log)"
+    fi
+    if late_all asked pend=loading asks=0 total=0 end=image saw=false frames=0 fallback=true; then
+        ok "a row the planner already asked for is waited on, never asked twice"
+    else
+        bad "the asked leg: '$(late asked)', want no ask of our own and the picture once the reply lands (log $log)"
+    fi
+    if late_all forgot pend=loading asks=0 total=1 rows=7 end=sentence pendsaw=false; then
+        ok "an ask forgotten while its reply is owed ends on the sentence"
+    else
+        bad "the forgot leg: '$(late forgot)', want one ask, then the sentence once the entry was forgotten (log $log)"
+    fi
+    if late_all relist pend=loading asks=0 total=2 rows=7,8 held=loading end=image saw=false frames=0 fallback=true; then
+        ok "a re-list while the reply is owed finds the file again, asks once on the new listing and ends on the picture"
+    else
+        bad "the relist leg: '$(late relist)', want a second ask for row 8 and the picture (log $log)"
+    fi
+    if late_all vanish pend=loading asks=0 total=1 rows=7 held=loading end=sentence; then
+        ok "a re-list that drops the file asks nothing more and ends on the sentence"
+    else
+        bad "the vanish leg: '$(late vanish)', want no second ask and the sentence (log $log)"
+    fi
+    for leg in off hold; do
+        if late_all "$leg" pend=sentence asks=0 total=0 end=sentence; then
+            ok "thumbnails $leg asks nothing and keeps the sentence"
+        else
+            bad "the $leg leg: '$(late "$leg")', want no ask and the sentence (log $log)"
+        fi
+    done
+    if late_all move pend=loading asks=0 second= total=1 rows=8 stale=none held=loading end=sentence pendsaw=false; then
+        ok "a cursor move while a reply is owed asks for the new row alone and never binds the old row's reply"
+    else
+        bad "the move leg: '$(late move)', want the ask for row 8 alone and row 7's reply unbound (log $log)"
+    fi
+    if late_all drift pend=loading asks=0 total=0 bound=none end=sentence pendsaw=false; then
+        ok "a reply for a row that drifted onto another file binds nothing"
+    else
+        bad "the drift leg: '$(late drift)', want the reply unbound and the sentence (log $log)"
+    fi
+    if late_all decodable pend=image asks=0 total=0 end=image; then
+        ok "a decodable image asks for no thumbnail"
+    else
+        bad "the decodable leg: '$(late decodable)', want no ask and the picture (log $log)"
+    fi
     # e81f-r3: the interim meta-row guards, one PREVIEW GUARD line each.
     if grep -a -q "PREVIEW GUARD1 PASS" "$log"; then
         ok "the interim refuses a meta reply for a row that drifted onto another file"
@@ -248,6 +420,6 @@ fi
 
 printf 'preview-decode: %s check(s), %s failed\n' "$((pass + fail))" "$fail"
 if [ "$fail" -ne 0 ]; then
-    grep -a -E 'TypeError|ReferenceError|ERROR|INTERIM|GUARD' "$log" | head -20
+    grep -a -E 'TypeError|ReferenceError|ERROR|INTERIM|GUARD|LATE' "$log" | head -20
 fi
 [ "$fail" -eq 0 ]

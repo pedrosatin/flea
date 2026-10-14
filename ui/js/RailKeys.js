@@ -26,17 +26,36 @@ function messaged(sidebar, isError) {
     if (isError && sidebar) sidebar.focusOnOpen = false
 }
 
-// The Trash row's accent reads as open, so the cursor shows only while Trash is open, focused, or menu-held.
-function trashCursor(trashActive, isCursor, focused, menuOnRow) {
-    if (trashActive) return true
-    if (!isCursor) return false
-    return Boolean(focused || menuOnRow)
+// The keyboard cursor draws its own frame only while the keyboard holds the rail: not under an open rail menu, and not after a pointer press until a rail key; the lit place is Places.heldBy's, Trash included.
+function cursorDrawn(focused, menuOpen, pointerFocus) {
+    return Boolean(focused && !menuOpen && !pointerFocus)
 }
 
-// The rail answers ten of the key table's action names and ignores the rest while it has focus.
-function act(action, root, sidebar) {
-    // Any other rail key ends a mount-first open's claim on the focus.
+// Right Arrow from a row whose mark releases moves the keyboard onto that mark, read raw because the table resolves Right to opening the row in every preset.
+function markKey(event, root, sidebar) {
+    if (event && (event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)) !== 0) return false
+    var key = event ? event.key : 0
+    if (!sidebar.markFocused) {
+        if (key !== Qt.Key_Right || !Eject.releasable(sidebar.entries[sidebar.cursorIndex])) return false
+        sidebar.markFocused = true
+        return true
+    }
+    if (key === Qt.Key_Left || key === Qt.Key_Escape) sidebar.markFocused = false
+    else if (key === Qt.Key_Return || key === Qt.Key_Enter || key === Qt.Key_Space) {
+        sidebar.markFocused = false
+        Eject.release(root, sidebar, true)
+    } else if (key !== Qt.Key_Right) return false
+    return true
+}
+
+// The rail answers ten of the key table's action names and ignores the rest while it has focus; event is the key itself, for the ones the table does not name.
+function act(action, root, sidebar, event) {
+    // Any other rail key ends a mount-first open's claim on the focus, and shows the keyboard frame a pointer press hid.
     sidebar.focusOnOpen = false
+    sidebar.pointerFocus = false
+    if (markKey(event, root, sidebar)) return
+    // A cursor key leaves the mark for the rows, even on the first or last row where the cursor stays.
+    if (action.indexOf("cursor") === 0) sidebar.markFocused = false
     switch (action) {
     case "cursorDown": sidebar.cursorIndex = Math.min(sidebar.entries.length - 1, sidebar.cursorIndex + 1); return
     case "cursorUp": sidebar.cursorIndex = Math.max(0, sidebar.cursorIndex - 1); return

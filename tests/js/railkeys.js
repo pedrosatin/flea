@@ -53,6 +53,10 @@ function run(check) {
     var emptyRail = { entries: [], cursorIndex: 0 }
     RailKeys.act("cursorLast", railPane(), emptyRail)
     check("and an empty rail has no last row to reach", emptyRail.cursorIndex, 0)
+    // A pointer press hid the keyboard frame; the next rail key is the keyboard's and shows it again.
+    var pressedRail = { entries: [1, 2, 3], cursorIndex: 0, pointerFocus: true }
+    RailKeys.act("cursorDown", railPane(), pressedRail)
+    check("a rail key after a pointer press shows the frame again", pressedRail.pointerFocus, false)
 
     // #181: opening a rail row hands focus to the folder it opened, and an empty rail opens nothing.
     var opening = railPane()
@@ -156,7 +160,7 @@ function run(check) {
     var favourite = rail([home], 0)
     RailKeys.act("menu", railing, favourite)
     check("a row with nothing to release says why instead of swallowing the key",
-          favourite.opened + "|" + railing.said, "0|Home has nothing to eject or unmount.")
+          favourite.opened + "|" + railing.said, "0|Home has nothing to eject or unmount")
     var empty = rail([], 0)
     railing.said = ""
     RailKeys.act("menu", railing, empty)
@@ -165,10 +169,8 @@ function run(check) {
 
     // Finder's Cmd+E on the rail's own cursor row. The release goes through the same releaseChosen a
     // chosen menu row takes, carrying the row's key and not its index.
-    // RailAdditions rule 1's switch builds this row, so it carries the board's own menu
-    // (Open, Unmount, Eject) rather than the single Eject 0.2.1 drew: without volumeMenu the
-    // release below cannot tell rows[0] from the release.
-    var stick = { label: "128GB", group: "device", kind: "volume", device: "/dev/sda1", path: "/run/media/user/128GB", mounted: true, removable: true, volumeMenu: true }
+    // Every mounted volume offers Open and Unmount, so the release below never reads rows[0].
+    var stick = { label: "128GB", group: "device", kind: "volume", device: "/dev/sda1", path: "/run/media/user/128GB", mounted: true, removable: true }
     var ejecting = ejectPane("/home/user", [home, stick], 1)
     RailKeys.act("eject", ejecting, ejecting.sidebar)
     check("ctrl e in the rail ejects the cursor row by its key",
@@ -176,7 +178,7 @@ function run(check) {
     var favouriteRail = ejectPane("/home/user", [home, stick], 0)
     RailKeys.act("eject", favouriteRail, favouriteRail.sidebar)
     check("ctrl e on a favourite says why, and releases nothing",
-          favouriteRail.sidebar.released.length + "|" + favouriteRail.said, "0|Home has nothing to eject or unmount.")
+          favouriteRail.sidebar.released.length + "|" + favouriteRail.said, "0|Home has nothing to eject or unmount")
     // The release is picked by name, never by position: a share offers only Unmount, and a
     // phone leads with Open beside its Unmount the way a volume does, so rows[0] would open both.
     var share = { label: "isos", group: "network", kind: "share", uri: "smb://example.com/isos/", path: "", mounted: true }
@@ -190,15 +192,11 @@ function run(check) {
     check("ctrl e on a phone unmounts it rather than opening it",
           onPhone.sidebar.released.join(","), "unmountPhone:mtp://Google_Pixel_7_1A2B/")
 
-    // Leaving Trash takes the accent cursor off its row: unfocused with no menu is dark.
-    check("leaving Trash takes the accent cursor off the Trash row",
-          RailKeys.trashCursor(false, true, false, false), false)
-    check("the Trash row keeps the cursor while the rail has focus",
-          RailKeys.trashCursor(false, true, true, false), true)
-    check("the Trash row keeps the cursor while its own rail menu is open",
-          RailKeys.trashCursor(false, true, false, true), true)
-    check("the Trash row keeps the cursor while Trash is open",
-          RailKeys.trashCursor(true, true, false, false), true)
-    check("a rail menu on another row leaves this one dark",
-          RailKeys.trashCursor(false, false, false, true), false)
+    // The frame draws only while the keyboard holds the rail; Trash lights by Places.heldBy, so no row is special.
+    check("an unfocused rail with no menu draws no cursor", RailKeys.cursorDrawn(false, false, false), false)
+    check("a focused rail draws its cursor", RailKeys.cursorDrawn(true, false, false), true)
+    check("a right click's open rail menu draws no frame on its row", RailKeys.cursorDrawn(false, true, false), false)
+    check("a keyboard-opened rail menu draws no frame on its row", RailKeys.cursorDrawn(true, true, false), false)
+    check("a pointer press on a focused rail draws no frame", RailKeys.cursorDrawn(true, false, true), false)
+    check("a missing menu is not an open one", RailKeys.cursorDrawn(true, undefined, false), true)
 }

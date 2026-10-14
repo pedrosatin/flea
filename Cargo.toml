@@ -1,11 +1,15 @@
 [package]
 name = "flea"
-version = "0.3.9"
+version = "0.3.10"
 edition = "2021"
 # src/vulkan.rs uses c"..." literals, stabilised in 1.77; without this the error names rustc, not flea.
 rust-version = "1.77"
 
 [dependencies]
+
+[features]
+# Bench-only: the flasher's loop-device seam for a marked root, never enabled by packaging or any default build.
+flash-test-seam = []
 
 [profile.release]
 opt-level = 3

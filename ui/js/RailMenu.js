@@ -70,6 +70,13 @@ function placeSaved(sidebar, mounts, requestId, uri, success) {
 // Both Services re-check the kind themselves; this only resolves which row was meant, and the rail
 // itself owns the two rows that need no mount at all.
 function release(action, key, devices, mounts, sidebar) {
+    // Flash image hands the pane the volume's whole disk to match against its own drive list.
+    if (action === "flashImage") {
+        var at = Mounts.rowByKey(sidebar.deviceEntries, key)
+        if (at >= 0 && sidebar.navigationPane)
+            sidebar.navigationPane.openFlashDrive(sidebar.deviceEntries[at].device)
+        return
+    }
     if (action === "eject") {
         var volume = Mounts.rowByKey(sidebar.deviceEntries, key)
         if (volume >= 0)
@@ -78,7 +85,7 @@ function release(action, key, devices, mounts, sidebar) {
     }
     // RailAdditions rule 2: Mount and Open are the row's own activation, which mounts when it has to
     // and opens either way, so the menu row and Enter cannot drift apart.
-    if (action === "mountVolume" || action === "unmountVolume") {
+    if (action === "mountVolume" || action === "unmountVolume" || action === "unlockVolume") {
         var row = Mounts.rowByKey(sidebar.deviceEntries, key)
         if (row < 0)
             return

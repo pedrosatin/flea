@@ -2,12 +2,13 @@
 
 .import "Menu.js" as Menu
 .import "Errors.js" as Errors
+.import "StateWords.js" as StateWords
 
-// The Locked tile's own menu, issue 193 follow-up (GM, 2026-09-24). A right click on the
+// The Locked tile's own menu, issue 193 follow-up (2026-09-24). A right click on the
 // tile names the locked folder itself, never the parent behind it, so only rows that act
 // on that folder without listing it are offered: terminal, permissions and path. Kept in
 // ui/js/Menu.js INVENTORY order, one group, so the menu never reorders under its caller.
-// Controller ruling for 0.3.8: the tile keeps its single Copy path row, acting as before,
+// For 0.3.8: the tile keeps its single Copy path row, acting as before,
 // while its visibility follows the Copy as switch that replaced Copy path in Settings > Menus.
 // A Places row's menu keeps the flat row the same way (ui/js/Menu.js availableEntry).
 var LOCKED_IDS = ["openTerminal", "permissions", "copyAs"]
@@ -30,8 +31,8 @@ function lockedEntries(p) {
         if (entry.action === "permissions") {
             var permission = lockedPermissions(p.lockedMode)
             entry.disabled = permission.disabled
-            if (permission.errored) entry.errored = true
-            else delete entry.errored
+            if (permission.errored) { entry.errored = true; if (permission.hint) entry.hint = permission.hint }
+            else { delete entry.errored; delete entry.hint }
         }
         if (out.length && group !== spec[4]) out.push({ separator: true })
         group = spec[4]
@@ -47,11 +48,16 @@ function lockedRefusal(p) {
 
 // The mode is the locked directory's own, so ownership decides: a denial on owner-readable
 // owner-executable proves somebody else owns it, and nobody but the owner can chmod it back,
-// which reads red the way a provider that cannot answer does. An owner locked out too may
-// still be the owner, so that row stays plain: it is the way back in.
+// which reads red with its state word, the way a provider that cannot answer does. An owner
+// locked out too may still be the owner, so that row stays plain: it is the way back in.
 function lockedPermissions(mode) {
     var kind = (Number(mode) || 0) & 0o170000
-    if (kind !== 0o100000 && kind !== 0o040000) return { disabled: true, errored: true }
-    if (Errors.notYours(mode)) return { disabled: true, errored: true }
+    if (kind !== 0o100000 && kind !== 0o040000) {
+        var bad = { disabled: true, errored: true }
+        var word = StateWords.permissions(mode)
+        if (word) bad.hint = word
+        return bad
+    }
+    if (Errors.notYours(mode)) return { disabled: true, errored: true, hint: StateWords.WORDS.permissionsNotYours }
     return { disabled: false }
 }

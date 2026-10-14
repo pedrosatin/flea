@@ -103,8 +103,10 @@ QtObject {
         // File pointing belongs to quicklook-firstframe; the path handler only needs it callable here.
         root.pointFile = function () {}
         root.path = "/doc/B.md"
-        new Function("root", "reloadCoalesce", body(source, "    onPathChanged: {"))(root, { stop: function () {} })
+        var tableRoute = { resets: 0, reset: function () { this.resets++ } }
+        new Function("root", "reloadCoalesce", "tableRoute", body(source, "    onPathChanged: {"))(root, { stop: function () {} }, tableRoute)
         check(root.parseError === "" && root.status === "loading", "F41 unloaded path clears previous error")
+        check(tableRoute.resets === 1, "a path change forgets the old document's table places")
         root.askParse = function () { ask(root, file, markdown, timer, parserLoader) }
         root.parseError = "probe previous fault"
         root.askParse()
@@ -260,7 +262,7 @@ QtObject {
     readonly property real endRoundingPx: 0.5
     function endStub(source) {
         var list = { originY: 0, topMargin: endInsetPx, bottomMargin: endInsetPx, contentHeight: endContentPx, height: endViewPx, contentY: 0 }
-        var root = { seenHeight: 0, endBuilt: false, lastBuilt: true, snappingToEnd: false, samePlacePx: 1, blockList: ["first", "last"] }
+        var root = { seenEnd: 0, endBuilt: false, lastBuilt: true, snappingToEnd: false, samePlacePx: 1, blockList: ["first", "last"] }
         root.blockItem = function () { return root.lastBuilt ? {} : null }
         var note = new Function("root", body(source, "function noteEnd()"))
         root.noteEnd = function () { note(root) }
@@ -342,14 +344,14 @@ QtObject {
             }
         })
         // The stub's own first holdEnd primed these, so the growth below reaches the snap and no earlier exit.
-        var primed = held.root.endBuilt && held.root.seenHeight === endContentPx
+        var primed = held.root.endBuilt && held.root.seenEnd === endContentPx
         var error = ""
         try {
             held.root.grow(endGrowPx)
         } catch (thrown) {
             error = String(thrown)
         }
-        check(primed && error === "" && writes === 1 && !held.root.snappingToEnd, "N1 a height that settles under the snap does not re-enter it (primed " + primed + ", endBuilt " + held.root.endBuilt + ", seenHeight " + held.root.seenHeight + " of " + endContentPx + ", writes " + writes + ", snappingToEnd " + held.root.snappingToEnd + " " + error + ")")
+        check(primed && error === "" && writes === 1 && !held.root.snappingToEnd, "N1 a height that settles under the snap does not re-enter it (primed " + primed + ", endBuilt " + held.root.endBuilt + ", seenEnd " + held.root.seenEnd + " of " + endContentPx + ", writes " + writes + ", snappingToEnd " + held.root.snappingToEnd + " " + error + ")")
     }
 
     function lazyChecks() {
@@ -376,9 +378,12 @@ QtObject {
         var tooLarge = expression(markdownSource, /readonly property bool tooLarge:([^\n]*)/)
         // Sample input: function pointFile() { then var want = (root.active && !root.tooLarge) ? root.path : "" on its own line.
         var readerPath = expression(body(markdownSource, "function pointFile()"), /\n\s*var want =([^\n]*)/)
+        // The loader gate the callback binds: PreviewColumn's shipped expression over a remote Markdown row.
+        var active = new Function("item", "Facts", "return" + expression(columnSource, /readonly property bool markdownActive:([^\n]*)/))(
+            { visible: true, manualHold: false, rowState: "text", isMarkdownRow: true }, { TEXT: "text" })
         var probe = Qt.createQmlObject('import QtQuick\nQtObject {\n'
-            + 'id: item\nproperty var root: ({ path: "/remote/A.md", row: { s: ' + remoteRowBytes + ' }, visible: true, '
-            + 'manualHold: false, rowState: "text", isMarkdownRow: true, textLimit: ' + remoteLimitBytes + ', truncateText: true })\n'
+            + 'id: item\nproperty var root: ({ path: "/remote/A.md", row: { s: ' + remoteRowBytes + ' }, '
+            + 'markdownActive: ' + active + ', textLimit: ' + remoteLimitBytes + ', truncateText: true })\n'
             + 'property var facts: ({ TEXT: "text" })\n'
             + 'property bool active: false\nproperty string path: ""\nproperty int size: 0\n'
             + 'property int maxBytes: ' + defaultReaderLimitBytes + '\nproperty bool truncate: false\nproperty bool compact: false\n'
@@ -405,7 +410,7 @@ QtObject {
         var column = readSource("../ui/PreviewColumn.qml")
         var shipped = readerGate(source, column)
         check(shipped.guarded, "F47 oversized remote row never exposes FileView path")
-        // GM 2026-10-03: the column never draws Source, so its wiring names no view and reads no stored choice.
+        // Decided 2026-10-03: the column never draws Source, so its wiring names no view and reads no stored choice.
         var wiring = body(column.slice(column.indexOf("id: markdownLoader")), "onLoaded:")
         check(wiring.indexOf("item.view") < 0 && wiring.indexOf("markdownView") < 0 && wiring.indexOf("ViewState") < 0,
             "F51 the column Markdown wiring sets no view and reads no stored choice")

@@ -33,6 +33,7 @@ function pane(holds) {
     }
     p.clearSelection = function () { p.cleared += 1 }
     p.message = function (text, isError) { p.said.push(text) }
+    p.armPrompted = function () {}
     p.listArea = { primeSettle: function () {} }
     p.backend = {
         list: function (path, first, hidden) { p.sent.push("list " + path) },
@@ -70,6 +71,7 @@ function keyPane(inFlight, rows) {
     p.selectedIndices = function () { return [] }
     p.renameEditor = function () { return null }
     p.message = function (text, isError) { p.said.push(text) }
+    p.armPrompted = function (text) { p.sent.push("armed " + text) }
     p.clearSelection = function () {}
     p.listArea = { primeSettle: function () {} }
     p.backend = {
@@ -132,9 +134,25 @@ function run(check) {
           Swap.begin(Swap.heard(walked, false), "ready", "", {}, 0).holding, true)
     check("a caller whose rows were never listed in the view now showing clears at once",
           Swap.begin(Swap.idle(), "ready", "", { clearAtOnce: true }, 0).holding, false)
+    var owed = Swap.begin(walked, "ready", "", { restore: { path: "/d", name: "report", index: 10 } }, 0)
+    check("an unheld Back or Forward owing a row keeps its listed line for the rows, and nothing else does",
+          owed.holding + "|" + Swap.onListed(owed, true, "/d", "/d") + "|" + Swap.onListed(Swap.begin(walked, "ready", "", {}, 0), true, "/d", "/d")
+          + "|" + Swap.landed(owed).waits + "|" + Swap.ended(owed).waits, "false|keep|apply|false|false")
     check("the query a re-read hands back rides with its own hold and no other",
           Swap.begin(Swap.idle(), "ready", "", { keptQuery: "scr" }, 0).query + "|" + Swap.begin(settled, "ready", "", {}, 0).query,
           "scr|")
+
+    // A live answer arrives with no listing out, so the old rows stay drawn until its own rows land.
+    check("a live answer while typing is kept with no listing out", Swap.keepLive("typing", false), true)
+    check("a landed live answer marks the phase, so an exit re-list holds nothing",
+          Swap.begin(Swap.heard(Swap.idle(), true), "ready", "", {}, 0).holding, false)
+    check("and after enter moved the keys to the results", Swap.keepLive("results", false), true)
+    check("and a folder answer with a listing out is never kept that way", Swap.keepLive("", true), false)
+    check("a session line lands on its open session and generation", Swap.dropSessionLine("typing", 2, 2), false)
+    check("but not with no session open", Swap.dropSessionLine("", 2, 2), true)
+    check("nor for an older generation", Swap.dropSessionLine("typing", 1, 2), true)
+    check("nor for the generation the open session started at", Swap.dropSessionLine("typing", 2, 2, false, 2), true)
+    check("while a directory line without one always lands", Swap.dropSessionLine("", 0, 2), false)
 
     // Which listed line is kept: the one naming the directory asked for, while rows are held or fallen back.
     var inner = "/home/gm/Work/inner"
@@ -177,7 +195,7 @@ function run(check) {
     var dropped = Swap.dropped(stashed)
     check("a failure ends it without the loading state, and the failure draws the rest",
           dropped.holding + "|" + dropped.fellBack, "false|false")
-    var failing = { listInFlight: true, listedSeen: true, swap: { drop: function () { failing.droppedOut = failing.listInFlight } } }
+    var failing = { listInFlight: true, listedSeen: true, swap: { phase: Swap.idle(), drop: function () { failing.droppedOut = failing.listInFlight } } }
     check("a failed listing lets held rows go while it is still out, then ends it",
           Swap.failListing(failing, "scan") + "|" + failing.droppedOut + "|" + failing.listInFlight + "|" + failing.listedSeen,
           "true|true|false|false")
@@ -197,12 +215,13 @@ function run(check) {
     check("but lets through the navigations, which refuse themselves, escape, and the keys that change the window",
           Swap.ANSWERED_WHILE_LISTING.filter(function (a) { return Swap.swallows(true, a) }).join(",") + "|"
           + Swap.ANSWERED_WHILE_LISTING.join(","),
-          "|open,parent,historyBack,historyForward,escape,viewList,viewColumns,viewGrid,sidebar,windowNew,togglePreview,reload")
+          "|open,parent,historyBack,historyForward,escape,viewList,viewColumns,viewGrid,viewDual,sidebar,windowNew,togglePreview,reload")
     check("a pane with no listing out swallows nothing", Swap.swallows(false, "trash"), false)
     check("and an unbound key is left to the route that names the filter", Swap.swallows(true, ""), false)
 
     // The control: at rest the same keys over a row really reach the backend through the real route.
-    check("at rest dd trashes the cursor row", pressed(false, FILE, DD).sent.join(","), "trash 0")
+    check("at rest dd trashes the cursor row, and its first d reaches armPrompted with the arm sentence, not message",
+          pressed(false, FILE, DD).sent.join("/") + "|" + pressed(false, FILE, DD).said.join(""), "armed Press d again to move it to Trash, or Delete on its own./trash 0|")
     check("and Delete does too", pressed(false, FILE, DELETE).sent.join(","), "trash 0")
     check("and F2 opens the rename", pressed(false, FILE, F2).sent.join(","), "rename")
     check("and Return opens the row", pressed(false, FILE, RETURN).sent.join(","), "open /home/gm/Work/a.txt")
@@ -221,8 +240,8 @@ function run(check) {
     check("held rows send nothing for dd, Delete, F2 or Return either",
           [DD, DELETE, F2, RETURN].map(function (keys) { return pressed(true, FILE, keys).sent.length }).join(","), "0,0,0,0")
     var heldBack = pressed(true, FILE, [key(Qt.Key_Backspace, "\b")])
-    check("while Backspace still reaches the pane, which refuses it the same way",
-          heldBack.acted.join(",") + "|" + heldBack.sent.length + "|" + heldBack.said.join(""), "parent|0|" + Swap.LOADING)
+    check("while Backspace still reaches the pane, which climbs from the listing out and says nothing",
+          heldBack.acted.join(",") + "|" + heldBack.sent.length + "|" + heldBack.said.join(""), "parent|1|")
 
     // What one frame showed while a listing was out.
     check("a listing out drawn in the loading state before the cap is the blank frame", Swap.frameKind(true, "loading", false), "blank")

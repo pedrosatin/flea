@@ -2,8 +2,8 @@
 # Headless pins for the two-window UI case's pointer targeting and exit cleanup.
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
-repo=$(cd "$(dirname "$0")/.." && pwd) || exit 1
-. "$repo/tests/lib/hypr-dispatch.sh"
+repo=$(pwd)
+. "$repo/tests/lib/hypr-dispatch.sh" || exit 1
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT
 source_file=${XW_HARNESS_SOURCE:-$repo/tests/ui.sh}
@@ -44,7 +44,7 @@ flea_process_owned() {
 }
 omarchy-drive() {
     [[ "$*" == 'click 400 600 right' ]] || fail "pointer reached another window: $*"
-    printf 'New Folder|New File|Paste\n' > "$tmp/menu"
+    printf 'New folder|New file|Paste\n' > "$tmp/menu"
     printf '%s\n' "$*" >> "$tmp/clicks"
 }
 # Exercise the real xw_ipc timeout and argv against a per-process qs stub.
@@ -179,7 +179,7 @@ xw_key() {
 xw_menu_seek() {
     local entries
     entries=$(xw_ipc "$2" contextMenuEntries)
-    [[ "$entries" == 'New Folder|New File'* ]] || fail "New File requires the background menu: $entries"
+    [[ "$entries" == 'New folder|New file'* ]] || fail "New File requires the background menu: $entries"
 }
 xw_wait_editor() {
     [[ "$mode" != failure ]] || fail 'injected editor failure'
@@ -480,6 +480,17 @@ test_pid=$!
 pgrep() {
     printf '%s\n' "$test_pid"
 }
+# Wait until the dummy cmdline carries the marker before driving the stopper.
+dummy_wait_s=5
+dummy_deadline=$((SECONDS + dummy_wait_s))
+dummy_cmdline=""
+while :; do
+    dummy_cmdline=$(tr '\0' ' ' 2>/dev/null < "/proc/$test_pid/cmdline") || dummy_cmdline=""
+    [[ "$dummy_cmdline" == *"$fixture_root/xwwatch-ui"* ]] && break
+    [[ -d "/proc/$test_pid" ]] || { printf 'FAIL dummy %s left before carrying its marker\n' "$test_pid"; failures=$((failures + 1)); break; }
+    (( SECONDS < dummy_deadline )) || { printf 'FAIL dummy %s showed no marker within %s s\n' "$test_pid" "$dummy_wait_s"; failures=$((failures + 1)); break; }
+    sleep 0.05
+done
 result=0
 ( xw_kill_second "$fixture_root/xwwatch-ui" ) > "$tmp/stop.log" 2>&1 || result=$?
 stopped=0

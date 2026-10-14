@@ -3,7 +3,7 @@ use super::{Shared, JOURNAL_FILE};
 use crate::backend::testdir::TestDir;
 use crate::backend::undo::{Entry, ItemIdentity, Journal, Step};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::channel;
 
@@ -25,21 +25,23 @@ fn shared_journal(sandbox: &TestDir) -> Journal {
     journal
 }
 
-fn guard(sandbox: &TestDir, paths: &[&Path]) {
-    for path in paths {
-        assert!(!path.as_os_str().is_empty() && path.is_absolute() && path.starts_with(sandbox.path()));
-    }
-    assert!(sandbox.path().join(".flea-test-sandbox").is_file());
-}
-
 fn rename_steps(sandbox: &TestDir, from: &str, to: &str) -> (PathBuf, PathBuf, Vec<Step>) {
     let from_path = sandbox.path().join(from);
     std::fs::write(&from_path, "payload").unwrap();
     let to_path = sandbox.path().join(to);
-    guard(sandbox, &[&from_path, &to_path]);
+    for path in [&from_path, &to_path] {
+        sandbox.assert_contains(path);
+    }
     let (dst, steps) = crate::backend::ops::rename(&from_path, to).unwrap();
     assert_eq!(dst, to_path);
     (from_path, to_path, steps)
+}
+
+// One MiB past the journal cap, so the op string alone makes the entry too big.
+const TOO_BIG: usize = super::MAX_FILE_BYTES as usize + 1024 * 1024;
+const BARRIER_MSG: &str = "That operation was too large to undo.";
+fn huge_entry(path: PathBuf) -> Entry {
+    Entry { op: "h".repeat(TOO_BIG), steps: vec![Step::Created { path }] }
 }
 
 #[test]
@@ -153,7 +155,7 @@ fn a_malformed_file_is_ignored_and_heals_on_push() {
 fn an_oversized_file_is_ignored() {
     let sandbox = TestDir::new("xundo-huge");
     let dir = runtime_0700(&sandbox);
-    let big = vec![b'x'; 33 * 1024 * 1024];
+    let big = vec![b'x'; TOO_BIG];
     std::fs::write(dir.join(JOURNAL_FILE), &big).unwrap();
     let mut journal = shared_journal(&sandbox);
     assert!(journal.undo().is_err(), "an oversized file is ignored, not trusted");
@@ -177,6 +179,26 @@ fn a_planted_symlink_at_the_journal_path_is_replaced_not_followed() {
     journal.push(Entry { op: "rename".to_string(), steps: vec![Step::Created { path: sandbox.path().join("x") }] });
     assert!(!dir.join(JOURNAL_FILE).symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
+}
+
+#[test]
+fn an_endless_journal_is_ignored_within_its_bound() {
+    let sandbox = TestDir::new("xundo-zero");
+    let dir = runtime_0700(&sandbox);
+    std::os::unix::fs::symlink("/dev/zero", dir.join(JOURNAL_FILE)).unwrap();
+    let mut journal = shared_journal(&sandbox);
+    let ignored = crate::backend::fifotest::within("an endless journal", move || journal.undo().is_err());
+    assert!(ignored, "an endless journal is ignored, not trusted");
+}
+
+#[test]
+fn a_fifo_journal_is_ignored_within_its_bound() {
+    let sandbox = TestDir::new("xundo-fifo");
+    let dir = runtime_0700(&sandbox);
+    crate::backend::fifotest::mkfifo(&dir.join(JOURNAL_FILE));
+    let mut journal = shared_journal(&sandbox);
+    let ignored = crate::backend::fifotest::within("a fifo journal", move || journal.undo().is_err());
+    assert!(ignored, "a fifo journal is ignored, not trusted");
 }
 
 #[test]
@@ -244,16 +266,16 @@ fn every_step_kind_round_trips_with_exact_integers() {
     let entry = Entry {
         op: "mixed".to_string(),
         steps: vec![
-            Step::Moved { from: dir.join("a"), to: dir.join("b"), before: id.clone(), after: id.clone() },
+            Step::Moved { from: dir.join("a"), to: dir.join("b"), before: id.clone(), after: id.clone(), rename_fat: false },
             Step::Created { path: dir.join("c") },
             Step::Linked { path: dir.join("d"), identity: id.clone(), source: dir.join("e"),
                 kind: crate::backend::link::LinkKind::Hard },
-            Step::Copied { from: dir.join("f"), to: dir.join("g"), source: id.clone(), created: id.clone(), manifest: None, manifest_nonce: None },
+            Step::Copied { from: dir.join("f"), to: dir.join("g"), source: id.clone(), created: id.clone(), manifest: None, manifest_nonce: None, merge: false, rename_fat: false },
             Step::MadeDir { path: dir.join("h"), identity: id.clone() },
             Step::MadeFile { path: dir.join("i"), identity: unborn.clone() },
-            Step::Trashed(crate::backend::trash::Entry { original: dir.join("j"), uri: "trash:///j".to_string() }),
-            Step::Mode { path: dir.join("k"), before: 0o644, after: 0o600, dev: u64::MAX, ino: 1 << 60, born: Some((1 << 62, u32::MAX)) },
-            Step::Mode { path: dir.join("l"), before: 0o644, after: 0o600, dev: u64::MAX, ino: 1 << 60, born: None },
+            Step::Trashed(crate::backend::trash::Entry { original: dir.join("j"), uri: "trash:///j".to_string(), before: Vec::new(), trashed_at: String::new() }),
+            Step::Mode { path: dir.join("k"), before: 0o644, after: 0o600, dev: u64::MAX, ino: 1 << 60, born: Some((1 << 62, u32::MAX)), generation: Some(u64::MAX) },
+            Step::Mode { path: dir.join("l"), before: 0o644, after: 0o600, dev: u64::MAX, ino: 1 << 60, born: None, generation: None },
             Step::Barrier,
         ],
     };
@@ -278,10 +300,7 @@ fn a_trash_entry_with_no_uri_is_a_record_not_a_defect() {
     let doc = super::Doc {
         undo: vec![Entry {
             op: "trash".to_string(),
-            steps: vec![Step::Trashed(crate::backend::trash::Entry {
-                original: sandbox.path().join("gone"),
-                uri: String::new(),
-            })],
+            steps: vec![Step::Trashed(crate::backend::trash::Entry::unresolved(sandbox.path().join("gone"), Vec::new(), String::new()))],
         }],
         redo: Vec::new(),
         push_gen: 0,
@@ -297,7 +316,7 @@ fn a_trash_entry_with_no_uri_is_a_record_not_a_defect() {
 #[test]
 fn foreign_records_are_never_trusted() {
     for (tag, body) in [
-        ("version", r#"{"v":3,"undo":[],"redo":[]}"#),
+        ("version", r#"{"v":4,"undo":[],"redo":[]}"#),
         ("relative", r#"{"v":1,"undo":[{"op":"rename","steps":[{"k":"c","path":"rel/x"}]}],"redo":[]}"#),
         ("kind", r#"{"v":1,"undo":[{"op":"rename","steps":[{"k":"mf","path":"/x","id":{"d":1,"i":2,"k":511,"l":0,"m":[0,0],"c":[0,0]}}]}],"redo":[]}"#),
         ("shape", r#"{"v":1,"undo":[{"op":"rename","steps":[{"k":"m","from":"/a"}]}],"redo":[]}"#),
@@ -347,14 +366,13 @@ fn a_single_entry_over_the_cap_stores_a_barrier_and_keeps_history() {
     let mut a = shared_journal(&sandbox);
     a.push(Entry { op: "small1".to_string(), steps: vec![Step::Created { path: f1.clone() }] });
     a.push(Entry { op: "small2".to_string(), steps: vec![Step::Created { path: f2.clone() }] });
-    let huge_op = "h".repeat(33 * 1024 * 1024);
-    a.push(Entry { op: huge_op, steps: vec![Step::Created { path: fh.clone() }] });
+    a.push(huge_entry(fh.clone()));
     let bytes = std::fs::read(dir.join(JOURNAL_FILE)).unwrap();
     assert!(bytes.len() as u64 <= super::MAX_FILE_BYTES, "history preserved under cap");
     let back = crate::backend::undocodec::decode(&String::from_utf8(bytes).unwrap()).unwrap();
     assert_eq!(back.undo.len(), 3, "the barrier keeps the huge entry's place in line");
     let err = a.undo().expect_err("the recorder holds no payload either");
-    assert_eq!(err.msg, "That operation was too large to undo.");
+    assert_eq!(err.msg, BARRIER_MSG);
     assert!(fh.exists(), "the barrier reverses nothing");
     let mut b = shared_journal(&sandbox);
     assert_eq!(b.undo().unwrap(), "small2", "older entries still undo from the file");
@@ -367,12 +385,11 @@ fn a_foreign_claim_of_a_huge_entry_consumes_the_barrier() {
     let fh = sandbox.path().join("fh");
     std::fs::write(&fh, "h").unwrap();
     let mut a = shared_journal(&sandbox);
-    let huge_op = "h".repeat(33 * 1024 * 1024);
-    a.push(Entry { op: huge_op, steps: vec![Step::Created { path: fh.clone() }] });
+    a.push(huge_entry(fh.clone()));
     let mut b = shared_journal(&sandbox);
     let err = b.undo().expect_err("a barrier answers a sentence in any window");
     assert_eq!(err.where_, "undo");
-    assert_eq!(err.msg, "That operation was too large to undo.");
+    assert_eq!(err.msg, BARRIER_MSG);
     assert!(fh.exists(), "the barrier reverses nothing");
     assert!(a.undo().is_err(), "the barrier was spent by the foreign claim");
 }
@@ -392,8 +409,7 @@ fn a_too_big_push_clears_the_shared_redo_stack() {
     assert_eq!(a.undo().unwrap(), "rename");
     let fh = sandbox.path().join("fh");
     std::fs::write(&fh, "h").unwrap();
-    let huge_op = "h".repeat(33 * 1024 * 1024);
-    a.push(Entry { op: huge_op, steps: vec![Step::Created { path: fh }] });
+    a.push(huge_entry(fh));
     let info = a.redo_info().unwrap_err();
     assert_eq!(info.msg, "there is nothing to redo");
 }
@@ -409,17 +425,18 @@ fn a_too_big_push_keeps_global_order_through_a_barrier() {
     std::fs::write(&fb, "h").unwrap();
     let mut a = shared_journal(&sandbox);
     a.push(Entry { op: "small-a".to_string(), steps: vec![Step::Created { path: fa.clone() }] });
-    let huge_op = "h".repeat(33 * 1024 * 1024);
-    a.push(Entry { op: huge_op, steps: vec![Step::Created { path: fb.clone() }] });
+    a.push(huge_entry(fb.clone()));
     let (rc_from, rc_to, rc_steps) = rename_steps(&sandbox, "rc.txt", "rc-renamed.txt");
-    guard(&sandbox, &[&rc_from, &rc_to]);
+    for path in [&rc_from, &rc_to] {
+        sandbox.assert_contains(path);
+    }
     a.push(Entry { op: "small-c".to_string(), steps: rc_steps });
     // Global order holds across the too-big push, so the newest goes first.
     assert_eq!(a.undo().unwrap(), "small-c");
     assert!(rc_from.exists());
     let err = a.undo().expect_err("a barrier answers a sentence, never a payload");
     assert_eq!(err.where_, "undo");
-    assert_eq!(err.msg, "That operation was too large to undo.");
+    assert_eq!(err.msg, BARRIER_MSG);
     assert!(fb.exists(), "the barrier reverses nothing");
     // A barrier never enters redo: the stack below still names small-c, not the barrier.
     assert_eq!(a.redo_info().unwrap(), ("small-c".to_string(), 1));
@@ -439,13 +456,12 @@ fn a_barrier_is_consumed_once_and_blocks_nothing_older() {
     {
         let mut a = shared_journal(&sandbox);
         a.push(Entry { op: "small-a".to_string(), steps: vec![Step::Created { path: fa.clone() }] });
-        let huge_op = "h".repeat(33 * 1024 * 1024);
-        a.push(Entry { op: huge_op, steps: vec![Step::Created { path: fh.clone() }] });
+        a.push(huge_entry(fh.clone()));
         // The recorder exits with the payload held nowhere.
     }
     let mut b = shared_journal(&sandbox);
     let err = b.undo().expect_err("a barrier answers a sentence in any window");
-    assert_eq!(err.msg, "That operation was too large to undo.");
+    assert_eq!(err.msg, BARRIER_MSG);
     assert!(fh.exists(), "the oversized payload was never reversed");
     let mut c = shared_journal(&sandbox);
     assert_eq!(c.undo().unwrap(), "small-a", "one claim spent the barrier; older entries follow");
@@ -458,7 +474,7 @@ fn a_barrier_is_consumed_once_and_blocks_nothing_older() {
 fn a_newer_version_file_is_unavailable_and_never_rewritten() {
     let sandbox = TestDir::new("xundo-newer");
     let dir = runtime_0700(&sandbox);
-    let before = r#"{"v":3,"gen":0,"undo":[],"redo":[]}"#;
+    let before = r#"{"v":4,"gen":0,"undo":[],"redo":[]}"#;
     std::fs::write(dir.join(JOURNAL_FILE), before).unwrap();
     let target = sandbox.path().join("f");
     std::fs::write(&target, "1").unwrap();
@@ -470,13 +486,26 @@ fn a_newer_version_file_is_unavailable_and_never_rewritten() {
     assert!(!target.exists());
 }
 
-// The codec reads v1, writes v2 with the barrier kind, and refuses anything newer.
+// Undo, redo and the redo preview all say one sentence when the shared file is a newer Flea's.
 #[test]
-fn the_codec_reads_v1_and_v2_and_refuses_newer() {
+fn a_journal_a_newer_flea_wrote_reads_as_history_that_could_not_be_read() {
+    let sandbox = TestDir::new("xundo-newer-sentence");
+    let dir = runtime_0700(&sandbox);
+    std::fs::write(dir.join(JOURNAL_FILE), r#"{"v":4,"gen":0,"undo":[],"redo":[]}"#).unwrap();
+    const UNREADABLE: &str = "the undo history could not be read";
+    assert_eq!(shared_journal(&sandbox).undo().unwrap_err().msg, UNREADABLE);
+    assert_eq!(shared_journal(&sandbox).redo_info().unwrap_err().msg, UNREADABLE);
+    let (tx, _rx) = channel();
+    assert_eq!(shared_journal(&sandbox).redo(1, &AtomicBool::new(false), &tx).unwrap_err().msg, UNREADABLE);
+}
+
+// The codec reads v1 through v3 and refuses anything newer.
+#[test]
+fn the_codec_reads_v1_v2_and_v3_and_refuses_newer() {
     assert!(crate::backend::undocodec::decode(r#"{"v":1,"gen":0,"undo":[],"redo":[]}"#).is_some(), "v1 still reads");
-    let barrier = r#"{"v":2,"gen":0,"undo":[{"op":"huge","steps":[{"k":"barrier"}]}],"redo":[]}"#;
-    assert!(crate::backend::undocodec::decode(barrier).is_some(), "v2 carries the barrier kind");
-    assert!(crate::backend::undocodec::decode(r#"{"v":3,"gen":0,"undo":[],"redo":[]}"#).is_none(), "v3 reads as nothing");
+    assert!(crate::backend::undocodec::decode(r#"{"v":2,"gen":0,"undo":[{"op":"huge","steps":[{"k":"barrier"}]}],"redo":[]}"#).is_some(), "v2 carries the barrier kind");
+    assert!(crate::backend::undocodec::decode(r#"{"v":3,"gen":0,"undo":[],"redo":[]}"#).is_some(), "v3 is current");
+    assert!(crate::backend::undocodec::decode(r#"{"v":4,"gen":0,"undo":[],"redo":[]}"#).is_none(), "v4 reads as nothing");
 }
 
 // Attaching after pushes moves them into the shared doc oldest first; nothing stays local.
@@ -509,10 +538,11 @@ fn a_too_big_push_whose_barrier_is_refused_keeps_the_entry_in_memory() {
     let target = sandbox.path().join("f");
     std::fs::write(&target, "1").unwrap();
     let mut journal = shared_journal(&sandbox);
-    let huge_op = "h".repeat(33 * 1024 * 1024);
-    journal.push(Entry { op: huge_op.clone(), steps: vec![Step::Created { path: target.clone() }] });
+    let entry = huge_entry(target.clone());
+    let want_len = entry.op.len();
+    journal.push(entry);
     let op = journal.undo().unwrap();
-    assert_eq!(op.len(), huge_op.len(), "the refused barrier kept the full entry in memory");
+    assert_eq!(op.len(), want_len, "the refused barrier kept the full entry in memory");
     assert!(!target.exists(), "the in-memory entry reverses the file it created");
 }
 #[test]

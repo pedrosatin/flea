@@ -21,6 +21,12 @@ Item {
     readonly property int tabCount: root.tabs && root.tabs.items && root.tabs.items.length > 0 ? root.tabs.items.length : 1
     readonly property int currentIndex: root.tabs ? root.tabs.index : 0
     readonly property bool open: root.tabCount > 1
+    // Tab's strip stop: the keyboard is on the tab at focusedIndex, or on New tab one past the last, which draws its own frame; ui/js/ChromeKeys.js moves it.
+    property bool stopFocused: false
+    property int focusedIndex: 0
+    // The keyboard frame lies inside a tab's box, clear of the rule, the current tab's accent edge and the separator.
+    readonly property real frameLeft: Theme.chromeControlInset
+    readonly property real frameBottom: Theme.accentEdge + Theme.chromeControlInset
     readonly property int tabWidth: {
         var n = Math.max(1, root.tabCount)
         var avail = Math.max(0, root.width - Theme.hitMin)
@@ -60,8 +66,7 @@ Item {
     // A receiver cannot wait longer than the source keeps its unacknowledged lift.
     readonly property int tabDropWaitMs: Tabs.ACK_WAIT_MS
     onPaneChanged: root.refuseTabDrop()
-    // The lift outlives the drag's own end, until the taken ack or this wait ends.
-    property int ackWaitMs: Tabs.ACK_WAIT_MS
+    // The lift outlives the drag's own end, until the taken ack or Tabs.ACK_WAIT_MS ends.
     property double ackLiftedAt: 0
     property var takenQueue: []
     property var outstandingLifts: []
@@ -114,8 +119,7 @@ Item {
     }
     function dragFinished() {
         if (root.dragFrom >= 0 && root.dropAt >= 0 && root.pane) {
-            var at = root.dropAt
-            Tabs.move(root.pane, root.dragFrom, at > root.dragFrom ? at - 1 : at)
+            Tabs.move(root.pane, root.dragFrom, root.dragTo)
         }
         root.dragFrom = -1
         root.dropAt = -1
@@ -268,7 +272,7 @@ Item {
 
     // An own-window tab drag reorders its strip instead of opening another tab.
     function tabEnterOk(drag) {
-        var ok = Tabs.enterAccepts(drag.formats, drag.getDataAsString(Tabs.TAB_MIME), undefined, root.pane ? Tabs.canReceive(root.pane) : false, root.outActive)
+        var ok = Tabs.enterAccepts(drag.formats, drag.getDataAsString(Tabs.TAB_MIME), undefined, Tabs.canReceive(root.pane), root.outActive)
         root.traceTab("enter-strip", "formats=" + String(drag.formats) + " ok=" + ok)
         return ok
     }
@@ -342,10 +346,22 @@ Item {
     function itemAt(index) {
         return repeater.itemAt(index)
     }
+    // The strip's keyboard frames, so tests/keyreach.qml measures them in their host.
+    readonly property Item newTabFrame: addFrame
 
+    // On glass the strip's ground runs left and right of the current tab's plate, which a dragged tab gives up; see ui/Glass.qml.
+    readonly property Item plate: Glass.on && root.dragFrom !== root.currentIndex && repeater.count > root.currentIndex ? root.itemAt(root.currentIndex) : null
     Rectangle {
-        anchors.fill: parent
-        color: Theme.color.surface
+        width: root.plate ? strip.x + root.plate.x : parent.width
+        height: parent.height
+        color: Glass.surface
+    }
+    Rectangle {
+        visible: root.plate !== null
+        x: root.plate ? strip.x + root.plate.x + root.plate.width : 0
+        width: parent.width - x
+        height: parent.height
+        color: Glass.surface
     }
 
     Rectangle {
@@ -379,6 +395,7 @@ Item {
                 opacity: root.dragFrom === tab.index ? Theme.disabledOpacity : 1
 
                 readonly property bool current: root.currentIndex === tab.index
+                readonly property Item focusFrame: tabFrame
                 // Every input named, so the label re-reads when a tab opens or the pane navigates.
                 readonly property string title: Tabs.label(
                     Tabs.pathAt(root.tabs, root.currentIndex, tab.index, root.path),
@@ -390,7 +407,7 @@ Item {
 
                 HoverHandler { cursorShape: Qt.PointingHandCursor }
 
-                // GM's ruling: a drag resting on a tab selects it so the drop can land in that tab's
+                // The rule: a drag resting on a tab selects it so the drop can land in that tab's
                 // listing, and a drop on the tab itself lands there too, by path, see ui/DropInto.qml.
                 Flea.DropInto {
                     anchors.fill: parent
@@ -422,7 +439,7 @@ Item {
 
                 Rectangle {
                     anchors.fill: parent
-                    color: tab.current ? Theme.color.background : "transparent"
+                    color: tab.current && (!Glass.on || root.plate === tab) ? Glass.background : "transparent"
                 }
 
                 // Flush on the strip's own bottom edge, replacing it rather than sitting inside the
@@ -444,6 +461,18 @@ Item {
                     color: Theme.color.foreground
                     opacity: 0.12
                     visible: tab.slot < root.tabCount - 1 && !tab.current
+                }
+
+                Rectangle {
+                    id: tabFrame
+                    x: root.frameLeft
+                    y: root.frameLeft
+                    width: parent.width - 2 * root.frameLeft
+                    height: parent.height - root.frameLeft - root.frameBottom
+                    color: "transparent"
+                    border.width: Theme.spacing.hairline
+                    border.color: Theme.color.foreground
+                    visible: root.stopFocused && root.focusedIndex === tab.index
                 }
 
                 Text {
@@ -474,7 +503,7 @@ Item {
                         width: Theme.chromeMarkSize
                         height: Theme.chromeMarkSize
                         name: "x"
-                        color: tab.current || closeHover.hovered ? Theme.color.foreground : Theme.color.muted
+                        color: tab.current || closeHover.hovered ? Theme.color.foreground : Theme.color.mutedFrame
                     }
 
                     HoverHandler { id: closeHover }
@@ -545,12 +574,24 @@ Item {
             Accessible.onPressAction: if (pane) Tabs.openNew(pane)
             HoverHandler { cursorShape: Qt.PointingHandCursor }
 
+            Rectangle {
+                id: addFrame
+                x: root.frameLeft
+                y: root.frameLeft
+                width: parent.width - 2 * root.frameLeft
+                height: parent.height - root.frameLeft - root.frameBottom
+                color: "transparent"
+                border.width: Theme.spacing.hairline
+                border.color: Theme.color.foreground
+                visible: root.stopFocused && root.focusedIndex === root.tabCount
+            }
+
             Flea.Glyph {
                 anchors.centerIn: parent
                 width: Theme.chromeMarkSize
                 height: Theme.chromeMarkSize
                 name: "plus"
-                color: Theme.color.muted
+                color: root.stopFocused && root.focusedIndex === root.tabCount ? Theme.color.foreground : Theme.color.mutedFrame
             }
 
             TapHandler {
@@ -598,7 +639,7 @@ Item {
                 return
             }
             // The take decision answers Move at once; the peek behind it may still refuse, and then no ack goes out.
-            if (Tabs.dropDecision(info, undefined, root.outActive, root.pane ? Tabs.canReceive(root.pane) : false) !== Tabs.DROP_TAKE) {
+            if (Tabs.dropDecision(info, undefined, root.outActive, Tabs.canReceive(root.pane)) !== Tabs.DROP_TAKE) {
                 root.traceTab("drop-skip", "reason=strip-decision-ignore")
                 return
             }

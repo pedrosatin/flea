@@ -12,6 +12,7 @@ import "js/Menu.js" as Menu
 import "js/Mounts.js" as Mounts
 import "js/Search.js" as Search
 import "js/Archive.js" as Archive
+import "js/DragOut.js" as DragOut
 import "js/Startup.js" as Startup
 import "js/Nav.js" as Nav
 import "js/RecentMode.js" as RecentMode
@@ -24,12 +25,14 @@ import "js/SlowClick.js" as SlowClick
 import "js/Sort.js" as Sort
 import "js/Tabs.js" as Tabs
 import "js/Thumbs.js" as Thumbs
+import "js/FolderViews.js" as FolderViews
 
 FocusScope {
     id: root
     focus: true
     // Unhandled child keys reach the pane, including keys from an actually focused rail.
-    Keys.onPressed: function (event) { event.accepted = Focus.handleKey(event, root.sidebar && root.sidebar.activeFocus ? root.railPane : root, root.sidebar) }
+    Keys.onPressed: function (event) { DragOut.keys.track(event, true); event.accepted = Focus.handleKey(event, root.sidebar && root.sidebar.activeFocus ? root.railPane : root, root.sidebar) }
+    Keys.onReleased: function (event) { DragOut.keys.track(event, false) }
     enabled: !root.settingsPanel || !root.settingsPanel.opened
     property var backend: null
     property string path: ""
@@ -46,6 +49,8 @@ FocusScope {
     property int cursorIndex: 0
     // Filter and Marks bump this on every cursor move, ending a shift gesture.
     property int cursorSeq: 0
+    // The wheel's last pull of the cursor, which ui/js/Filter.js pulledFrom reads for a Shift range's start.
+    property var cursorPulled: null
     property string listingState: "loading"
     property string stateMessage: ""
     property int lockedMode: 0
@@ -54,6 +59,14 @@ FocusScope {
     readonly property string lockedTarget: Nav.lockedTarget(root)
     // Off by default: dotfiles stay out of every listing until the context menu or "." turns them on.
     property bool showHidden: ViewState.state.hidden === true
+    // A zip's one image member, which Flash to drive needs named before it shows on a zip.
+    property string flashZipMember: ""
+    // The asked zip with its size and mtime, so a late answer for an earlier file never arms a later one.
+    property string flashZipAsked: ""
+    onCursorIndexChanged: Ops.checkZip(root)
+    onSelectionVersionChanged: Ops.checkZip(root)
+    onPathChanged: Ops.checkZip(root)
+    onBackendChanged: Ops.checkZip(root)
     // Issue 27's state-file key: with it on a cursor step past an end comes round; ui/js/Focus.js step is the only reader.
     readonly property bool wrapAtEnds: ViewState.state.wrapAtEnds === true
     // ClickAndRefresh under Settings, View: Escape climbs, one tap opens, and the slow click renames.
@@ -93,8 +106,10 @@ FocusScope {
     property int trashedFirst: -1
     property string keySequence: ""
     property string keySequenceIdentity: ""
-    // "" off, "typing" while the query line has the keyboard, "results" once a walk was asked for; ui/js/Search.js owns every transition.
+    // "" off, "typing" while the query line has the keyboard, "results" once Enter keeps them; ui/js/Search.js owns every transition.
     property string searchMode: ""
+    // An exit owed its landing: the backend closed at the request and the drawn state clears with the rows.
+    property bool searchLeaving: false
     // Search origin survives a home-wide walk.
     property string searchFrom: ""
     property string searchQuery: ""
@@ -102,6 +117,16 @@ FocusScope {
     property bool searchHere: false
     property bool searchRunning: false
     property bool searchCancelled: false
+    // Newest sent query generation, rising across sessions; answers for an older one are dropped.
+    property int searchGen: 0
+    // The gen a session opened at; a line at or below it is from a closed session.
+    property int searchOpenedGen: 0
+    // Stopwatch for the newest gen: keyAt at the send, firstRowsAt at its first rows, settledAt at its landed searched; a stale gen sets none.
+    property real searchKeyAt: 0
+    property real searchFirstRowsAt: 0
+    property real searchSettledAt: 0
+    // The listing's own base: the scope for a live answer, the folder for an empty one.
+    property string searchBase: ""
     // Recent place: "" off, "results" once answered; RecentMode.js owns transitions; pane path is history base.
     property string recentMode: ""
     // Where Recent was opened over, and the listing it hands back on leaving.
@@ -115,6 +140,9 @@ FocusScope {
     // Filter.js owns the standing query and its typing state.
     property string filterQuery: ""
     property bool filterTyping: false
+    // The filter stopwatch Ipc's filterStamps reads: the newest keystroke and when it narrowed the shown model.
+    property real filterKeyAt: 0
+    property real filterNarrowedAt: 0
     property int searchScanned: 0
     property real searchMs: 0
     property bool listInFlight: false
@@ -126,10 +154,14 @@ FocusScope {
     readonly property alias header: header
     property var sharedSidebar: null
     property var railPane: root
+    // The window's chrome bar and tab strip, the two Tab stops after the rail; ui/js/ChromeKeys.js reads them.
+    property var chromeBar: null
+    property var tabStrip: null
     // The window-long network host, injected by ui/WindowBody.qml (the primary pane's own,
     // shared by the second pane): mounts, bridge waits and dialog answers outlive the rail.
     property var sharedNetworkService: null
     property var networkService: null
+    readonly property var pathAlias: root.networkService ? root.networkService.pathAlias(root.path) : null
     // Answers the one network host ui/WindowBody.qml builds with the window.
     function ensureNetworkService() {
         if (root.networkService) return root.networkService
@@ -143,6 +175,8 @@ FocusScope {
     readonly property bool railHidden: railHost.hidden
     // What the rail takes from the pane, which an overlay never does; the sidebar case reads it.
     readonly property real railInset: railHost.inset
+    readonly property bool railRevealed: railHost.revealed
+    readonly property real railX: railHost.railX
     // Directive 77: a withdrawn rail is still a place Tab can go, because arriving there reveals it.
     readonly property bool railAvailable: root.sidebar !== null || railHost.overlay
     function toggleRail() { ViewState.toggleRail() }
@@ -154,6 +188,8 @@ FocusScope {
     property bool paneFocused: true
     property bool listOnly: false
     signal focusRequested()
+    // A list-only pane draws no view of its own, so a view chosen on it goes to the window, which routes it as its chrome does.
+    signal viewRequested(string mode)
     // Which view Tab last handed the keyboard to; the rail's own cursor is read the same way.
     property string focusView: Focus.LIST
     readonly property int railCursor: root.sidebar ? root.sidebar.cursorIndex : 0
@@ -176,6 +212,8 @@ FocusScope {
     property var settingsPanel: null
     property Item overlayParent: null
     readonly property alias trash: trashHost
+    // Set by the window's flash host while it covers this pane; every gate below reads it.
+    property bool flashActive: false
     readonly property alias menuActions: menuActions
     readonly property var emptyState: paneStates.emptyItem
     readonly property var stateMessageItem: paneStates.messageItem
@@ -183,20 +221,44 @@ FocusScope {
     // The listing swap, ui/PaneSwap.qml: ui/js/Nav.js starts a hold through it and the views read holding.
     readonly property alias swap: wire.swap
     readonly property alias wire: wire
-    readonly property string menuSelectionIdentity: JSON.stringify([root.path, root.held, root.rows,
-        root.selectionVersion, root.cursorIndex, root.total, root.listInFlight])
+    // The rows serialize on the first read after they change, never inside the landing turn; rows are only replaced
+    // whole, so the array the text came from tells a stale text whatever order the handlers run in.
+    readonly property var rowsIdentity: ({ rows: null, text: "" })
+    onRowsChanged: { root.rowsIdentity.rows = null; root.rowsIdentity.text = ""; Ops.checkZip(root) }
+    // Notifies whenever an input of menuSelectionIdentity() does, and serializes nothing.
+    readonly property var menuSelectionInputs: [root.path, root.held, root.selectionVersion, root.cursorIndex,
+        root.total, root.listInFlight, root.rows]
+    function menuSelectionIdentity() {
+        if (root.rowsIdentity.rows !== root.rows) {
+            root.rowsIdentity.rows = root.rows
+            // A tag write changes only a row's tg, which names no file, so a menu opened before it still names the same rows.
+            root.rowsIdentity.text = JSON.stringify(root.rows, function (key, value) { return key === "tg" ? undefined : value })
+        }
+        return JSON.stringify([root.path, root.held, root.selectionVersion, root.cursorIndex, root.total,
+            root.listInFlight]) + "\n" + root.rowsIdentity.text
+    }
 
     signal opened(string path)
     signal message(string text, bool isError)
+    // The dd prompt of an arm, said apart from message so the status bar never reads a sentence to find it.
+    signal armPrompted(string text)
     signal forgetMessage(string text)
     signal operationResult(string headline, string detail, bool isError)
     // The status bar's sticky slot, which unlike message does not time out; empty clears it.
     signal sticky(string text)
+    // The same slot for the GVFS bridge's Starting line, so the status bar lights its busy mark from the call and not from the sentence.
+    signal stickyStarting(string text)
     // The one popup, hosted in shell.qml beside the network dialog rather than inside the pane.
     signal convertRequested(string name)
+    // Archives040: the password compress resolves through the cards host, which Focus reaches
+    // through this signal so Focus takes no new first-frame import.
+    signal compressPasswordRequested(var paths, int menuId)
+    signal extractPasswordRequested(string path, string dest, string err)
     signal permissionsRequested(string path)
     // MenuAdditions040: the whole selection's paths for the multi-row card.
     signal permissionsBatchRequested(var paths)
+    // Bulk rename takes the whole selection's paths for its card.
+    signal bulkRenameRequested(var paths)
     signal pathBarRequested()  // ":" and Ctrl+L; the bar is chrome, so shell.qml opens it as it does the popup above
     signal textSizeRequested(int direction)  // issue 9's zoom pair, +1, -1 or 0 to follow Omarchy again; the size is the window's
 
@@ -217,6 +279,8 @@ FocusScope {
     readonly property int buffer: Math.max(minBuffer, Math.min(maxBuffer, bufferRows))
     readonly property int visibleRows: Math.max(1, Math.ceil(list.height / Theme.fileRowHeight))
     readonly property int windowSize: visibleRows + 2 * buffer
+    // The leading result rows a live answer may carry folder sizes for: none when the shown view would ask for none.
+    readonly property int sizeWish: DirSizes.wantsSizes(root.viewMode, ViewState.hiddenCols, root.storageClass, root.storageKnown) ? root.visibleRows : 0
     readonly property int refetchMargin: 25
     readonly property int cacheRows: 4
     readonly property int coalesceMs: 16
@@ -232,6 +296,14 @@ FocusScope {
     property string extVerdict: ExtThumbs.verdict("", ViewState.preview)
     // Same cap as thumbState, same reason; a directory row's size is only ever asked for by a viewport.
     property var dirSizeState: DirSizes.empty()
+    // The filesystem answers user extended attributes here, probed once per directory beside the fsinfo figures.
+    property bool canTag: true
+    // File tags (ui/TagState.qml) are built when a listing first carries one or a tag key or menu first asks.
+    property var tagState: null
+    function tags() {
+        if (root.tagState === null) root.tagState = Qt.createComponent("TagState.qml").createObject(root, { pane: root })
+        return root.tagState
+    }
     // Input to rows is stamped inside the UI, because a harness that polls IPC across the interval times itself; see AGENTS.md "Testing".
     property real inputAt: 0
     property real rowsAt: 0
@@ -267,16 +339,27 @@ FocusScope {
 
     // "list", "columns" or "grid"; the chrome's own buttons write it and the views read it.
     property string viewMode: "list"
-    property bool preferencesReady: false
-    Component.onCompleted: {
-        root.viewMode = root.listOnly ? "list" : ViewState.view
-        root.preferencesReady = true
+    Component.onCompleted: root.viewMode = root.desiredView(root.path)
+    // A view switch takes the filter with it; only chooseView() and adoptView() persist, so a restored view writes nothing.
+    onViewModeChanged: Filter.close(root)
+    // The folder a view belongs to; a search, Recent or Trash standing over it is not that folder.
+    readonly property string viewFolder: root.searchMode.length === 0 && root.recentMode.length === 0 && !trashHost.opened ? root.path : ""
+    // Dual draws lists in both panes, and a folder's own view applies only while it is remembered.
+    function desiredView(path) {
+        return root.listOnly || root.dualMode ? "list" : FolderViews.viewFor(ViewState.folderViews, path, ViewState.view,
+                                                                              ViewState.rememberViewPerFolder)
     }
-    // Only the list view draws a filter, so leaving it takes the filter with it.
-    onViewModeChanged: {
-        Filter.close(root)
-        if (root.preferencesReady && !root.listOnly && (!root.dualMode || root.viewMode !== "list") && ViewState.state.view !== root.viewMode)
-            ViewState.changeKey("view", root.viewMode)
+    function restoreView(path) {
+        var desired = root.desiredView(path)
+        if (root.viewMode !== desired)
+            root.viewMode = desired
+    }
+    // A tab brings back the view it held: a remembered folder keeps its own, any other view becomes the standing one.
+    function adoptView(path, mode) {
+        var own = ViewState.rememberViewPerFolder && FolderViews.has(ViewState.folderViews, path)
+        if (!own && !root.dualMode && mode !== ViewState.view)
+            ViewState.changeKey("view", mode)
+        root.restoreView(path)
     }
     readonly property string listingPreferences: JSON.stringify([ViewState.state.hidden, ViewState.state.sort,
         ViewState.state.foldersFirst, ViewState.state.groupByKind, ViewState.state.hiddenLast, ViewState.state.rememberSort])
@@ -308,14 +391,13 @@ FocusScope {
         }
     }
     onListInFlightChanged: if (!root.listInFlight) { preferences.restart(); Sort.applyPending(root); listingWait.stop() } else listingWait.restart()
-    onSearchModeChanged: if (root.searchMode.length === 0) preferences.restart()
+    onSearchModeChanged: preferences.restart()
     onRecentModeChanged: if (root.recentMode.length === 0) preferences.restart()
     Timer {
         id: preferences
         interval: 0
         onTriggered: {
-            var desired = root.listOnly ? "list" : ViewState.view
-            if (root.viewMode !== desired) root.viewMode = desired
+            root.restoreView(root.viewFolder)
             if (!root.visible || !root.path || root.listInFlight || root.searchMode.length > 0
                     || root.recentMode.length > 0
                     || root.appliedListingPreferences === root.listingPreferences) return
@@ -331,27 +413,37 @@ FocusScope {
         // A class switched on in Settings decodes again the same way the menu row does.
         function onPreviewChanged() { root.refreshExtThumbs() }
     }
+    // The zip probe lands here; the open menu is never rebuilt for it, the next opening draws it.
+    Connections {
+        target: root.backend
+        function onFlashImageResult(message) { Ops.noteZip(root, message) }
+    }
 
 
     // Each tab retains its own back and forward navigation.
     property var history: []
     property var forwardHistory: []
     property var tabs: null
+    property int tabCountNotice: -1
     readonly property bool canGoBack: trashHost.opened || root.recentMode.length > 0 || root.history.length > 0
-    readonly property bool canGoUp: root.path.length > 1 || root.recentMode.length > 0
+    readonly property bool canGoUp: root.path.length > 1 || root.recentMode.length > 0 || Nav.climbsFromListing(root)
 
     // The filesystem line the status bar draws, refreshed once per directory rather than per row.
     property string fsName: ""
     property real fsFree: 0
+    // False from a request for another folder until the backend's fsinfo line for it lands, so the strip says nothing, not unknown, before then.
+    property bool fsAnswered: false
     // ExtThumbs: src/backend/extclass.rs's own word for the directory being shown, network,
     // phone, usb or "", carried beside the fsinfo line once per directory change, never per row.
     // storageKnown is false until that line lands, so the first settle never spends unknown as local.
     property string storageClass: ""
     property bool storageKnown: false
+    // The backend's fact that a system mountpoint holds this directory, found by its device number, so a link or bind mount counts as its volume.
+    property bool systemVolume: false
 
     // Back and up close Recent rather than travelling; forward stays put outside the history.
-    function goBack() { if (trashHost.opened) trashHost.close(); else if (root.recentMode.length > 0) { if (root.listInFlight) root.message("A directory is already loading.", false); else RecentMode.close(root) } else Nav.back(root) }
-    function goForward() { if (!trashHost.opened && root.recentMode.length === 0) Nav.forward(root) }
+    function goBack() { if (root.flashActive) root.overlayParent.closeFlash(); else if (trashHost.opened) trashHost.close(); else if (root.recentMode.length > 0) RecentMode.close(root); else Nav.back(root) }
+    function goForward() { if (!trashHost.opened && !root.flashActive && root.recentMode.length === 0) Nav.forward(root) }
 
     // Rename lives in ui/js/Ops.js with the other write operations; ui/List.qml's editor commits through this.
     function commitRename(newName) { Ops.commitRename(root, newName) }
@@ -381,6 +473,8 @@ FocusScope {
     property int selectionVersion: 0
     property int selectionAnchor: 0
     property var selectionBand: null
+    // A button is down over the header or the view; ui/PaneStates.qml writes it, and ui/js/Anchor.js busy holds a watched re-read while it is true.
+    property bool pointerHeld: false
     function isSelected(index) { return root.selectionVersion >= 0 && root.selection.has(index) }
     function selectionCount() { return root.selectionVersion >= 0 ? root.selection.count() : 0 }
     function selectedIndices() { return root.selectionVersion >= 0 ? root.selection.indices() : [] }
@@ -411,6 +505,7 @@ FocusScope {
 
     function open(newPath) {
         if (trashHost.confirming) return
+        if (root.flashActive) root.overlayParent.closeFlash()
         trashHost.close()
         Nav.open(root, newPath)
     }
@@ -428,22 +523,24 @@ FocusScope {
             Nav.openPlace(root, home)
     }
 
-    // options.keepHidden is the tab restore's alone: it just put back this tab's own dotfile answer, which the standing preference would overwrite.
-    // A refused hop clears nothing: Nav refuses while a listing is out, and Recent's rows must survive it.
+    // A refused hop clears nothing: only a navigation takes the place of a listing out, and Recent's rows must survive a re-list that does not.
     function openWithoutHistory(newPath, options) {
-        if (root.listInFlight) {
+        // Only a navigation lets a waiting listing go; an in-place re-list of the folder being left keeps it.
+        if (!options || options.inPlace !== true) Anchor.clearWaiting(root)
+        // Only a navigation takes the place of a listing out, and the folder asked for last has its own wait, not the first one's clock.
+        if (root.listInFlight && (!options || options.supersede !== true)) {
             root.message("A directory is already loading.", false)
             return
         }
-        // Every real navigation leaves Recent and Trash, restoring the folder beneath each; options.inPlace, a re-list of this folder, leaves Trash up.
-        if (!options || options.inPlace !== true) trashHost.close()
+        if (root.listInFlight) listingWait.restart()
+        // Every real navigation leaves Recent, Trash and Flash; options.inPlace, a re-list of this folder, leaves Trash up.
+        if (!options || options.inPlace !== true) { trashHost.close(); if (root.flashActive) root.overlayParent.closeFlash() }
         RecentMode.leave(root)
-        if (!root.listInFlight) {
-            var applied = root.appliedListingPreferences ? JSON.parse(root.appliedListingPreferences) : []
-            // Search exit can enter here before the preferences timer consumes a deferred Settings change.
-            if (JSON.stringify(applied[1]) !== JSON.stringify(ViewState.state.sort)) root.backend.resetSort(newPath)
-            if (!options || options.keepHidden !== true) root.showHidden = ViewState.state.hidden === true
-        }
+        var applied = root.appliedListingPreferences ? JSON.parse(root.appliedListingPreferences) : []
+        // Search exit can enter here before the preferences timer consumes a deferred Settings change.
+        if (JSON.stringify(applied[1]) !== JSON.stringify(ViewState.state.sort)) root.backend.resetSort(newPath)
+        // options.keepHidden is the tab restore's alone: it just put back this tab's own dotfile answer, which the standing preference would overwrite.
+        if (!options || options.keepHidden !== true) root.showHidden = ViewState.state.hidden === true
         Nav.openWithoutHistory(root, newPath, options)
     }
 
@@ -452,7 +549,7 @@ FocusScope {
     // Re-listing also clears the cursor and selection, the same as opening any other directory.
     // Recent lists what the history names, dotfiles among them, so the toggle has nothing to hide there.
     function toggleHidden() {
-        if (root.recentMode.length > 0) { root.message("This listing is a history, and keeps the dotfiles it names.", false); return }
+        if (root.recentMode.length > 0) { root.message("Recent shows every item it lists, hidden ones included", false); return }
         root.showHidden = !root.showHidden
         ViewState.changeKey("hidden", root.showHidden)
         root.open(root.path)
@@ -497,8 +594,9 @@ FocusScope {
         if (action === "openTrash" || action === "emptyTrash" || action === "restoreAll") { trashHost.action(action); return }
         if (action === "settings") { root.settingsPanel.open(root); return }
         if (action === "permissions") { root.openPermissions(); return }
+        if (action === "rename" && root.openBulkRename(paths)) return  // several rows open the bulk card
         // Recent is a history, not a directory: a new file there would land in the root it stands on.
-        if (action === "newFile" && root.recentMode.length > 0) { root.message("This listing is a history, and cannot take a new file.", false); return }
+        if (action === "newFile" && root.recentMode.length > 0) { root.message("Recent cannot hold a new file. Open a folder first", false); return }
         if (["newFile", "rename", "openWith", "moveTo", "copyTo", "properties", "deletePermanently"].indexOf(action) >= 0) {
             menuActions.open(action, menuId || 0, context)
             return
@@ -513,7 +611,7 @@ FocusScope {
         menu.clearRail()
         menu.forHeader = false
         menu.hasRow = true
-        menu.openedIdentity = root.menuSelectionIdentity
+        menu.openedIdentity = root.menuSelectionIdentity()
         menuActions.snapshot()
         menuActions.sheetRequest = menuActions.requestId
         menuActions.activate(action, true)
@@ -542,7 +640,7 @@ FocusScope {
         if (!row || row.d) return ""
         var bits = Number(row.p) || 0
         if ((bits & Format.S_IFMT) !== Format.S_IFREG || (bits & Format.ANY_EXECUTE_BIT) !== 0) return ""
-        return root.join(root.path, row.n)
+        return root.join(Search.baseOf(root), row.n)
     }
     function checkShebang() {
         var path = root.shebangTarget()
@@ -563,17 +661,18 @@ FocusScope {
         if (menu.opened && menu.hasRow) menu.refreshProviderRows()
     }
     // MenuAdditions040 callout 10: adds the owner execute bit through the permissions batch, so one undo restores it.
-    function makeExecutable(paths) {
+    // The context menu is its one caller, and it acts on the single cursor target.
+    function makeExecutable() {
         if (!root.isSingleCursorTarget()) {
-            root.message("Make executable needs a script without its execute bit.", false)
+            root.message("Make executable works on a script that cannot run yet", false)
             return
         }
         var row = root.rowFor(root.cursorIndex)
         if (!row || !Menu.canMakeExecutable(row.p, 1, root.rowHasShebang, true)) {
-            root.message("Make executable needs a script without its execute bit.", false)
+            root.message("Make executable works on a script that cannot run yet", false)
             return
         }
-        var taken = [root.join(root.path, row.n)]
+        var taken = [root.join(Search.baseOf(root), row.n)]
         var oldBits = (Number(row.p) || 0) & 0o7777
         var octal = Permissions.octal((oldBits | Format.S_IXUSR) & 0o7777)
         root.makeExecPendingId += 1
@@ -605,7 +704,7 @@ FocusScope {
             var target = root.permissionSelection()
             var single = target ? target.p : 0
             if (Menu.permissionsEntry(single, 1).disabled) {
-                root.message("Permissions takes one file or folder, not a link.", true)
+                root.message("Permissions takes one item, not a link.", true)
                 return
             }
             root.permissionsRequested(paths[0])
@@ -613,10 +712,31 @@ FocusScope {
         }
         root.permissionsBatchRequested(paths)
     }
+    // Several rows open the bulk card; one row answers false so the caller keeps its single-row route.
+    function openBulkRename(paths) {
+        if (paths && paths.length > 1) { root.bulkRenameRequested(paths); return true }
+        var idx = paths && paths.length ? [] : Ops.targetIndices(root)
+        if (idx.length <= 1) return false
+        if (root.pathsPending || root.clipPending !== null) { Ops.pathsBusy(root); return true }
+        root.pathsPending = { kind: "bulkrename" }
+        root.backend.askPaths(idx)
+        return true
+    }
+    // The backend's answer to openBulkRename's askPaths.
+    function openBulkRenameWith(paths) {
+        if (paths.length <= 1) { Ops.sayNoTarget(root); return }
+        root.bulkRenameRequested(paths)
+    }
+    // One line for the whole batch, and one undo reverses every rename it made.
+    function bulkRenamed(ok) {
+        root.message(Ops.bulkDoneLine(ok), false)
+        root.clearSelection()
+        root.refresh("")
+    }
     // c and P open Copy as and Paste as on their first flyout row.
     function openCopyAs() {
         if (!root.openCursorMenu()) {
-            root.message("No row under the cursor to open a menu on.", false)
+            root.message("No item under the cursor to open a menu on", false)
             return
         }
         menu.openSubmenuFor("copyAs")
@@ -626,7 +746,7 @@ FocusScope {
             menu[root.cursorRow ? "openAt" : "openBackground"](root.listSlot.mapToItem(null, root.listSlot.width / 2, root.listSlot.height / 2))
         if (!menu.clipboardAvailable) {
             menu.close()
-            root.message("There is nothing to paste; y copies and x cuts.", false)
+            root.message(Menu.EMPTY_CLIPBOARD, false)
             return
         }
         menu.openSubmenuFor("pasteAs")
@@ -639,10 +759,10 @@ FocusScope {
     function showOriginal() {
         var row = root.rowFor(root.cursorIndex)
         if (!row || !Format.isSymlink(row.p)) {
-            root.message("Show original needs the cursor on a symlink.", false)
+            root.message("Show original needs the cursor on a link", false)
             return
         }
-        root.requestLinkTarget(root.join(root.path, row.n))
+        root.requestLinkTarget(root.join(Search.baseOf(root), row.n))
     }
     // Both entrances send through here, so one pending id covers the cursor and the menu.
     function requestLinkTarget(path) {
@@ -659,13 +779,11 @@ FocusScope {
     // and the scroll both happen in view space, because a filter can be narrowing what is drawn.
     // A click carries context 0; a keyboard move keeps the default 3.
     function setCursor(index, context) { Filter.setCursor(root, index, context) }
-    // The cursor keeps three rows of context above and below: the list and the columns view hold
-    // it through their own showCursor, and the grid keeps Contain, whose tiles are not rows.
-    // ListView.Contain has no name inside a .pragma library, so the scroll itself stays here.
+    // The cursor keeps three rows of context: the list and the columns view hold it through their own showCursor, the grid keeps Contain after its landing window.
     function showRow(view, context) {
         if (root.viewMode === "columns" && root.columnsArea) root.columnsArea.activeColumn().showCursor(view, context)
         else if (root.viewMode === "list") list.showCursor(view, context)
-        else root.listArea.positionViewAtIndex(view, ListView.Contain)
+        else root.listArea.showCursor(view, context)
         root.listArea.restartCoalesce()
     }
 
@@ -700,7 +818,7 @@ FocusScope {
     // Quoted when it holds whitespace, because this one is pasted into a shell: see ui/js/Format.js.
     function copyDirPath() { wire.opener.copyText(Format.shellQuoted(root.path)) }
 
-    function openParent() { if (trashHost.opened) trashHost.close(); else if (root.recentMode.length > 0) { if (root.listInFlight) root.message("A directory is already loading.", false); else RecentMode.close(root) } else Nav.parent(root) }
+    function openParent() { if (root.flashActive) root.overlayParent.closeFlash(); else if (trashHost.opened) trashHost.close(); else if (root.recentMode.length > 0) RecentMode.close(root); else Nav.parent(root) }
 
     // The sort Recent replaced, handed back on leaving; ui/js/Search.js reaches it through here.
     function restoreRecentSort() { RecentMode.restoreSort(root) }
@@ -727,6 +845,13 @@ FocusScope {
         service: root.networkService
     }
 
+    // On glass the listing's ground, beside the rail and below the path and search strips, never under them; see ui/Glass.qml.
+    Rectangle {
+        anchors { top: root.searchMode.length > 0 ? header.bottom : panePath.bottom; bottom: parent.bottom; left: railHost.right; right: parent.right }
+        visible: Glass.on
+        color: Glass.background
+    }
+
     Flea.PanePath {
         id: panePath
         anchors { left: railHost.right; right: parent.right; top: parent.top }
@@ -735,8 +860,10 @@ FocusScope {
         // A history is a location and not a directory, so the strip says its own name.
         path: root.recentMode.length > 0 ? "Recent" : root.path
         home: root.home
+        pathAlias: root.pathAlias
         focused: root.paneFocused
         inputLive: !(root.preview && root.preview.active)
+        pane: root
         onChosen: function (path) { root.open(path) }
         onEditRequested: root.pathBarRequested()
     }
@@ -752,7 +879,7 @@ FocusScope {
         // Only the list view has columns to head, and neither the grid board nor the columns board
         // draws one; the strip collapses rather than hiding, so the view below starts at the top of
         // the pane instead of a gap. A search takes the strip whole, in any view.
-        visible: !trashHost.opened && (root.viewMode === "list" || root.searchMode.length > 0)
+        visible: !trashHost.opened && !root.flashActive && (root.viewMode === "list" || root.searchMode.length > 0)
         height: visible ? implicitHeight : 0
         anchors.top: panePath.bottom
         anchors.left: railHost.right
@@ -770,8 +897,8 @@ FocusScope {
         searchMode: root.searchMode
         searchQuery: root.searchQuery
         searchScope: Search.scope(Search.scopeRoot(root.path, root.home, root.searchHere), root.home)
-        searchNote: Search.note(root.total, root.searchRunning, root.searchCancelled)
-        searchWayOut: Search.wayOut(root.searchRunning)
+        searchNote: Search.note(root.total, root.searchRunning, root.searchQuery.length === 0)
+        searchWayOut: Search.wayOut(root.searchRunning, root.searchQuery.length === 0)
     }
 
     // The two views share the same slot, the same rows and the same cursor; only one is ever up, and
@@ -804,7 +931,7 @@ FocusScope {
     Loader {
         id: columnsLoader
         active: root.viewMode === "columns" || root.columnsBuilt
-        visible: !trashHost.opened
+        visible: !trashHost.opened && !root.flashActive
         focus: visible && root.viewMode === "columns"
         anchors { top: filterStrip.bottom; left: railHost.right; right: parent.right; bottom: parent.bottom }
         Component.onCompleted: setSource("ColumnsArea.qml", { pane: root, menu: menu, focus: true })
@@ -814,7 +941,7 @@ FocusScope {
     Loader {
         id: gridLoader
         active: root.viewMode === "grid" || root.gridBuilt
-        visible: !trashHost.opened
+        visible: !trashHost.opened && !root.flashActive
         focus: visible && root.viewMode === "grid"
         anchors { top: filterStrip.bottom; left: railHost.right; right: parent.right; bottom: parent.bottom }
         Component.onCompleted: setSource("GridArea.qml", { pane: root, menu: menu })
@@ -862,7 +989,27 @@ FocusScope {
         // The preview follows rather than loads, so a class just switched off holds instead of decoding.
         if (root.viewMode === "columns" && columnsLoader.item) columnsLoader.item.askMeta()
     }
-    function chooseView(mode) { ViewState.changeKey("view", mode) }
+    function chooseView(mode) {
+        if (FolderViews.MODES.indexOf(mode) < 0 && mode !== "dual")
+            return
+        if (root.listOnly) {
+            root.viewRequested(mode)
+            return
+        }
+        // Dual is a window layout and no folder's view: choosing it, or any view while in it, sets the standing view first.
+        if (mode === "dual" || root.dualMode)
+            ViewState.changeKey("view", mode)
+        if (mode === "dual")
+            return
+        root.viewMode = mode
+        if (FolderViews.shouldRemember(ViewState.rememberViewPerFolder, root.viewFolder)) {
+            var leaf = {}
+            leaf[root.viewFolder] = mode
+            ViewState.changeMapEntries("folderViews", leaf, FolderViews.set(ViewState.folderViews, root.viewFolder, mode))
+        } else if (ViewState.state.view !== mode) {
+            ViewState.changeKey("view", mode)
+        }
+    }
     function focusPreviewColumn() {
         if (!ViewState.previewColumn || root.dualMode) return
         if (root.viewMode === "columns" && columnsLoader.item) columnsLoader.item.focusPreview()
@@ -872,10 +1019,11 @@ FocusScope {
     readonly property alias pathSlot: panePath.crumbSlot
     readonly property alias pathStrip: panePath
     signal switchPane()
+    signal switchToRail()
 
     Flea.List {
         id: list
-        visible: !trashHost.opened && root.viewMode === "list"
+        visible: !trashHost.opened && !root.flashActive && root.viewMode === "list"
         focus: visible
         anchors.top: filterStrip.bottom
         anchors.left: railHost.right
@@ -905,6 +1053,10 @@ FocusScope {
         anchors { top: parent.top; left: railHost.right; right: parent.right; bottom: parent.bottom }
     }
 
+    // The two menu rows open the pane through the window's host with the half they came from chosen.
+    function openFlashImage(path) { root.overlayParent.openFlash(root, path, "") }
+    function openFlashDrive(device) { root.overlayParent.openFlash(root, "", device) }
+
     // Directory cursors retain the installed provider with its explicit file-only reason.
     readonly property var cursorRow: root.rowFor(root.cursorIndex)
     readonly property alias taildropService: wire.taildrop
@@ -925,23 +1077,28 @@ FocusScope {
         rowIsFile: root.cursorRow !== null && !root.cursorRow.d
         taildropInstalled: !root.backend.providers.taildrop || root.backend.providers.taildrop.installed !== false
         taildropReason: root.cursorRow && root.cursorRow.d ? "Taildrop sends files only" : wire.taildrop.reason
+        taildropCode: wire.taildrop.code
         archiveFormats: root.backend.archiveFormats
         canConvert: root.backend.canConvert
         canExtract: root.menuValuesLive && root.cursorRow !== null
             && Archive.canExtract(root.cursorRow.n, root.backend.extraction)
+        archiveName: root.cursorRow ? root.cursorRow.n : ""
         rowMode: root.menuPermissionRow ? root.menuPermissionRow.p : 0
         selectionCount: root.menuValuesLive ? Ops.targetIndices(root).length : 0
         cursorIsTarget: root.menuValuesLive && root.isSingleCursorTarget()
         openWithApps: menuActions.openWithApps
         openWithLoaded: menuActions.openWithLoaded
-        selectionIdentity: root.menuSelectionIdentity
+        identitySource: root
         clipboardAvailable: root.clipboard.paths.length > 0
         clipboardWatchFailed: root.clipboardWatchFailed
         // Scripts, send peers and the shebang are requested only when a row menu opens.
-        onSnapshotRequested: { menuActions.snapshot(); Flea.Scripts.refresh(); menuActions.localSend.refresh(menu.localSend.installed); root.checkShebang() }
+        onSnapshotRequested: { menuActions.snapshot(); Flea.Scripts.refresh(); menuActions.localSend.refresh(menu.localSend.installed); root.checkShebang(); if (root.canTag) root.tags().ask() }
         onRefused: function(reason) { root.message(reason, true) }
         rowIsArchive: root.menuValuesLive && root.cursorRow !== null && !root.cursorRow.d && Archive.isArchive(root.cursorRow.n)
         rowIsImage: root.cursorRow !== null && root.cursorRow.i === "image-x-generic"
+        // Flash to drive reads the name, not the icon: only the name carries the ledger's suffixes.
+        rowName: root.cursorRow !== null && !root.cursorRow.d ? root.cursorRow.n : ""
+        flashZipMember: root.flashZipMember
         // MenuAdditions040: Show original is visible but only on a symlink.
         rowIsSymlink: root.cursorRow !== null && Format.isSymlink(root.cursorRow.p)
         rowHasShebang: root.rowHasShebang
@@ -951,9 +1108,10 @@ FocusScope {
         localSend: ({ installed: (root.backend.providers.localsend || {}).installed === true, checking: menuActions.localSend.checking,
                       peers: (root.cursorRow && !root.cursorRow.d) ? menuActions.localSend.peers : [], answeredOnce: menuActions.localSend.answeredOnce })
         dropboxPath: root.dropboxService && root.dropboxService.dropboxReady ? root.dropboxService.dropboxPath : ""
-        dropboxReason: root.dropboxService ? root.dropboxService.dropboxReason : "Dropbox service unavailable"
+        dropboxReason: root.dropboxService ? root.dropboxService.dropboxReason : "Dropbox is not available"
+        dropboxCode: root.dropboxService ? root.dropboxService.dropboxCode : ""
         rowInDropbox: root.menuValuesLive && root.dropboxService && root.cursorRow
-            && Dropbox.contains(root.dropboxService.dropboxPath, root.join(root.path, root.cursorRow.n))
+            && Dropbox.contains(root.dropboxService.dropboxPath, root.join(Search.baseOf(root), root.cursorRow.n))
         // Issue 133: no GVFS mount, share or phone, has a trash of its own, so the row is not offered there.
         // A read-only folder has none either: the listed line's own writability rides along.
         canTrash: Mounts.trashable(root.path, root.backend ? root.backend.dirWritable !== false : true)
@@ -961,6 +1119,8 @@ FocusScope {
         dirWritable: root.backend ? root.backend.dirWritable !== false : true
         // vfat and exfat hold no links, so the Paste as rows are not offered there either.
         canLink: root.fsName !== "vfat" && root.fsName !== "exfat"
+        // The Tags flyout stands only while a menu is live; null drops the row where tags cannot be stored.
+        tagSubmenu: root.menuValuesLive && root.canTag && root.tagState !== null ? root.tagState.flyout() : null
         // ExtThumbs: the class the background menu's thumbnail row is present for, "" locally.
         storageClass: root.storageClass
         // Issue 179: the Sort by flyout offers its forget row only where this folder has its own sort.
@@ -972,7 +1132,7 @@ FocusScope {
         onChosen: function (action) {
             // Issue #170: Rename opens the editor at once by the route F2 takes
             // rather than queueing an activate behind the cold Open-with catalogue.
-            if (action === "rename") { menuActions.openRenameFromMenu(); return }
+            if (action === "rename") { if (!root.openBulkRename(null)) menuActions.openRenameFromMenu(); return }
             menuActions.activate(action, menu.hasRow && !menu.forHeader)
         }
         // The Locked tile's folder arrives with the row: close() cleared the menu's own copy
@@ -987,9 +1147,33 @@ FocusScope {
         pane: root
     }
 
-    // Every paste and drop asks through here first, see ui/js/Collide.js.
-    Flea.CollideHost { id: collideHost; parent: root.overlayParent || root; pane: root }
-    readonly property alias collide: collideHost
+    // Every paste and drop asks through here first, see ui/js/Collide.js; built by the first ask and owned by the pane, so a closed tab takes its card.
+    property var collide: null
+    function asks() {
+        var made = root.collide ? null : Qt.createComponent("CollideHost.qml")
+        if (made && made.status !== Component.Ready) throw new Error("CollideHost.qml did not load: " + made.errorString())
+        return root.collide || (root.collide = made.createObject(root, { pane: root, parent: root.overlayParent || root }))
+    }
+
+    // Opening an executable file asks once, in the window's one card; see ui/WindowBody.qml.
+    // A null host is a loud refusal, never a call into nothing; every product pane names one.
+    readonly property string noWindowSentence: "This pane has no window, so nothing was done."
+    function askRunCard(info) {
+        if (!root.overlayParent) { root.message(root.noWindowSentence, true); return }
+        root.overlayParent.askRunCard(root, info)
+    }
+    function runText(path) {
+        if (!root.overlayParent) { root.message(root.noWindowSentence, true); return }
+        root.overlayParent.runLane().openText(path, root)
+    }
+    // Without a path Open with opens over the cursor; with one the card snapshots the row that path still names.
+    function showOpenWith(path) {
+        if (path === undefined) { menuActions.open("openWith", 0); return }
+        var at = Anchor.matchListed(root, path)
+        if (at < 0) { root.message("That file is no longer listed.", true); return }
+        menuActions.snapshot([at])
+        menuActions.open("openWith", menuActions.requestId)
+    }
 
     // The one ui/ContextMenu.qml this pane owns, for ui/Ipc.qml: entries, flyout and row geometry
     // are read off it directly, so a new reader costs the seam a line and this file none.
@@ -1005,7 +1189,7 @@ FocusScope {
     function moveToDropbox(menuId) { Ops.moveToDropbox(root, root.dropboxService && root.dropboxService.dropboxReady ? root.dropboxService.dropboxPath : "", menuId) }
     // The three foreign programs live in ui/PaneWire.qml with the backend's replies; these only name the row.
     function copyShareLink(path) {
-        if (!path) { root.message("Cursor source was not validated; reopen the menu.", true); return }
+        if (!path) { root.message("That menu is out of date. Reopen it.", true); return }
         wire.shareLink.copy(path)
     }
     function sendTaildrop(peerId, path) { Ops.sendTaildrop(root, wire.taildrop, peerId, path) }
@@ -1027,7 +1211,7 @@ FocusScope {
         }
         if (action === "copyAs") { Ops.copyAs(root, "path", [path]); return }
         if (action === "permissions") { root.permissionsRequested(path); return }
-        root.message(action + " is not built yet.", false)
+        root.message("That action is not available yet", false)
     }
 
     // The keyboard's own entrance to the row menu; the placement itself is ui/js/Menu.js's.
@@ -1039,5 +1223,8 @@ FocusScope {
         }
         return Menu.openAtCursor(root, menu, Theme.spacing.rowPaddingX)
     }
+
+    // The query lines' paste source (issue 287), read only when Ctrl+V or Shift+Insert reaches one.
+    function clipboardText() { return Quickshell.clipboardText }
 
 }

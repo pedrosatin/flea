@@ -2,6 +2,7 @@ import QtQuick
 import qs.Commons
 import "js/Errors.js" as Errors
 import "js/Filter.js" as Filter
+import "js/Format.js" as Format
 
 // The one thing a pane shows instead of rows, and it carries all three parts the States board gives
 // a pane state: the mark, then one sentence, then the detail the system can prove. The sentence used
@@ -31,6 +32,10 @@ Item {
     readonly property string detail: root.locked ? Errors.lockedLine(root.lockedMode)
         : root.nothingMatched ? Filter.noMatch(root.total) : ""
 
+    // The mark and lines at their unwrapped width, so ui/PaneStates.qml can tell whether they clear the listed columns.
+    readonly property real naturalWidth: Math.max(Theme.stateMarkSize, sentence.implicitWidth,
+        root.detail.length > 0 ? detailLine.implicitWidth : 0)
+
     visible: root.active && (root.nothingMatched
         || (root.total === 0 && root.message.length > 0 && root.listingState !== "empty"))
 
@@ -49,12 +54,13 @@ Item {
             height: Theme.stateMarkSize
             name: root.locked ? "lock" : root.nothingMatched ? "search" : "alert"
             // Only a failure takes the urgent role, and only on the mark; the sentence stays readable.
-            color: root.nothingMatched ? Theme.color.muted : Theme.color.error
+            color: root.nothingMatched ? Theme.color.mutedFrame : Theme.color.error
         }
 
         Text {
+            id: sentence
             width: root.width
-            text: root.nothingMatched ? "Nothing matched " + root.filterQuery : root.message
+            text: root.nothingMatched ? Format.fill(Filter.WORDS.nothingMatched, root.filterQuery) : root.message
             color: Theme.color.foreground
             font.family: Theme.font.family
             font.pixelSize: Theme.font.body
@@ -64,6 +70,7 @@ Item {
         }
 
         Text {
+            id: detailLine
             width: root.width
             visible: root.detail.length > 0
             text: root.detail

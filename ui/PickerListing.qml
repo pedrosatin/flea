@@ -55,9 +55,9 @@ Item {
             current.write(JSON.stringify({c: "fsinfo"}) + "\n")
     }
     // Sort reorders the worker's own listing without replacing it; the caller re-asks the window after.
-    function sort(by, desc, foldersFirst, groupByKind) {
+    function sort(by, desc, foldersFirst, groupByKind, hiddenLast) {
         if (current && current.running && !current.obsolete && !quitting)
-            current.write(JSON.stringify({c: "sort", by: by, desc: desc, foldersFirst: foldersFirst, groupByKind: groupByKind}) + "\n")
+            current.write(JSON.stringify({c: "sort", by: by, desc: desc, foldersFirst: foldersFirst, groupByKind: groupByKind, hiddenLast: hiddenLast}) + "\n")
     }
     // Thumbnails are planned against the rows this worker holds, so the ask goes to it and not to
     // the picker's selection backend, which holds no listing at all. An empty ask names nothing.
@@ -71,6 +71,24 @@ Item {
         if (!rows || rows.length === 0) return
         if (current && current.running && !current.obsolete && !quitting)
             current.write(JSON.stringify({c: "thumbcancel", rows: rows}) + "\n")
+    }
+    // The path bar's folder jump, asked once per open of the field; the worker is the full backend, so it answers the main window's jumped line.
+    function jump(id, ranking, favourites, recent) {
+        if (current && current.running && !current.obsolete && !quitting) {
+            var message = {c: "jump", id: id, favourites: favourites, recent: recent}
+            if (ranking !== 0) message.ranking = ranking
+            current.write(JSON.stringify(message) + "\n")
+        }
+    }
+    // Tab completion behind the picker's field: the directory the head names.
+    function peek(dir, first, hidden) {
+        if (current && current.running && !current.obsolete && !quitting)
+            current.write(JSON.stringify({c: "peek", path: dir, first: first, hidden: hidden}) + "\n")
+    }
+    // A typed file's row, named from the listing's own names: nothing is statted and no window is walked.
+    function locate(path) {
+        if (current && current.running && !current.obsolete && !quitting)
+            current.write(JSON.stringify({c: "locate", path: path}) + "\n")
     }
     function quit() {
         quitting = true
@@ -115,12 +133,16 @@ Item {
                             if (request !== undefined) root.pathsResolved(message.paths, request)
                         } else root.message(message)
                     }
-                    catch (error) { root.failed("The listing backend sent an invalid reply.") }
+                    catch (error) { console.warn("PickerListing could not handle a worker reply: " + error); root.failed("This folder could not be listed.") }
                 }
             }
-            onExited: function(code, status) { root.ended(process, "The listing backend exited with code " + code) }
+            onExited: function(code, status) {
+                // The signal(9) above ends an obsolete or quitting worker on purpose, so only an unasked exit is worth a warning.
+                if (!process.obsolete && !root.quitting) console.warn("PickerListing worker exited with code " + code)
+                root.ended(process, "Flea stopped responding, so this folder could not be listed.")
+            }
             // A failed QProcess spawn emits runningChanged, but never exited.
-            onRunningChanged: if (!running && !started) root.ended(process, "The listing backend could not be started.")
+            onRunningChanged: if (!running && !started) root.ended(process, "This folder could not be listed. Restart Flea.")
         }
     }
 }

@@ -152,7 +152,7 @@ fn order_ignores_a_path_that_is_not_pinned_and_a_place_that_is_not_there() {
     assert_eq!(shelf.pile().len(), 1);
 }
 
-// The advloop's Rust pass: a pile that cannot be parsed is not an empty one, and writing over it
+// Found in code review: a pile that cannot be parsed is not an empty one, and writing over it
 // would take every row with it.
 #[test]
 fn a_pile_that_cannot_be_parsed_is_never_written_over() {
@@ -195,4 +195,34 @@ fn absolute_keeps_the_std_contract_it_replaces() {
     // Joining off / keeps its sole slash as the separator, so the want is /rel/path and never //rel/path.
     let want = std::env::current_dir().expect("a working directory").join("rel/path").as_os_str().as_bytes().to_vec();
     assert_eq!(read("rel/path"), want);
+}
+
+// A reason comes from error::io_message, so a person reads words and not Os { code: 21, kind: IsADirectory }.
+fn reason(kind: std::io::ErrorKind) -> String {
+    crate::error::io_message(&std::io::Error::from(kind))
+}
+
+#[test]
+fn a_pile_that_cannot_be_read_says_why_in_words() {
+    let (_dir, shelf) = shelf("shelfreadwhy");
+    // A folder where the pile file belongs: the read is refused with a reason a person can act on.
+    std::fs::create_dir_all(shelf.pile_file()).unwrap();
+    assert_eq!(shelf.held().unwrap_err(), format!("{} could not be read: item is a folder", shelf.pile_file().display()));
+}
+
+#[test]
+fn an_item_that_is_not_there_is_refused_with_its_reason() {
+    let (dir, shelf) = shelf("shelfaddgone");
+    let gone = dir.path().join("never-written").to_string_lossy().to_string();
+    let expected = format!("{} could not be read: {}", gone, reason(std::io::ErrorKind::NotFound));
+    assert_eq!(shelf.add(&[gone.clone()]).unwrap_err(), expected);
+    assert_eq!(size_of(&gone).unwrap_err(), expected);
+}
+
+#[test]
+fn a_pile_file_with_no_folder_above_it_says_so_in_the_shelfs_words() {
+    let (_dir, mut shelf) = shelf("shelfnofolder");
+    // The root has no parent, so there is no folder to write the pile in.
+    shelf.pile = PathBuf::from("/");
+    assert_eq!(shelf.clear().unwrap_err(), "the shelf has no folder to write in");
 }

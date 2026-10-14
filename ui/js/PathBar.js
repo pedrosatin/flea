@@ -2,6 +2,12 @@
 
 .import "Format.js" as Format
 
+// The sentence Tab answers with when nothing completes, filled by Format.fill.
+var WORDS = {
+    manyStart: "%1 items start with that",
+    nothingStartsWith: "Nothing in %1 starts with that"
+}
+
 // What a typed path line means, and nothing about the field that carries it: ui/ChromeBar.qml owns
 // the field and ui/shell.qml owns the navigation, the same split ui/js/Filter.js keeps with its
 // strip. Every function here is pure, so tests/js/pathbar.js drives the whole of it with no window.
@@ -208,8 +214,19 @@ function shouldNavigate(target, current, failed) {
     return true
 }
 
-// A line that named something and still resolved to nothing, which is only ever a file:// URI on
-// another host: the bar owes that a sentence, where an empty line owes silence.
+// What a typed line that resolved to a path says when the picker's peek of it finds nothing, or a file the listing leaves out.
+var MISSING_SENTENCE = "%1 does not exist or cannot be reached."
+var FILTERED_SENTENCE = "%1 is hidden by the file filter or the hidden files setting."
+
+// Sample input: kindOfPeek(false, 0) and (true, 16877) are "folder", (true, 0) "missing", (true, 33188) "file".
+function kindOfPeek(readFailed, mode) {
+    if (!readFailed || (mode & Format.S_IFMT) === Format.S_IFDIR) return "folder"
+    return mode === 0 ? "missing" : "file"
+}
+
+// A line that named something yet resolved to nothing (a file:// URI on another host) owes a sentence; an empty line owes silence.
+var REFUSED_SENTENCE = "That URI names a file on another host, not a path on this machine."
+
 function refused(text) {
     var line = String(text).trim()
     return line.length > 0 && unwrap(line).length === 0
@@ -219,10 +236,10 @@ function refused(text) {
 // name. An empty string means the line moved and the bar says nothing, which is the usual case.
 function completionMessage(before, after, dir) {
     if (after.matches === 0) {
-        return "Nothing in " + dir + " starts with that."
+        return Format.fill(WORDS.nothingStartsWith, dir)
     }
     if (after.text === before) {
-        return Format.count(after.matches) + " names share that prefix."
+        return Format.fill(WORDS.manyStart, Format.count(after.matches))
     }
     return ""
 }

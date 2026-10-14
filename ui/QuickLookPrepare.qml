@@ -3,6 +3,7 @@ import Quickshell.Io
 import "js/Markdown.js" as Markdown
 import "js/MarkdownMaths.js" as Maths
 import "js/MarkdownPrepared.js" as Prepared
+import "js/Search.js" as Search
 
 // A rested cursor on a small local Markdown file prepares Quick Look's entry and holds its small pictures decoded for the first frame.
 Item {
@@ -11,8 +12,8 @@ Item {
     property var pane: null
     // False while Quick Look is open: the entry is for the next Space.
     property bool resting: true
-    // The rest the preview column's own settle waits, so a sweep reads nothing.
-    property int restMs: 120
+    // The rest the preview column's own settle waits, so a sweep reads nothing; the pane owns that settle.
+    property int restMs: root.pane ? root.pane.settleMs : 120
     // What a suite reads: files read at rest, the bytes the last read returned, parses the worker answered, and the file the entry last took.
     property int reads: 0
     property int readBytes: 0
@@ -29,12 +30,19 @@ Item {
     property bool picturesSettled: true
     // The formulas a rested document draws, typeset ahead so the open takes their drawings from the figure service's memory; empty once the cursor moves.
     property var formulas: []
-    // A rested inline formula holds one decoded picture, so the process's first picture decode (about 20 ms of plugin set-up) is paid at rest.
+    // A rested formula holds one decoded picture, so the process's first picture decode (about 20 ms of plugin set-up) is paid at rest.
     property bool warmDecoder: false
     readonly property bool decoderWarm: decoder.status === Image.Ready
     // How many times a rest turned the warm on, which a suite reads to prove a held key never does.
     property int decoderWarms: 0
     onWarmDecoderChanged: if (root.warmDecoder) root.decoderWarms++
+    // A rested table builds one unseen table once, so the process's first table types, bold and code faces and rich import are paid at rest.
+    property bool tableWarmed: false
+    // How many warm tables a rest built and measured, which a suite reads to prove it runs once, never under a held key or after Space.
+    property int tableWarms: 0
+    // The warm table's Markdown and the width it lays out in: a bold cell, a code span and a link, so each face and the link markup are first used here.
+    readonly property string tableWarmText: "| A | B | C |\n|:--|:-:|--:|\n| **x** | `y` | [l](https://e.t) |\n"
+    readonly property int tableWarmWidth: 400
     // The one stat child sizing them (null when none), and a suite's counts of those started and alive.
     property var sizer: null
     property int sizersStarted: 0
@@ -166,6 +174,26 @@ Item {
         onStatusChanged: root.recount()
     }
 
+    // MarkdownTable's preview at Quick Look's body size, holding the warm table: no card holds a Markdown pane at rest.
+    Component {
+        id: tableHost
+        Item {
+            id: host
+            visible: false
+            property var block: null
+            property real availableWidth: 0
+            readonly property alias table: tableLoader.item
+            readonly property int bodyPx: Theme.font.body
+            readonly property int blockGap: 0
+            readonly property real ruleOpacity: 0
+            // Loaded by file name and given its block before it completes, so the table builds once and only when a warm runs.
+            Loader {
+                id: tableLoader
+                Component.onCompleted: setSource("MarkdownTable.qml", { visible: false, preview: host, availableWidth: host.availableWidth, block: host.block })
+            }
+        }
+    }
+
     Loader {
         id: parser
         active: false
@@ -184,7 +212,7 @@ Item {
         if (!Prepared.readsInline(row, pane.storageClass, pane.storageKnown))
             return
         root.reads++
-        var request = readerComponent.createObject(root, { seq: root.seq, path: pane.join(pane.path, row.n) })
+        var request = readerComponent.createObject(root, { seq: root.seq, path: pane.join(Search.baseOf(pane), row.n) })
         request.running = true
     }
 
@@ -217,10 +245,46 @@ Item {
         // A parse that throws is Quick Look's to report on Space, so nothing is kept here.
         if (reply.seq !== root.seq || reply.error !== "")
             return
+        if (a.warm === true) {
+            root.buildWarmTable(reply.blocks[0])
+            return
+        }
         Prepared.store(a.path, a.text, a.dir, a.chrome, a.ink, reply.blocks)
         root.workerAnswers++
         root.startPictures(reply.blocks, a.dir)
         root.preparedPath = a.path
+    }
+
+    // The first rested document holding a table, a quote's or a list item's included, sends the warm table's Markdown to the worker.
+    function warmTable(blocks, dir) {
+        if (root.tableWarmed || !root.resting || root.asked !== null || !root.holdsTable(blocks))
+            return
+        // A warm never replaces a request still out; one the cursor overtakes is dropped with its seq, so the next rested table asks again.
+        parser.active = true
+        root.asked = { seq: root.seq, warm: true }
+        parser.item.sendMessage({ seq: root.seq, source: root.tableWarmText, dir: dir, chrome: Prepared.hexOf(Theme.color.background), ink: Prepared.hexOf(Theme.color.foreground) })
+    }
+
+    // The warm table's blocks came back at rest: build the table unseen and drop it at once.
+    function buildWarmTable(block) {
+        if (!root.resting || !block)
+            return
+        root.tableWarmed = true
+        var host = tableHost.createObject(root, { block: block, availableWidth: root.tableWarmWidth })
+        // Reading the measured width lays its cells out now; only a table that built and measured counts.
+        if (host.table !== null && host.table.tableWidth > 0)
+            root.tableWarms++
+        host.destroy()
+    }
+
+    function holdsTable(list) {
+        for (var i = 0; i < list.length; i++) {
+            var b = list[i]
+            // A list's parts hold one array of blocks per item.
+            if (b && (b.type === "table" || (Array.isArray(b) && root.holdsTable(b)) || (b.parts !== undefined && root.holdsTable(b.parts))))
+                return true
+        }
+        return false
     }
 
     function releaseSizer() {
@@ -233,7 +297,8 @@ Item {
     function startPictures(blocks, dir) {
         root.releaseSizer()
         root.formulas = Prepared.formulasIn(blocks, Prepared.FORMULA_LIMIT)
-        root.warmDecoder = root.formulas.some(function (one) { return !one.display })
+        root.warmDecoder = root.formulas.length > 0
+        root.warmTable(blocks, dir)
         var urls = Prepared.pictureUrls(blocks, Prepared.PICTURE_LIMIT, dir)
         if (urls.length === 0) {
             root.recount()

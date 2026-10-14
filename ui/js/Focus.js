@@ -1,16 +1,19 @@
 .pragma library
 .import "Input.js" as Input
+.import "ChromeKeys.js" as ChromeKeys
 .import "Eject.js" as Eject
 .import "Filter.js" as Filter
 .import "Grid.js" as Grid
 .import "Format.js" as Format
 .import "Keymap.js" as Keymap
+.import "KeyName.js" as KeyName
 .import "Marks.js" as Marks
 .import "Mounts.js" as Mounts
 .import "Ops.js" as Ops
 .import "PreviewKeys.js" as PreviewKeys
 .import "RailKeys.js" as RailKeys
 .import "Reload.js" as Reload
+.import "Nav.js" as Nav
 .import "RecentMode.js" as RecentMode
 .import "Status.js" as Status
 .import "Search.js" as Search
@@ -20,18 +23,48 @@
 .import "Trash.js" as Trash
 .import "Tabs.js" as Tabs
 
+// Whole sentences with "%1" for the key the running preset binds, filled by KeyName.hinted.
+var WORDS = {
+    filterTip: "Press %1 to filter this folder by name"
+}
+
 var LIST = "list"
 var RAIL = "rail"
+var CHROME = "chrome"
+var STRIP = "strip"
+// The stops Tab walks, in order; the list is always one and the others only while drawn.
+var RING = [LIST, RAIL, CHROME, STRIP]
 
 // Refusal where gio has no Trash, from ui/js/Status.js, which recognises it to drop it when the pane leaves that place; a preset with no key reads bare.
 var NO_TRASH = Status.NO_TRASH
 function noTrashHint() { return Status.trashHint().replace(" · ", "") }
 function noTrashLine() { return Status.noTrashLine() }
 
-// Tab is the only thing that moves focus between views, so the rule lives in one function.
-function next(current, sidebar) {
-    // RailAdditions rule 4: a hidden rail is not a place the keyboard can go, so Tab stays in the list. Directive 77: one that auto-hide withdrew is, because arriving there is what reveals it.
-    return current === LIST && sidebar ? RAIL : LIST
+// Tab is the only thing that moves focus between views, so the rule lives in one function; drawn names the optional stops that are there, as ChromeKeys.drawn says.
+function next(current, drawn, forward) {
+    // RailAdditions rule 4: a hidden rail is not a place the keyboard can go, so Tab skips it. Directive 77: one that auto-hide withdrew is, because arriving there is what reveals it.
+    var stops = RING.filter(function (view) { return view === LIST || drawn[view] === true })
+    var at = stops.indexOf(current)
+    return at < 0 ? LIST : stops[(at + (forward ? 1 : stops.length - 1)) % stops.length]
+}
+
+// Tab and Shift+Tab. In the dual view the two lists are consecutive stops and the pane switch is the step between them; the rail is the left pane's, so any pane's step onto it hands the keyboard to that one.
+function tabStep(root, sidebar, forward) {
+    if (root.dualMode && root.focusView === LIST && forward !== (root.listOnly === true)) { root.switchPane(); return }
+    var to = next(root.focusView, ChromeKeys.drawn(root, sidebar || root.sidebar || root.railAvailable), forward)
+    if (to === LIST) {
+        root.focusView = LIST
+        // Forward lands on the left list and backward on the right one, wherever the keyboard stood.
+        if (root.dualMode && (root.listOnly === true) === forward) root.switchPane()
+        return
+    }
+    if (to === RAIL && root.dualMode) {
+        root.focusView = LIST
+        root.switchToRail()
+        return
+    }
+    ChromeKeys.enter(root, to, forward)
+    root.focusView = to
 }
 
 // Hiding the rail while it holds the keyboard strands focusView, so the listing takes the logical view and the actual focus together.
@@ -67,10 +100,7 @@ function canUndo(pane, sidebar) {
     return true
 }
 
-// The one lookup Pane.qml's Keys.onPressed calls. "addNetwork" is a rail-only action (the
-// dialog is reached from the rail's own "+" mark), so "a" does nothing in the list;
-// filtering it here, not in Keymap.js, keeps the generated file a pure keys.toml mirror.
-// seekBack/seekForward get the same treatment, scoped to an open MEDIA preview instead of the rail.
+// Pane.qml's one key lookup: the keys.toml action for the focused context, narrowed below per view and overlay.
 function lookup(event, root) {
     var context = (root.preview && root.preview.active) ? (root.preview.isPdf ? "pdf" : root.preview.isMedia ? "media" : "preview")
                   : shareBrowserHere(root) ? "menu" : root.focusView === RAIL ? "rail" : "listing"
@@ -84,17 +114,17 @@ function lookup(event, root) {
     var action = Keymap.lookup(event.key, event.text, event.modifiers, context)
     // The share listing borrows the menu context for j/k/enter, but it has no submenu to step into.
     if (action === "menuRight" && shareBrowserHere(root)) return "open"
-    // List and Grid filter held rows; search owns the header while its results are active.
+    // Every view filters the held rows it draws; search owns the header while its results are active.
     if (action === "filter")
-        return (root.viewMode !== "columns" && root.searchMode.length === 0) ? action : ""
+        return root.searchMode.length === 0 ? action : ""
     // Left and Right seek inside a media preview and turn the page in a PDF one, which is the only
     // place the map binds either action now that the browsing pair is parent and browse-in; the grid
     // takes the bare arrows above, before the map is consulted.
     if (action === "seekBack" || action === "seekForward")
         return root.preview && root.preview.active && (root.preview.isMedia || root.preview.isPdf) ? action : ""
-    // Minus, plus and e mean nothing outside a PDF. l is h's forward: page, else enter or preview.
-    if (action === "zoomOut" || action === "zoomIn" || action === "expand")
-        return (root.preview && root.preview.active && root.preview.isPdf) ? action : ""
+    // The zoom keys reach a PDF or an image, 0 reaches an image only (keys.toml binds it in that context), and e expands a PDF only. l is h's forward: page, else enter or preview.
+    if (action === "zoomOut" || action === "zoomIn" || action === "zoomFit" || action === "expand")
+        return (root.preview && root.preview.active && (root.preview.isPdf || (root.preview.isImage && action !== "expand"))) ? action : ""
     if (action === "pageForward") {
         if (root.preview && root.preview.active)
             return root.preview.isPdf ? action : ""
@@ -148,8 +178,8 @@ function act(action, root, menuId, paths) {
     // Popups handle Escape first; the focused listing then unwinds filter, search, status and marks.
     case "escape":
         if (root.filterTyping || root.filterQuery.length > 0) Filter.close(root)
-        else if (root.searchMode.length > 0 && root.focusView === LIST) Search.cancel(root)
-        else if (root.recentMode.length > 0 && root.focusView === LIST) { if (root.listInFlight) root.message("A directory is already loading.", false); else RecentMode.close(root) }
+        else if (root.searchMode.length > 0 && root.focusView === LIST) Search.abort(root)
+        else if (root.recentMode.length > 0 && root.focusView === LIST) RecentMode.close(root)
         else if (root.statusBar && root.statusBar.escapePressed()) return
         else if (escapeUp(root)) root.openParent()
         else root.escapePressed()
@@ -176,7 +206,7 @@ function act(action, root, menuId, paths) {
     // MenuAdditions040: c copies as, P pastes as, V flips the selection.
     case "copyAs": root.openCopyAs(); return
     case "pasteAs":
-        if (root.recentMode.length > 0) { root.message("This listing is a history, and cannot take a paste.", false); return }
+        if (root.recentMode.length > 0) { root.message("Recent cannot take a paste. Open a folder first", false); return }
         root.openPasteAs(); return
     case "invertSelection": root.invertSelection(); return
     case "showOriginal": root.showOriginal(); return
@@ -193,9 +223,9 @@ function act(action, root, menuId, paths) {
         root.pasteLink(action === "pasteAbsoluteLink" ? "absolute" : action === "pasteHardLink" ? "hard" : "relative"); return
     case "cut": Ops.clip(root, true, paths); return
     // Recent is a history, not a directory: pasting or creating there would land in the root it stands on.
-    case "paste": if (root.recentMode.length > 0) { root.message("This listing is a history, and cannot take a paste.", false); return } Ops.paste(root); return
+    case "paste": if (root.recentMode.length > 0) { root.message("Recent cannot take a paste. Open a folder first", false); return } Ops.paste(root); return
     case "movePaste":
-        if (root.recentMode.length > 0) { root.message("This listing is a history, and cannot take a paste.", false); return }
+        if (root.recentMode.length > 0) { root.message("Recent cannot take a paste. Open a folder first", false); return }
         Ops.paste(root, true)
         return
     case "undo": Ops.undo(root); return
@@ -203,8 +233,12 @@ function act(action, root, menuId, paths) {
     // m opens the row menu, or says why no row was under the cursor.
     case "menu":
         if (!root.openCursorMenu())
-            root.message("No row under the cursor to open a menu on.", false)
+            root.message("No item under the cursor to open a menu on", false)
         return
+    // The run card's own entrances; see ui/js/Nav.js runCursor.
+    case "run": Nav.runCursor(root, root.opener, "open"); return
+    case "openAsText": Nav.runCursor(root, root.opener, "openText"); return
+    case "tags": root.tags().openMenu(); return
     case "extract": Ops.extract(root, menuId); return
     case "dropbox": root.moveToDropbox(menuId); return
     case "sharelink": root.copyShareLink(); return
@@ -220,20 +254,25 @@ function act(action, root, menuId, paths) {
         return
     case "addNetwork": if (root.sidebar) root.sidebar.addRequested(); return
     case "eject": Eject.release(root, root.sidebar, false); return
-    // Finder's Cmd+1/2/3; the chrome's three buttons write the same property, so they follow.
+    // Finder's Cmd+1/2/3/4; the chrome's four buttons write the same property, so they follow.
     case "viewList": root.chooseView("list"); return
     case "viewColumns": root.chooseView("columns"); return
     case "viewGrid": root.chooseView("grid"); return
-    case "newFolder": if (root.recentMode.length > 0) { root.message("This listing is a history, and cannot take a new folder.", false); return } Ops.newFolder(root); return
+    case "viewDual": root.chooseView("dual"); return
+    case "newFolder": if (root.recentMode.length > 0) { root.message("Recent cannot hold a new folder. Open a folder first", false); return } Ops.newFolder(root); return
     // The directory being shown, not the row: the menu row and the chord both land here.
     case "openTerminal": root.openTerminal(); return
     // The background menu's Update Flea row, drawn only while an update is known, opens Omarchy's updater through the pane's opener.
     case "updateFlea": root.opener.updateFlea(root); return
     }
     // A submenu row fires "<action>:<id>", which is how one signal covers Taildrop and Compress both.
+    if (action.indexOf("tags:") === 0) { root.tags().choose(action.substring(5)); return }
     if (action.indexOf("compress:") === 0) {
-        if (paths) Ops.compressResolved(root, paths, action.substring("compress:".length), menuId)
-        else Ops.compress(root, action.substring("compress:".length))
+        var picked = action.substring("compress:".length)
+        // The submenu's last row opens the password dialog, routed by the pane: this file takes no new first-frame import.
+        if (picked === "compressPassword") { root.compressPasswordRequested(paths || null, menuId || 0); return }
+        if (paths) Ops.compressResolved(root, paths, picked, menuId)
+        else Ops.compress(root, picked)
         return
     }
     // The background menu's Sort by flyout, routed to the header click's own function so an aimed
@@ -244,7 +283,7 @@ function act(action, root, menuId, paths) {
     }
     // Tabs run here and handleKey opens the path bar, so neither answers unbuilt any more.
     if (action.indexOf("tab") === 0) { Tabs.act(action, root); return }
-    root.message(action + " is not built yet.", false)
+    root.message("That action is not available yet", false)
 }
 
 // Issue 29: Escape climbs only when nothing else owns it, so each unwound state keeps the key.
@@ -262,7 +301,6 @@ function hasDeliberateMarks(root) {
         return false
     return true
 }
-
 // Only a step from an end wraps; page overshoots and selection extensions retain their clamps.
 function step(root, delta) {
     var last = root.shownTotal - 1
@@ -330,14 +368,23 @@ function handleKey(event, root, sidebar) {
     }
     root.inputAt = Date.now()
     root.rowsAt = 0
-    // Cursor keys commit a query before acting on its results; search walks once per commit.
-    if ((root.searchMode === Search.TYPING || root.filterTyping) && leavesLine(event)) {
-        if (root.filterTyping) Filter.commit(root)
-        else Search.run(root)
-    }
-    // The query line owns every key while it has the caret, the same way the rename field does above.
-    if (root.searchMode === Search.TYPING) {
+    // The query line owns every key unless Quick Look or the share listing is over it; cursor motions act on the results through the one route.
+    if (root.searchMode === Search.TYPING && !(root.preview && root.preview.active) && !shareBrowserHere(root)) {
+        if (leavesLine(event)) {
+            var action = Keymap.lookup(event.key, event.text, event.modifiers)
+            // No key off the line moves rows a listing or the search's exit is about to replace, as below and in Search.typeKey.
+            if (root.searchLeaving === true) return true
+            if (Swap.swallows(root.listInFlight, action)) { root.message(Swap.LOADING, false); return true }
+            if (Grid.arrow(event, action, root)) {
+                return true
+            }
+            act(action, root)
+            return true
+        }
         return Search.typeKey(event, root)
+    }
+    if (root.filterTyping && leavesLine(event)) {
+        Filter.commit(root)
     }
     // The filter's query line owns every key while it has the caret, the same as the search's above.
     if (root.filterTyping) {
@@ -364,8 +411,9 @@ function handleKey(event, root, sidebar) {
         return true
     }
     if (windowAction(action, root, sidebar)) return true
+    if ((root.focusView === CHROME || root.focusView === STRIP) && ChromeKeys.act(event, root)) return true
     if (root.focusView === RAIL && sidebar) {
-        RailKeys.act(action, root, sidebar)
+        RailKeys.act(action, root, sidebar, event)
         return true
     }
     // An armed pair keeps Escape to cancel the arm instead of climbing.
@@ -386,7 +434,8 @@ function handleKey(event, root, sidebar) {
     }
     // Unbound printable keys name the filter instead of jumping into destructive bindings.
     if (root.shown === null && Input.isPrintable(event.text)) {
-        root.message("Press / to filter this listing by name.", false)
+        var tip = KeyName.hinted(WORDS.filterTip, "filter")
+        if (tip.length > 0) root.message(tip, false)
         return true
     }
     return false
@@ -399,8 +448,7 @@ function dispatchAction(action, root) {
 
 function windowAction(action, root, sidebar) {
     if (action === "focusNext" || action === "focusPrevious") {
-        if (root.dualMode && root.focusView === LIST) root.switchPane()
-        else root.focusView = next(root.focusView, sidebar || root.sidebar || root.railAvailable)
+        tabStep(root, sidebar, action === "focusNext")
         return true
     }
     if (action === "focusPreview") {

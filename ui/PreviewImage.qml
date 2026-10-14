@@ -2,6 +2,9 @@ import QtQuick
 import qs.Commons
 import "." as Flea
 import "js/Format.js" as Format
+import "js/Kinds.js" as Kinds
+import "js/PreviewKeys.js" as PreviewKeys
+import "js/Scroll.js" as Scroll
 import "js/Thumbs.js" as Thumbs
 
 // The Quick Look's image pane, reached only through Preview.qml's Loader. It draws the file itself:
@@ -9,7 +12,34 @@ import "js/Thumbs.js" as Thumbs
 Item {
     id: root
 
+    // A zoomed picture runs past the surface's edges.
+    clip: true
+
     property string path: ""
+
+    // Times the fit size, on the PDF's ladder; 1 is fit.
+    property real zoom: PreviewKeys.PDF_ZOOM_MIN
+    readonly property bool zoomed: root.zoom > PreviewKeys.PDF_ZOOM_MIN
+    // The zoom read against fit; fit itself carries no label.
+    readonly property string zoomLabel: root.zoomed ? "%1%".arg(Math.round(root.zoom * 100)) : ""
+    // The pannable viewport, the strip under it and the sharper layer, for Preview.qml's readers and the zoom suite.
+    readonly property alias viewport: flick
+    readonly property alias band: band
+    readonly property alias fullPicture: sharp
+    // Another file is a new subject: the next one opens at fit.
+    onPathChanged: root.zoom = PreviewKeys.PDF_ZOOM_MIN
+
+    // The viewport's centre point stays put across a step; a picture still decoding or refused does not zoom in.
+    function zoomTo(next) {
+        if (next === root.zoom || (next > PreviewKeys.PDF_ZOOM_MIN && picture.status !== Image.Ready)) return
+        var fx = (flick.contentX + flick.width / 2) / flick.contentWidth
+        var fy = (flick.contentY + flick.height / 2) / flick.contentHeight
+        root.zoom = next
+        flick.contentX = Scroll.bounded(fx * flick.contentWidth - flick.width / 2, flick.originX, flick.contentWidth, flick.width, flick.leftMargin, flick.rightMargin)
+        flick.contentY = Scroll.bounded(fy * flick.contentHeight - flick.height / 2, flick.originY, flick.contentHeight, flick.height, flick.topMargin, flick.bottomMargin)
+    }
+    function zoomBy(steps) { root.zoomTo(PreviewKeys.zoomStep(root.zoom, steps)) }
+    function zoomFit() { root.zoomTo(PreviewKeys.PDF_ZOOM_MIN) }
 
     // The row's cache file, held by Quick Look while this decodes: drawn between the
     // ground and the picture, so it is never hidden by one nor covers the other.
@@ -19,16 +49,35 @@ Item {
     property real interimWidth: 0
     property real interimHeight: 0
     property bool interimVisible: false
+    // Set from open while this row's thumbnail may still be asked for; it only gates failed.
+    property bool thumbPending: false
     readonly property bool interimReady: interimPicture.status === Image.Ready
 
-    // The same name the media and PDF panes give their unreadable state, so Preview.qml tests one property.
-    readonly property bool failed: picture.status === Image.Error
-    // Every state is terminal: a decode ends Ready or Error, and a vanished file ends Error too.
+    // The same name the media and PDF panes give their unreadable state, so Preview.qml tests one property; failed only with no thumbnail to stand in or coming, and a decoding one keeps loading.
+    readonly property bool failed: root.pictureFailed && !root.thumbPending && interimPicture.status !== Image.Ready && interimPicture.status !== Image.Loading
+    // Every state is terminal once an owed thumbnail has landed or been refused: a failed final waits on it first.
     readonly property string status: {
         if (root.failed) return "This image could not be read."
-        return picture.status === Image.Ready ? "image" : "loading"
+        return (picture.status === Image.Ready || root.fallbackShown) ? "image" : "loading"
     }
+    // The original's pixels for the thumbnail fit, from Preview.qml's meta reply; 0 while unknown.
+    property real origW: 0
+    property real origH: 0
+    // A 3D model is refused with no decode attempt: Qt has no plugin for it, and each attempt logs a warning.
+    readonly property bool decodable: !Kinds.isModel(root.path)
+    // The final refused, by a decode Error or at once for a file Qt cannot decode; the thumbnail below stands in when it decoded.
+    readonly property bool pictureFailed: picture.status === Image.Error || (root.interimSettled && !root.decodable)
+    readonly property bool fallbackShown: root.pictureFailed && root.interimReady
     readonly property string name: root.path.substring(root.path.lastIndexOf("/") + 1)
+
+    // The pixmap reader decodes only the final, one request at a time; it waits a turn after the build because Preview.qml binds the path before the thumbnail.
+    property bool armed: false
+    readonly property bool interimSettled: root.armed && interimPicture.status !== Image.Loading
+    Timer {
+        running: true
+        interval: 0
+        onTriggered: root.armed = true
+    }
 
     // The letterbox ground the video pane uses: a photo almost never matches the surface's proportions.
     Rectangle {
@@ -36,19 +85,21 @@ Item {
         color: Theme.color.background
     }
 
-    // The cached thumbnail at once, sized to the final's own rect by the caller: the
-    // cache file is already upright, so no turn applies, and Stretch meets that rect.
+    // The cached thumbnail at once, sized to the final's rect by the caller; it stays as the picture at the column fit when the final cannot decode.
     Image {
         id: interimPicture
-        x: root.interimX
-        y: root.interimY
-        width: root.interimWidth
-        height: root.interimHeight
+        readonly property real ownFit: Thumbs.fitScale(root.width, root.height, implicitWidth, implicitHeight,
+            Thumbs.posterLimit(false, implicitWidth, implicitHeight, root.origW, root.origH))
+        x: root.fallbackShown ? Math.round((root.width - width) / 2) : root.interimX
+        y: root.fallbackShown ? Math.round((root.height - height) / 2) : root.interimY
+        width: root.fallbackShown ? implicitWidth * ownFit : root.interimWidth
+        height: root.fallbackShown ? implicitHeight * ownFit : root.interimHeight
         // Only while the decode runs: a final with transparent pixels would show it through.
-        visible: root.interimVisible && root.status === "loading"
+        visible: root.interimVisible && root.status === "loading" || root.fallbackShown
         source: root.interimThumb.length > 0 ? Format.fileUri(root.interimThumb) : ""
         fillMode: Image.Stretch
-        asynchronous: true
+        // A cache thumbnail decodes on the GUI thread in about a millisecond: the reader cannot drop a running decode.
+        asynchronous: false
         cache: false
     }
 
@@ -58,17 +109,19 @@ Item {
     readonly property bool vector: /\.svgz?$/i.test(root.path)
     // The drawn picture itself, for ui/Ipc.qml's previewPictureRect: the item is sized to the
     // fit of what was decoded, so its rect is the picture and not the surface it is centred on.
-    readonly property Item pictureItem: picture
+    readonly property Item pictureItem: root.fallbackShown ? interimPicture : picture
+
     Image {
         id: picture
         readonly property real fit: Thumbs.fitScale(root.width, root.height, implicitWidth, implicitHeight, 1)
-        x: root.vector ? 0 : Math.round((root.width - width) / 2)
-        y: root.vector ? 0 : Math.round((root.height - height) / 2)
-        width: root.vector ? root.width : implicitWidth * fit
-        height: root.vector ? root.height : implicitHeight * fit
-        visible: picture.status === Image.Ready
+        x: Math.round((flick.contentWidth - width) / 2 - flick.contentX)
+        y: Math.round((flick.contentHeight - height) / 2 - flick.contentY)
+        width: root.vector ? root.width * root.zoom : implicitWidth * fit * root.zoom
+        height: root.vector ? root.height * root.zoom : implicitHeight * fit * root.zoom
+        // The sharper layer takes over once it has a frame, so a transparent picture never shows two.
+        visible: picture.status === Image.Ready && !sharp.drawn
         // Format.fileUri, not a concatenation: a # or a ? in the name would truncate a hand-built URI.
-        source: root.path.length > 0 ? Format.fileUri(root.path) : ""
+        source: root.path.length > 0 && root.decodable && root.interimSettled ? Format.fileUri(root.path) : ""
         fillMode: root.vector ? Image.PreserveAspectFit : Image.Stretch
         // A phone keeps a portrait photo's turn in EXIF, and Qt leaves it unapplied unless asked.
         autoTransform: true
@@ -79,6 +132,54 @@ Item {
         // corner: a zero here means unbounded to Qt, so the floor is 1 and never 0.
         sourceSize.width: Math.max(1, Math.round(root.width))
         sourceSize.height: Math.max(1, Math.round(root.height))
+    }
+
+    // Past fit the fit picture is drawn scaled until this layer has a frame.
+    Flea.PreviewImageSharp {
+        id: sharp
+        base: picture
+        active: root.zoomed
+        want: root.vector ? Qt.size(Math.max(1, Math.round(root.width * root.zoom)), Math.max(1, Math.round(root.height * root.zoom))) : Qt.size(0, 0)
+    }
+
+    // The pan: a drag, the wheel and the knobs move contentX and contentY, and the pictures above follow them. At fit it is the whole surface and holds still; zoomed, it is the surface less the band.
+    Flickable {
+        id: flick
+        width: root.width
+        height: root.zoomed ? root.height - band.height : root.height
+        contentWidth: Math.max(flick.width, picture.width)
+        contentHeight: Math.max(flick.height, picture.height)
+        interactive: root.zoomed
+        boundsBehavior: Flickable.StopAtBounds
+
+        // The wheel and the knobs are built at the first step past fit and go at fit: the first frame at fit holds neither.
+        Loader {
+            parent: flick
+            anchors.fill: parent
+            active: root.zoomed
+            sourceComponent: Flea.PreviewImagePan {}
+        }
+    }
+
+    // The zoom as a number under the picture, a media strip tall with no divider; absent at fit.
+    Rectangle {
+        id: band
+        visible: root.zoomed
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: Theme.chromeHeight
+        color: Theme.color.surface
+
+        Text {
+            anchors.centerIn: parent
+            text: root.zoomLabel
+            color: Theme.color.foreground
+            font.family: Theme.font.family
+            font.pixelSize: Theme.font.caption
+            font.features: { "tnum": 1 }
+            textFormat: Text.PlainText
+        }
     }
 
     // A failed decode is a mark and a sentence, never a bare ground: the blank-frame class again otherwise.

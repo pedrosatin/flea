@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // Big enough that the syscall count stops mattering, small enough that a cancel is noticed promptly.
 const CHUNK: usize = 256 * 1024;
+// A file under a chunk reads through a buffer of its own size, never under this, so a tree of small files maps no chunk per file.
+const SMALL_CHUNK: usize = 8 * 1024;
 // 8 MiB is 32 chunks, so one range sync per 32 writes keeps the card live without a syscall per chunk.
 pub(crate) const CONFIRM_BYTES: u64 = 8 * 1024 * 1024;
 // 1 MiB starts the ramp, so the first confirmed report lands after 1 MiB rather than 16 MiB.
@@ -17,6 +19,8 @@ const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
 // rename(2) sets EXDEV when the two paths are on different filesystems, which is the one failure that means "copy instead".
 const EXDEV: i32 = 18;
 use crate::oflags::{O_DIRECTORY, O_NOFOLLOW};
+use super::archivefree::format_size;
+use super::unheld::Kind;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 
@@ -34,7 +38,7 @@ pub struct Progress<'a> {
     pub manifest: Option<super::copymanifest::Writer>,
     // Some while the destination needs its bytes confirmed: transfer, duplicate and redo each make one for theirs.
     pub durability: Option<&'a mut super::durable::Durability>,
-    // True when the copy is a move's first half, so a skipped link fails instead of counting.
+    // True when the copy is a move's first half, so the sentence naming what a drive refused says moved.
     pub for_move: bool,
 }
 
@@ -83,23 +87,23 @@ fn copy_file_at(src: At, dst: At, total: u64, p: &mut Progress) -> Result<(), Fl
         .map_err(|e| from_io("copy", &src.named.to_string_lossy(), &e))?;
     // A file the destination cannot hold is refused before a byte is written, so EFBIG never leaves a partial.
     if let Some(refusal) = precheck(dst.named, src_meta.len()) {
-        return Err(copy_err(dst.named, &refusal));
+        // The size limit belongs to this one file, the free room to the whole drive.
+        return Err(if refusal == TOO_BIG { super::unheld::marked(dst.named, refusal) } else { copy_err(dst.named, &refusal) });
     }
     // Issue 109: a create takes the umask, so a 0600 source landed 0644 and the copy published what
     // the original kept private. The source's own bits are carried by the create itself, so there is
     // no window where the bytes are on disk under a wider mode, narrowed by the umask and never widened.
     let mode = mode_for_source(crate::backend::fsinfo::magic_of(src.at), src_meta.permissions().mode(), false);
-    let mut w = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(dst.at)
-        .map_err(|e| from_io("copy", &dst.named.to_string_lossy(), &e))?;
+    let mut w = super::unheld::fault(dst.named, Kind::Entry)
+        .and_then(|()| std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(dst.at))
+        .map_err(|e| super::unheld::refused(Kind::Entry, &e, dst.named, p.tree.is_some().then_some(src.at)))?;
     #[cfg(test)]
     super::durable::test_log("open-dest");
     // From here the destination exists, and every failure below leaves it for the caller to journal.
     let durable = p.durability.as_ref().is_some_and(|c| c.durable);
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = vec![0u8; usize::try_from(src_meta.len()).map_or(CHUNK, |len| len.clamp(SMALL_CHUNK, CHUNK))];
+    #[cfg(test)]
+    BUFFERS.with(|v| v.borrow_mut().push(buf.len()));
     let mut done: u64 = 0;
     let mut confirmed: u64 = 0;
     // A filesystem without range writeback (some FUSE mounts answer EINVAL) leaves the verdict to the final fsync.
@@ -125,6 +129,10 @@ fn copy_file_at(src: At, dst: At, total: u64, p: &mut Progress) -> Result<(), Fl
         }
         #[cfg(test)]
         super::durable::test_log("write-dest");
+        #[cfg(test)]
+        if CANCEL_AFTER_WRITE.with(|v| v.get()) {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
         done += n as u64;
         if !durable {
             let (reported, against) = match p.tree {
@@ -179,6 +187,7 @@ fn copy_file_at(src: At, dst: At, total: u64, p: &mut Progress) -> Result<(), Fl
     }
     // The copy carries the source mtime, best effort, so a copied tree still sorts by its own history.
     keep_mtime(&w, &src_meta);
+    super::tags::copy_tags(src.at, dst.at);
     if durable {
         // A batch_syncfs stick confirms 64 files with one syncfs, so a small file skips its own fsync.
         if p.durability.as_ref().is_some_and(|d| d.batch_syncfs) {
@@ -231,6 +240,28 @@ fn copy_file_at(src: At, dst: At, total: u64, p: &mut Progress) -> Result<(), Fl
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static CANCEL_AFTER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Sample input: test_cancel_after_write(true) raises the copy's own cancel after its first chunk lands; false clears it.
+#[cfg(test)]
+pub(crate) fn test_cancel_after_write(on: bool) {
+    CANCEL_AFTER_WRITE.with(|v| v.set(on));
+}
+
+#[cfg(test)]
+thread_local! {
+    static BUFFERS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Test seam: the length of every copy buffer this thread allocated since the last read.
+#[cfg(test)]
+pub(crate) fn test_take_buffers() -> Vec<usize> {
+    BUFFERS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
 // Production writes every byte; tests can refuse after a partial write without a sick drive.
 fn write_chunk(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(test)]
@@ -263,14 +294,15 @@ pub(crate) fn test_fail_write(fault: Option<(usize, i32)>) {
 
 // A file the destination cannot hold is refused before a byte is written, so EFBIG never leaves a partial file.
 fn precheck(dst: &Path, size: u64) -> Option<String> {
+    let name = dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     #[cfg(test)]
     if let Some((free, blocks, magic)) = TEST_PRECHECK.with(|v| *v.borrow()) {
-        return refuse_for_size(magic, free, blocks, size);
+        return refuse_for_size(&name, magic, free, blocks, size);
     }
     let parent = dst.parent().unwrap_or(dst);
     let (info, magic) = crate::backend::fsinfo::read_with_magic(parent);
     let (free, blocks) = info.map(|i| (i.free, i.blocks)).unwrap_or((u64::MAX, 1));
-    refuse_for_size(magic, free, blocks, size)
+    refuse_for_size(&name, magic, free, blocks, size)
 }
 
 // Sample input: test_set_precheck(Some(0), Some(0), None) makes the next precheck see unknown room.
@@ -285,61 +317,25 @@ pub fn test_set_precheck(free: Option<u64>, blocks: Option<u64>, magic: Option<i
     TEST_PRECHECK.with(|v| *v.borrow_mut() = free.map(|f| (f, blocks.unwrap_or(1), magic)));
 }
 
-// Sample input: (Some(0x4D44), free, 1, 4 GiB) refuses, (Some(ext4), free, 1, 4 GiB) passes.
-fn refuse_for_size(magic: Option<i64>, free: u64, blocks: u64, size: u64) -> Option<String> {
+const TOO_BIG: &str = "a file of 4 GiB or more does not fit on a FAT32 drive";
+
+// Sample input: ("a.iso", Some(0x4D44), free, 1, 4 GiB) refuses, ("a.iso", Some(ext4), free, 1, 4 GiB) passes.
+fn refuse_for_size(name: &str, magic: Option<i64>, free: u64, blocks: u64, size: u64) -> Option<String> {
     if magic == Some(VFAT_MAGIC) && size >= FOUR_GIB {
-        return Some("files of 4 GiB or more do not fit on a vfat drive".to_string());
+        return Some(TOO_BIG.to_string());
     }
     // A zero-block statfs reports unknown room, so a gvfs mount that omits free never refuses.
     if blocks == 0 {
         return None;
     }
     if size > free {
-        return Some(format!("the drive holds {free} bytes free but the file needs {size}"));
+        return Some(format!("{name} needs {}, and the drive has {} free", format_size(size), format_size(free)));
     }
     None
 }
 
 fn copy_err(path: &Path, msg: &str) -> FleaError {
     FleaError { where_: "copy".to_string(), path: path.to_string_lossy().to_string(), msg: msg.to_string() }
-}
-
-// A symlink onto a filesystem that holds no links is skipped with a count, never fatal to the folder around it.
-const EPERM: i32 = 1;
-const EXFAT_MAGIC: i64 = 0x2011BAB0;
-const LINKSKIP: &str = "linkskip";
-
-fn is_linkless_fs(magic: Option<i64>) -> bool {
-    #[cfg(test)]
-    if FORCE_LINKLESS.with(|f| f.get()) {
-        return true;
-    }
-    magic == Some(VFAT_MAGIC) || magic == Some(EXFAT_MAGIC)
-}
-
-thread_local! {
-    static SKIPPED_LINKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-// Sample input: test_force_linkless(true) makes the next folder copy skip links on any filesystem.
-#[cfg(test)]
-thread_local! {
-    static FORCE_LINKLESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-// A test makes symlink() answer EPERM on any filesystem, so a linkless destination needs no mount.
-#[cfg(test)]
-pub fn test_force_linkless(force: bool) {
-    FORCE_LINKLESS.with(|f| f.set(force));
-}
-
-fn note_skipped_link() {
-    SKIPPED_LINKS.with(|n| n.set(n.get() + 1));
-}
-
-// The skipped-link count since the last take, so a transfer reports what its folder copies skipped.
-pub fn take_skipped_links() -> usize {
-    SKIPPED_LINKS.with(|n| n.replace(0))
 }
 
 // The permission bits a copy carries: the source's own, minus anything the umask withholds, and never
@@ -420,28 +416,13 @@ fn record_open(p: &mut Progress, named: &Path, w: &std::fs::File) {
     }
 }
 
-// A symlink is copied as a symlink and never followed, matching cp -a and every rival in the parity audit.
-fn symlink_one(target: &Path, dst: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    if FORCE_LINKLESS.with(|f| f.get()) {
-        return Err(std::io::Error::from_raw_os_error(EPERM));
-    }
-    std::os::unix::fs::symlink(target, dst)
-}
-
-// A symlink is copied as a symlink and never followed, matching cp -a and every rival in the parity audit.
+// A symlink is copied as a symlink and never followed, matching cp -a and every file manager in the parity audit.
 fn copy_symlink_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
     let target = std::fs::read_link(src.at).map_err(|e| from_io("copy", &src.named.to_string_lossy(), &e))?;
-    symlink_one(&target, dst.at).map_err(|e| {
-        if e.raw_os_error() == Some(EPERM) {
-            let parent = dst.named.parent().unwrap_or(dst.named);
-            if is_linkless_fs(crate::backend::fsinfo::magic_of(parent)) {
-                return FleaError { where_: LINKSKIP.to_string(), path: dst.named.to_string_lossy().to_string(),
-                    msg: "this drive cannot hold links".to_string() };
-            }
-        }
-        from_io("copy", &dst.named.to_string_lossy(), &e)
-    })?;
+    super::unheld::fault(dst.named, Kind::Link)
+        .and_then(|()| std::os::unix::fs::symlink(&target, dst.at))
+        .map_err(|e| super::unheld::refused(Kind::Link, &e, dst.named, p.tree.is_some().then_some(src.at)))?;
+    super::tags::copy_tags(src.at, dst.at);
     if let Some(writer) = p.manifest.as_mut() {
         writer.record_stat(dst.at, dst.named);
     }
@@ -454,7 +435,20 @@ fn copy_symlink_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> 
 // Copies a file, a symlink, a whole directory tree, or any other node by recreating it. The
 // destination must not already exist.
 pub fn copy_any(src: &Path, dst: &Path, p: &mut Progress) -> Result<(), FleaError> {
-    copy_at(here(src), here(dst), p)
+    super::unheld::begin(p.durability.as_ref().is_some_and(|d| d.rename_fat));
+    if let Err(e) = copy_at(here(src), here(dst), p) {
+        // An item that ends on its own error counts none of its refusals, so none of them reaches the done line.
+        super::unheld::take();
+        return Err(super::unheld::plain(e));
+    }
+    // A tree that landed without what the drive refused is a partial copy: journaled as one, and named.
+    match super::unheld::summary(dst, p.for_move) {
+        Some(e) => {
+            p.partial = Some(dst.to_path_buf());
+            Err(e)
+        }
+        None => Ok(()),
+    }
 }
 
 fn copy_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
@@ -473,7 +467,7 @@ fn copy_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
     }
     // A fifo, a socket and a device node are the rest, and none of them has contents copy_file could
     // stream: the fifo's open waits, the socket's fails, and the device's would never end.
-    crate::backend::copynode::copy_node(&meta, dst.at)?;
+    crate::backend::copynode::copy_node(&meta, src.at, dst, p.tree.is_some().then_some(src.at))?;
     if let Some(writer) = p.manifest.as_mut() {
         writer.record_stat(dst.at, dst.named);
     }
@@ -494,9 +488,11 @@ fn copy_dir_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
     // owner's own three bits, which this run needs to write into it, and takes its exact mode at the end.
     let source_magic = crate::backend::fsinfo::magic_of(src.at);
     let keep = from.metadata().ok().map(|m| mode_for_source(source_magic, m.permissions().mode(), true));
-    std::fs::DirBuilder::new().mode(keep.unwrap_or(0o700) | 0o700).create(dst.at)
-        .map_err(|e| from_io("copy", &dst.named.to_string_lossy(), &e))?;
+    super::unheld::fault(dst.named, Kind::Entry)
+        .and_then(|()| std::fs::DirBuilder::new().mode(keep.unwrap_or(0o700) | 0o700).create(dst.at))
+        .map_err(|e| super::unheld::refused(Kind::Entry, &e, dst.named, p.tree.is_some().then_some(src.at)))?;
     let into = open_dir(dst.at).map_err(|e| from_io("copy", &dst.named.to_string_lossy(), &e))?;
+    super::tags::copy_tags(src.at, dst.at);
     if let Some(writer) = p.manifest.as_mut() {
         match into.metadata() {
             Ok(meta) => writer.record(dst.named, &meta),
@@ -552,15 +548,17 @@ fn copy_dir_at(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
 
 fn copy_dir_entries(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError> {
     let entries = std::fs::read_dir(src.at).map_err(|e| from_io("copy", &src.named.to_string_lossy(), &e))?;
+    let rename_fat = p.durability.as_ref().is_some_and(|d| d.rename_fat);
     for entry in entries {
         if cancelled(p) {
             return Err(cancel_err(dst.named));
         }
         let entry = entry.map_err(|e| from_io("copy", &src.named.to_string_lossy(), &e))?;
         let name = entry.file_name();
+        // The card's Rename answer reaches every level, so a name the drive refuses lands under the name it gives a top-level one.
+        let landed = super::fatnames::inside_leaf(&name, rename_fat);
         let (from_at, from_named) = (src.at.join(&name), src.named.join(&name));
-        let (into_at, into_named) = (dst.at.join(&name), dst.named.join(&name));
-        // A linkskip is counted and the walk goes on, so one symlink cannot fail a folder copy.
+        let (into_at, into_named) = (dst.at.join(&landed), dst.named.join(&landed));
         let outcome = if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             // The total is unused inside a tree: p.tree is Some here.
             copy_file_at(
@@ -576,15 +574,9 @@ fn copy_dir_entries(src: At, dst: At, p: &mut Progress) -> Result<(), FleaError>
                 p,
             )
         };
+        // An item the drive cannot hold is named and skipped, so one link or one FAT name never ends a tree.
         match outcome {
-            Err(e) if e.where_ == LINKSKIP => {
-                // A move's first half keeps its source, so a skipped link fails the item instead of counting.
-                if p.for_move {
-                    return Err(e);
-                }
-                note_skipped_link();
-                continue;
-            }
+            Err(e) if e.where_ == super::unheld::UNHELD => super::unheld::note(e),
             Err(e) => return Err(e),
             Ok(()) => {}
         }
@@ -636,6 +628,17 @@ fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+// Test builds only: move_any's rename answers EXDEV, so a folder takes the cross-device half on one filesystem.
+#[cfg(test)]
+thread_local! {
+    static FORCE_EXDEV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_force_exdev(force: bool) {
+    FORCE_EXDEV.with(|f| f.set(force));
+}
+
 // Same filesystem is a rename; a different one is copy-then-remove, and the source only goes once the copy is complete.
 pub fn move_any(src: &Path, dst: &Path, p: &mut Progress) -> Result<(), FleaError> {
     // A case twin reverses through the temp sibling, so redo shares the path the rename took.
@@ -649,6 +652,10 @@ pub fn move_any(src: &Path, dst: &Path, p: &mut Progress) -> Result<(), FleaErro
         }
         return Ok(());
     }
+    #[cfg(test)]
+    if FORCE_EXDEV.with(|f| f.get()) {
+        return move_cross_device(src, dst, p);
+    }
     match crate::backend::renamecompat::rename_noreplace(src, dst) {
         Ok(()) => {
             // One rename rewrote two directory entries, so both folders are confirmed.
@@ -661,6 +668,8 @@ pub fn move_any(src: &Path, dst: &Path, p: &mut Progress) -> Result<(), FleaErro
             Ok(())
         }
         Err(e) if e.raw_os_error() == Some(EXDEV) => move_cross_device(src, dst, p),
+        // A FUSE mount that refuses RENAME_NOREPLACE (fuse.rclone, issue 282) moves like another device.
+        Err(e) if crate::backend::renamecompat::needs_copy_fallback(src, &e) => move_cross_device(src, dst, p),
         Err(e) => Err(from_io("rename", &dst.to_string_lossy(), &e)),
     }
 }

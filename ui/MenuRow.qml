@@ -27,8 +27,10 @@ Item {
     readonly property bool hovered: pointer.hovered
     // For ui/Ipc.qml's contextMenuRowProbe: whether the pointer is over this row and where, before a test judges a move.
     function probe() { return pointer.hovered + " " + Math.round(pointer.point.scenePosition.x) + " " + Math.round(pointer.point.scenePosition.y) + " " + Math.round(pointer.restingAt.x) + " " + Math.round(pointer.restingAt.y) }
-    // The scene point (despite the name) any row of the menu last saw, compared exactly; ui/ContextMenu.qml owns it.
+    // The scene point (despite the name) the host's rows or ground last saw, or -1 when unseen since it opened; the host owns it.
     property point lastPointerGlobal: Qt.point(-1, -1)
+    // A first report is motion only a pixel or more from a point the host saw: Qt rounds the point a ground takes on appearing under the pointer.
+    function awayFrom(position, x, y) { return x >= 0 && (Math.abs(position.x - x) >= 1 || Math.abs(position.y - y) >= 1) }
     signal pointerSeen(point at)
 
     readonly property bool available: root.entry.disabled !== true
@@ -38,23 +40,31 @@ Item {
     // A danger row takes the theme's error role for both its mark and its label, never a hardcoded red.
     readonly property bool danger: root.entry.danger === true
     // A provider that cannot answer reads as an error in its own row, the way Move to Trash reads as
-    // a danger: red, and no sentence beside it widening the menu. GM's ruling, 2026-09-10.
+    // a danger: red, and no sentence beside it widening the menu. Decided 2026-09-10.
     readonly property bool errored: root.entry.errored === true
     // The key this row's action answers to, right-aligned per Menus.html. Derived from keys.toml
     // through the generated map, so an unbound action leaves the slot empty rather than guessing.
     // Empty with the Menus section's hints row off, which takes the slot's width with it.
     readonly property string hint: root.isSeparator ? "" : root.entry.hint !== undefined ? root.entry.hint
                                  : ViewState.keyHints ? Keymap.hintFor(root.entry.action) : ""
+    // A Tags flyout row's box and swatch are built only for those rows (ui/TagMenuMark.qml), so every other row builds none.
+    property var tagItem: null
+    function mountTag() {
+        if (root.entry.tagRow === undefined || root.tagItem !== null) return
+        root.tagItem = Qt.createComponent("TagMenuMark.qml").createObject(root, { row: root, mark: markSlot, hint: hintText })
+    }
+    Component.onCompleted: root.mountTag()
+    onEntryChanged: root.mountTag()
     readonly property color markColor: root.errored ? Theme.color.error
-                                     : !root.available ? Theme.color.muted : root.danger ? Theme.color.error
-                                     : root.picked ? Theme.color.accent : Theme.color.muted
+                                     : !root.available ? Theme.color.mutedFrame : root.danger ? Theme.color.error
+                                     : root.picked ? Theme.color.accent : Theme.color.mutedFrame
     readonly property color labelColor: root.errored ? Theme.color.error
                                       : !root.available ? Theme.color.muted : root.danger ? Theme.color.error
                                       : root.entry.labelColor !== undefined ? root.entry.labelColor
                                       : root.picked ? Theme.color.accent : Theme.color.foreground
 
     // The hover lift Row.qml uses, so a menu row and a list row read alike.
-    readonly property real hoverOpacity: 0.08
+    readonly property real hoverOpacity: Theme.washHover
     // The rail's mount-status square and the gap the Update Flea board puts between it and the version.
     readonly property int statusSquareSize: 6
     readonly property int statusSquareGap: 7
@@ -86,7 +96,18 @@ Item {
                     + (statusSquare.visible ? statusSquare.width + statusSquare.anchors.rightMargin : 0)
                     + chevronSlot.width + hintText.anchors.rightMargin)
 
+    // What this row laid out, read off its items and not off wantedWidth: ui/IpcMenuState.qml's width oracle sums these.
+    function parts() {
+        if (root.isSeparator) return {separator: true}
+        return {separator: false, markLeft: markSlot.anchors.leftMargin, slot: markSlot.width,
+                labelLeft: label.anchors.leftMargin, label: label.implicitWidth, labelRight: label.anchors.rightMargin,
+                labelTruncated: label.truncated, hint: hintText.implicitWidth, hintWrap: root.entry.hintWrap === true,
+                hintRight: hintText.anchors.rightMargin, status: statusSquare.visible ? statusSquare.width + statusSquare.anchors.rightMargin : 0,
+                chevron: chevronSlot.width, chevronRight: chevronSlot.anchors.rightMargin}
+    }
+
     Rectangle {
+        objectName: "menuWash"
         anchors.fill: parent
         visible: !root.isSeparator
         // selectedAccentFill already carries the theme's own selected alpha, so the tint is a
@@ -101,7 +122,7 @@ Item {
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         height: Theme.spacing.hairline
-        color: Theme.color.muted
+        color: Theme.color.mutedFrame
         opacity: root.separatorOpacity
     }
 
@@ -111,7 +132,7 @@ Item {
     Item {
         id: markSlot
         visible: !root.isSeparator
-        opacity: root.available ? 1 : 0.55
+        opacity: root.available ? 1 : Theme.disabledOpacity
         anchors.left: parent.left
         anchors.leftMargin: Theme.spacing.rowPaddingX
         anchors.verticalCenter: parent.verticalCenter
@@ -121,7 +142,7 @@ Item {
         // A brand mark is a reproduction and takes its own component; every other row is a cut glyph.
         Flea.Glyph {
             anchors.fill: parent
-            visible: root.entry.mark === undefined && !appMark.visible
+            visible: root.entry.mark === undefined && !appMark.visible && root.entry.tagRow === undefined
             name: root.entry.glyph !== undefined ? root.entry.glyph : "file"
             color: root.markColor
         }
@@ -194,11 +215,11 @@ Item {
         visible: !root.isSeparator
         anchors.left: markSlot.right
         anchors.leftMargin: Theme.spacing.gap
-        anchors.right: statusSquare.visible ? statusSquare.left : hintText.left
+        anchors.right: root.tagItem !== null && root.entry.tagRow !== undefined ? root.tagItem.left : statusSquare.visible ? statusSquare.left : hintText.left
         anchors.rightMargin: Theme.spacing.gap
         anchors.verticalCenter: parent.verticalCenter
         text: root.entry.label !== undefined ? root.entry.label : ""
-        opacity: root.available ? 1 : 0.55
+        opacity: root.available ? 1 : Theme.disabledOpacity
         color: root.labelColor
         font.family: Theme.font.family
         font.pixelSize: Theme.font.body
@@ -260,7 +281,7 @@ Item {
             anchors.fill: parent
             visible: root.isSubmenu
             name: "chevron-right"
-            color: Theme.color.muted
+            color: Theme.color.mutedFrame
         }
     }
 
@@ -270,7 +291,7 @@ Item {
         // Scene coordinates distinguish actual motion from a row moving beneath the resting pointer.
         property bool armed: false
         property point restingAt
-        // A first hover at the menu's last point is a row arriving under a still pointer; ui/ContextMenu.qml's pointerSettling discounts the rest.
+        // A first hover at the menu's last point, or at one unseen since it opened (Qt 6.12 hovers up to 100 ms late), is a still pointer.
         onHoveredChanged: {
             if (!pointer.hovered) {
                 pointer.armed = false
@@ -283,7 +304,7 @@ Item {
             // holding it would compare the new position against itself and lose the move.
             var knownX = root.lastPointerGlobal.x, knownY = root.lastPointerGlobal.y
             root.pointerSeen(position)
-            if (knownX < 0 || position.x !== knownX || position.y !== knownY)
+            if (root.awayFrom(position, knownX, knownY))
                 root.pointerMoved()
         }
         onPointChanged: {
@@ -295,7 +316,7 @@ Item {
                 pointer.armed = true
                 pointer.restingAt = position
                 root.pointerSeen(position)
-                if (firstX < 0 || position.x !== firstX || position.y !== firstY)
+                if (root.awayFrom(position, firstX, firstY))
                     root.pointerMoved()
                 return
             }

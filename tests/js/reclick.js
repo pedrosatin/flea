@@ -7,7 +7,7 @@
 function settled(path) {
     var p = {
         path: path, listingPath: "", listInFlight: false, listedSeen: true,
-        searchMode: "", searchQuery: "", searchRunning: false,
+        searchMode: "", searchQuery: "", searchRunning: false, searchFrom: "", searchGen: 0,
         trash: { opened: false }, listingState: "ready",
         history: [], forwardHistory: [], sent: [], said: [],
         focusView: "rail", filterTyping: false, filterQuery: "",
@@ -20,12 +20,14 @@ function settled(path) {
     }
     p.clearSelection = function () {}
     p.message = function (text, isError) { p.said.push(text) }
+    p.armPrompted = function () {}
     p.listArea = { primeSettle: function () {} }
     p.swap = { hold: function () { return false } }
     p.join = function (base, name) { return base + "/" + name }
     p.backend = {
         list: function (target, first, hidden) { p.sent.push("list " + target); p.path = target; p.listInFlight = false },
-        askFsInfo: function () {}
+        askFsInfo: function () {},
+        searchClose: function () {}
     }
     p.open = function (target) { Nav.open(p, target) }
     p.openWithoutHistory = function (target, options) { Nav.openWithoutHistory(p, target, options) }

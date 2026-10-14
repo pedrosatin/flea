@@ -19,6 +19,8 @@ ShellRoot {
     // A storage class the leg forces, or "unknown" to hold the pane before its class reply (storageKnown false, class "").
     readonly property string forcedClass: Quickshell.env("QLFF_CLASS")
     readonly property bool realKey: Quickshell.env("QLFF_MODE") === "key"
+    // QLFF_DUAL=1 restores a dual view with the right pane focused, so the first Space comes from the right pane.
+    readonly property bool dual: Quickshell.env("QLFF_DUAL") === "1"
     // The fixture documents that link a local picture, which a step on them must find drawn.
     readonly property var pictureDocs: ["a-notes.md", "h-html.md", "i-maths.md"]
     // The documents whose inline formula makes the first picture decode of the process a cost the rest must pay, and whether the card found the decoder warm at the key.
@@ -35,6 +37,8 @@ ShellRoot {
     readonly property int quietPolls: 8
     // A step that never reaches content is a harness fault, not a duration the product is held to; a 1 MiB parse is the slowest.
     readonly property int watchdogMs: 20000
+    // A parse past this has stalled however alive its worker looks; the slowest seen under load took 20 s.
+    readonly property int stage4CeilingMs: 90000
     readonly property int pollMs: 20
     // A held key repeats every 30 ms; the sweep widens the rest to 300 ms so a late tick on a loaded host cannot pass for a rested cursor.
     readonly property int sweepPaceMs: 30
@@ -228,6 +232,11 @@ ShellRoot {
         root.stageAt = Date.now()
         root.keyAt = Date.now()
         root.loadsAtKey = root.cardLoads
+        if (root.dual && !(pane.listOnly === true && pane.previewLoader !== null)) {
+            root.fail("the right pane has listOnly=" + pane.listOnly + " and previewLoader=" + pane.previewLoader + " before the first Space")
+            root.finish()
+            return
+        }
         root.log("KEY " + (root.step + 1) + " " + step.name + " " + step.via + " built=" + (root.pv() !== null) + " cards=" + root.cardLoads)
         // The first Space after a rest on a Markdown file finds the card built and closed, so it builds nothing and only opens it.
         if (root.step === 0 && (root.pv() === null || root.pv().active || root.pv().visible))
@@ -236,6 +245,13 @@ ShellRoot {
             PreviewKeys.act(root.indexOf(step.name) > pane.cursorIndex ? "cursorDown" : "cursorUp", pane)
         } else if (root.realKey) {
             root.press()
+            var card = body.item.quickLook
+            if (root.dual && !(card !== null && card.active && card.pane === pane)) {
+                root.fail("the right pane's first Space left quickLook=" + card + " active=" + (card ? card.active : "") + " on its own pane=" + (card ? card.pane === pane : ""))
+                root.finish()
+                return
+            }
+            root.syncPictures = root.pictureState()
         } else {
             root.warmAtKey = root.prepare.decoderWarm === true
             PreviewKeys.open(pane)
@@ -298,7 +314,10 @@ ShellRoot {
             }
             var pane = root.pane()
             Fresh.trace(root)
-            if (Date.now() - root.stageAt > root.watchdogMs) {
+            // A 1 MiB parse takes 5 to 20 s as the host loads, so stage 4 is held to the worker's silence, which the pane's own fallback times at 10 s, never to speed;
+            // a parse that lands past the watchdog is left by stage 4 on this same poll.
+            var workerLive = root.stage === 4 && Date.now() - root.stageAt < root.stage4CeilingMs && root.doc() !== null && root.doc().fallbackFires === 0
+            if (!workerLive && Date.now() - root.stageAt > root.watchdogMs) {
                 var at = pane ? pane.rowFor(pane.cursorIndex) : null
                 root.fail("stage " + root.stage + " stalled in step " + (root.step + 1) + " reads=" + (root.prepare ? root.prepare.reads : -1)
                     + " prepared=" + (root.prepare ? root.prepare.preparedPath : "") + " quiet=" + root.quiet

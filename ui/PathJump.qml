@@ -304,12 +304,14 @@ Item {
             height: Math.max(0, Math.min(rows.implicitHeight + 2 * Theme.spacing.rowPaddingY, root.room))
             color: Theme.color.surface
             border.width: Theme.spacing.hairline
-            border.color: Theme.color.muted
+            border.color: Theme.color.mutedFrame
             radius: Style.cornerRadius
 
             function reveal(index) { scroll.reveal(rowItems.itemAt(index)) }
             // For tests/jump-ui.sh: how many delegates stand, and the one at an index.
             readonly property int liveCount: rowItems.count
+            // For the picker's path shots: how far the rows have scrolled.
+            readonly property real scrollY: scroll.contentY
             function liveAt(index) { return rowItems.itemAt(index) }
             Component.onCompleted: reveal(root.cursor)
 

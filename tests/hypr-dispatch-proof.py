@@ -17,7 +17,7 @@ FAKE_EXECUTABLE_MODE = 0o755
 FAILED_COMMAND_STATUS = 7
 PLACEMENT_FIRST_WINDOW_CALL = 2
 PLACEMENT_CALL_COUNT = 4
-STANDALONE_HARNESS_COUNT = 4
+STANDALONE_HARNESS_COUNT = 6
 PLACEMENT_FLOAT_INDEX = 1
 PLACEMENT_RESIZE_INDEX = 2
 TEST_PID = 111
@@ -62,12 +62,14 @@ def functions(text, names):
     return "\n".join(match.group() for match in re.finditer(pattern, text))
 
 
-# Sample input: repo="$(cd "$(dirname "$0")/.." && pwd)" followed by . "$repo/tests/lib/hypr-dispatch.sh".
+# Sample input: cd "$(dirname "$0")/.." then repo=$(pwd) followed by . "$repo/tests/lib/hypr-dispatch.sh".
 def helper_source_block(text):
     setup = []
     sources = []
     for line in text.splitlines():
         stripped = line.lstrip()
+        if stripped.startswith('cd "$(dirname "$0")/.."') and not sources:
+            setup.append(line)
         if stripped.startswith("repo=") and not sources:
             setup.append(line)
         if stripped.startswith((". ", "source ", ".\t", "source\t")) and "hypr-dispatch.sh" in line:

@@ -23,6 +23,7 @@ function root() {
         selectionCount: function () { return this.picked.length },
         isSelected: function (i) { return this.picked.indexOf(i) >= 0 },
         commitOpenRename: function () {},
+        rowFor: function () { return null },
         selectOnly: function (i) { this.picked = [i]; this.cursorIndex = i; this.did.push("selectOnly") },
         toggleSelectAt: function (i) { this.did.push("toggleSelect") },
         extendSelectionTo: function (i) { this.did.push("extendSelect") },
@@ -274,8 +275,8 @@ function run(check) {
           columns.indexOf("slowClickWasSole") >= 0 && columns.indexOf("slowClickWasSole") < columns.indexOf("Tap.tappedMiddle("), true)
 
     // Each view cancels the armed timer on the second tap, so a double click opens without renaming.
-    check("the list cancels the arm on a second tap",
-          Source.slice(list, "onTapped:", "Flea.RowDrag").indexOf("tapCount === 2) root.pane.cancelSlowClick()") >= 0, true)
+    check("the list cancels the arm unless a lone tap hits the name, through the shared helper",
+          Source.slice(list, "onTapped:", "Flea.RowDrag").indexOf("Tap.slowTap(root.pane, tap.tapCount === 1 && ") >= 0 && Source.source("ui/js/Tap.js").indexOf("else\n        pane.cancelSlowClick()") >= 0, true)
     check("the grid cancels the arm on a second tap",
           Source.slice(grid, "onTapped:", "Flea.RowDrag").indexOf("tap.tapCount === 2) root.pane.cancelSlowClick()") >= 0, true)
     check("the columns view cancels the arm on a second tap",

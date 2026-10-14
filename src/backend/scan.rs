@@ -8,6 +8,8 @@ use std::time::Instant;
 // Phase 1 stats only typeless entries: d_type is free, see AGENTS.md "Two-phase listing".
 // hidden:false is the shell's own dotfile convention, matched here rather than left to the client.
 pub fn scan(path: &str, hidden: bool) -> Result<(Listing, f64), FleaError> {
+    #[cfg(test)]
+    super::scanhold::held(path, super::scanhold::Stage::Read);
     // The gvfs check first, so a local listing never reads the prefetch environment or the gio name.
     if !super::gvfslist::is_gvfs(std::path::Path::new(path)) {
         return scan_with(path, hidden, None, "gio");
@@ -22,10 +24,21 @@ pub fn scan_with(
     prefetch: Option<crate::gvfsprefetch::Prefetch>,
     gio: &str,
 ) -> Result<(Listing, f64), FleaError> {
+    scan_in(path, hidden, prefetch, gio, &crate::gvfsprefetch::runtime_dir)
+}
+
+// The runtime dir rides in as a getter, read only for a gvfs path, so a test names it too.
+pub(crate) fn scan_in(
+    path: &str,
+    hidden: bool,
+    prefetch: Option<crate::gvfsprefetch::Prefetch>,
+    gio: &str,
+    runtime: &dyn Fn() -> Option<std::path::PathBuf>,
+) -> Result<(Listing, f64), FleaError> {
     // One prefix check: local and USB paths take exactly today's code past it.
     if super::gvfslist::is_gvfs(std::path::Path::new(path)) {
         // The launcher's head start on this exact path; anything else takes today's gio path.
-        if let Some(found) = prefetch.as_ref().and_then(|p| crate::gvfsprefetch::adopt_matching(path, hidden, p)) {
+        if let Some(found) = prefetch.as_ref().and_then(|p| crate::gvfsprefetch::adopt_matching_in(path, hidden, p, runtime().as_deref())) {
             return Ok(found);
         }
         // Any gio failure falls back to readdir unchanged and says nothing to the user.
@@ -46,8 +59,9 @@ const DT_DIR: u8 = 4;
 const DT_LNK: u8 = 10;
 // fstatat flag asking for the link itself, so a symlink never resolves to its target here.
 const AT_SYMLINK_NOFOLLOW: c_int = 0x100;
-// st_mode file-type mask and the two types a typeless entry can resolve to.
-const S_IFMT: u32 = 0o170000;
+// st_mode file-type mask, the two types a typeless entry can resolve to, and the regular file a gvfs row's mode names.
+pub(crate) const S_IFMT: u32 = 0o170000;
+pub(crate) const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
 // st_mode offset inside struct stat: 24 on x86_64, 16 on aarch64; buffer oversized so neither arch overflows.
@@ -165,6 +179,8 @@ fn scan_raw(path: &str, hidden: bool, l: &mut Listing) -> Result<(), FleaError> 
 // directory's own permission string instead of nothing. Zero when the stat failed too, and a real
 // st_mode always carries its file-type bits, so zero can only mean "I could not look".
 pub fn mode_of(path: &str) -> u32 {
+    #[cfg(test)]
+    super::scanhold::held(path, super::scanhold::Stage::Mode);
     match fs::metadata(path) {
         Ok(m) => m.mode(),
         Err(_) => 0,

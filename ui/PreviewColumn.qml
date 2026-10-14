@@ -4,6 +4,7 @@ import "." as Flea
 import "js/Facts.js" as Facts
 import "js/Format.js" as Format
 import "js/Icons.js" as Icons
+import "js/KeyName.js" as KeyName
 import "js/Kinds.js" as Kinds
 import "js/PreviewKeys.js" as PreviewKeys
 import "js/Thumbs.js" as Thumbs
@@ -35,7 +36,7 @@ Item {
     // The row's own absolute path, which the PDF page needs and nothing else here does.
     property string path: ""
     property int pdfControlIndex: -1
-    property real pdfZoom: 1
+    property real pdfZoom: PreviewKeys.PDF_ZOOM_MIN
     readonly property real pdfScrollY: pdfFlick.contentY
     readonly property var pdfFrameItem: frame
     readonly property var pdfToolbarItem: pdfToolbar
@@ -53,7 +54,7 @@ Item {
 
     // A new row is a new subject, so whatever was playing stops being this column's business, and
     // the player it needed is torn down with it.
-    onPathChanged: { root.wantsPlayback = false; root.pdfZoom = 1; root.pdfControlIndex = -1 }
+    onPathChanged: { root.wantsPlayback = false; root.pdfZoom = PreviewKeys.PDF_ZOOM_MIN; root.pdfControlIndex = -1 }
     onActiveFocusChanged: if (root.activeFocus && root.pdfPages > 0 && root.pdfControlIndex < 0)
         PreviewKeys.pdfAction("focusNext", root)
 
@@ -88,11 +89,13 @@ Item {
     // The canvas's frame is 16 by 10, which is the one proportion every state shares.
     readonly property real frameRatio: 10 / 16
     // RenderedPreviews: a Markdown row renders instead of listing its first lines, in a frame
-    // tall from the column top down to the name, with no toggle; the remembered choice decides.
-    readonly property bool isMarkdownRow: root.previewState === Facts.TEXT && root.row !== null
+    // tall from the column top down to the name, with no toggle; it always renders.
+    readonly property bool isMarkdownRow: root.rowState === Facts.TEXT && root.row !== null
         && Kinds.isMarkdown(root.row.n)
     // The Markdown pane stays null without a Markdown row, so every reader guards the loader item.
     readonly property var markdown: markdownLoader.item
+    // The Markdown reader's activation, read by the Loader and its item together so the two cannot drift apart.
+    readonly property bool markdownActive: root.visible && !root.manualHold && root.rowState === Facts.TEXT && root.isMarkdownRow
     // Stretch renders a vector to the whole box, so the frame's pictures keep Fit for an SVG alone.
     readonly property bool vectorPath: /\.svgz?$/i.test(root.path)
     // EXIF orientations 5 to 8 swap the sides, and Qt fits its decode before it turns, so the box it is asked for turns too.
@@ -115,8 +118,10 @@ Item {
     readonly property Item pictureItem: playerLoader.visible && playerLoader.item ? playerLoader.item.contentItem : frameThumb
     readonly property Item linesItem: lines
     readonly property Item archiveItem: archivePane
-    // Ready is the decoded picture on screen; thumbShown is already true while it loads.
-    readonly property alias frameStatus: frameThumb.status
+    // A 3D model's original is never decoded: Qt has no plugin for it, and each attempt logs a warning.
+    readonly property bool originalRefused: Kinds.isModel(root.path)
+    // Ready is the decoded picture (thumbShown is true while it loads); a model with no thumbnail coming reads Error, which ui/js/PreviewSwap.js treats as settled.
+    readonly property int frameStatus: root.originalRefused && root.thumb.length === 0 && root.noThumbComing ? Image.Error : frameThumb.status
     // The two states whose picture is the thumbnail; audio's mark is what that state draws when it works.
     readonly property bool picturesFromThumb: root.previewState === Facts.IMAGE || root.previewState === Facts.VIDEO
 
@@ -136,9 +141,10 @@ Item {
                 ? Math.max(0, root.height - 2 * Theme.spacing.rowPaddingX - nameText.height
                     - factsTable.height - 3 * Theme.spacing.gap)
                 : Math.round(width * root.frameRatio)
-            color: Theme.color.background
+            // The listing's own colour, so on glass the pane's ground under it is the fill; see ui/Glass.qml.
+            color: Glass.on ? "transparent" : Theme.color.background
             border.width: Theme.spacing.hairline
-            border.color: Theme.color.muted
+            border.color: Theme.color.mutedFrame
             // Mirrors hyprland decoration:rounding, the same as every other floating chrome surface.
             radius: Style.cornerRadius
             clip: true
@@ -184,6 +190,7 @@ Item {
                     item.kind = Qt.binding(function () {
                         return root.previewState === Facts.VIDEO ? "video" : "audio"
                     })
+                    item.letterbox = Qt.binding(function () { return Glass.on ? "transparent" : Theme.color.background })
                     // It exists because play was pressed, so it starts.
                     item.autoStart = true
                 }
@@ -204,7 +211,7 @@ Item {
                     height: Theme.stateMarkSize
                     name: root.frameGlyph()
                     // A symlink takes the cyan role the row list already gives it; everything else stays muted.
-                    color: root.previewState === Facts.SYMLINK ? Theme.color.symlink : Theme.color.muted
+                    color: root.previewState === Facts.SYMLINK ? Theme.color.symlink : Theme.color.mutedFrame
                     opacity: 0.7
                 }
 
@@ -245,17 +252,14 @@ Item {
                 id: markdownLoader
                 anchors.fill: parent
                 anchors.margins: Theme.spacing.hairline
-                active: root.visible && !root.manualHold && root.rowState === Facts.TEXT && root.isMarkdownRow
+                active: root.markdownActive
                 visible: root.isMarkdownRow
                 source: "PreviewMarkdown.qml"
                 onLoaded: {
                     item.path = Qt.binding(function () { return root.path })
                     item.size = Qt.binding(function () { return root.row ? root.row.s : 0 })
                     item.maxBytes = Qt.binding(function () { return root.textLimit })
-                    item.active = Qt.binding(function () {
-                        return root.visible && !root.manualHold
-                            && root.rowState === Facts.TEXT && root.isMarkdownRow
-                    })
+                    item.active = Qt.binding(function () { return root.markdownActive })
                     item.truncate = Qt.binding(function () { return root.truncateText })
                     item.compact = true
                 }
@@ -320,7 +324,7 @@ Item {
                     width: Theme.stateMarkSize
                     height: Theme.stateMarkSize
                     name: root.previewState === Facts.ERROR ? "alert" : "file"
-                    color: root.previewState === Facts.ERROR ? Theme.color.error : Theme.color.muted
+                    color: root.previewState === Facts.ERROR ? Theme.color.error : Theme.color.mutedFrame
                 }
 
                 Text {
@@ -372,14 +376,14 @@ Item {
             Flea.ChromeButton {
                 id: pdfZoomOut
                 glyph: "minus"
-                enabled: root.pdfZoom > 1
+                enabled: root.pdfZoom > PreviewKeys.PDF_ZOOM_MIN
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 2
                 onActivated: root.zoomBy(-1)
             }
             Flea.ChromeButton {
                 id: pdfZoomIn
                 glyph: "plus"
-                enabled: root.pdfZoom < 4
+                enabled: root.pdfZoom < PreviewKeys.PDF_ZOOM_MAX
                 keyboardFocused: root.activeFocus && root.pdfControlIndex === 3
                 onActivated: root.zoomBy(1)
             }
@@ -452,7 +456,7 @@ Item {
     // Which page the frame is on, and the turn the chevrons make; both read back over IPC too.
     function pdfPage() { return pdfLoader.item ? pdfLoader.item.page : 0 }
     function turnPage(delta) { if (pdfLoader.item) pdfLoader.item.turn(delta) }
-    function zoomBy(steps) { root.pdfZoom = Math.max(1, Math.min(4, root.pdfZoom + steps * 0.25)) }
+    function zoomBy(steps) { root.pdfZoom = Math.max(PreviewKeys.PDF_ZOOM_MIN, Math.min(PreviewKeys.PDF_ZOOM_MAX, root.pdfZoom + steps * PreviewKeys.PDF_ZOOM_STEP)) }
     function toggleExpand() { root.expandRequested() }
     function scrollPage(delta) {
         pdfFlick.contentY = Math.max(0, Math.min(pdfFlick.contentHeight - pdfFlick.height,
@@ -476,7 +480,7 @@ Item {
     function markdownText() {
         if (!root.isMarkdownRow || !markdown) return ""
         var body = markdown.rawText || ""
-        if (markdown.view === "source") return body
+        if (markdown.shownView === "source") return body
         var out = body.split("\n")
         for (var i = 0; i < out.length; i++) {
             var head = /^#{1,6}\s/.exec(out[i])
@@ -491,10 +495,12 @@ Item {
     function archiveNames() { return root.meta && root.meta.names ? root.meta.names.map(function (e) { return e.n }).join("|") : "" }
     function failureText() { return root.failure }
 
+    // The two whole sentences a multi-selection names its count with, one per count, each filled by Format.fill.
+    readonly property var selectedWords: ({ one: "%1 item selected", many: "%1 items selected" })
     // A multi-selection describes a count, not a file, so it names the count instead of a name.
     function nameText() {
         if (root.previewState === Facts.MULTI)
-            return root.selectionCount + (root.selectionCount === 1 ? " item selected" : " items selected")
+            return Format.fill(root.selectionCount === 1 ? root.selectedWords.one : root.selectedWords.many, root.selectionCount)
         return root.row ? root.row.n : ""
     }
 
@@ -527,7 +533,7 @@ Item {
         if (!root.visible) return ""
         if (root.thumb.length > 0)
             return Format.fileUri(root.thumb)
-        if (!root.manualHold && root.noThumbComing && root.previewState === Facts.IMAGE && root.path.length > 0)
+        if (!root.manualHold && root.noThumbComing && root.previewState === Facts.IMAGE && root.path.length > 0 && !root.originalRefused)
             return Format.fileUri(root.path)
         return ""
     }
@@ -557,7 +563,7 @@ Item {
     // whose mark is simply what it draws, so the line only ever appears when something went wrong.
     function frameNote() {
         if (root.manualHold) {
-            return "Ctrl+Space loads it"
+            return KeyName.hinted("%1 loads it", "loadPreview")
         }
         if (root.wantsThumb && root.thumb.length > 0 && !root.thumbDrawn) {
             return "thumbnail unavailable"

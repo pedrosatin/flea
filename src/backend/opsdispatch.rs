@@ -1,8 +1,8 @@
 // Dispatch for the five write operations: one runs at a time, because the status bar has one sticky slot for it.
-use crate::backend::iomount::{internal_failure, mount_body, mount_key, slow_sentence, slow_write_with, CALL_DEADLINE, SlowWrite};
+use crate::backend::iomount::{internal_failure, mount_body, mount_key, slow_sentence, slow_write_with, CALL_DEADLINE, SlowWrite, SLOW_MKDIR, SLOW_RENAME};
 use crate::backend::ops;
 use crate::backend::opsreq::{
-    duplicated_line, made_line, op_err, renamed_line, run_duplicate_checked, run_transfer_checked, run_trash, trashed_line,
+    duplicated_line, made_line, op_err, renamed_line, run_duplicate_checked, run_transfer_checked, run_trash,
     transferdone_line, transferitem_line, transferprogress_line, transferstarted_line, undone_line, usable_dest,
     LinkOutcome, OpMsg,
 };
@@ -17,6 +17,9 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+// The answer for a menu route whose captured selection is gone or differs from the request; a path outside a held selection gets selected_path's own sentence.
+pub(crate) const SELECTION_CHANGED: &str = "Selected items changed; reopen the menu.";
 
 // A slow remote write still running past its slow line, keyed by the mount it holds.
 pub(crate) struct SlowClaim {
@@ -40,6 +43,8 @@ pub(crate) struct Ops {
     pub live: Arc<super::opscancel::Live>,
     // Slow writes still running past their slow lines; a second write on the same mount waits.
     pub pending: Vec<SlowClaim>,
+    // Trash batches announced but not yet journaled: undo and redo wait on them, every other write runs.
+    pub settling: Vec<(usize, String)>,
     // Detached jobs, so a quit cancels each one; they run alongside by design.
     pub detached: Arc<super::opscancel::DetachedJobs>,
     pub tx: Sender<OpMsg>,
@@ -48,7 +53,7 @@ pub(crate) struct Ops {
 impl Ops {
     pub fn new(tx: Sender<OpMsg>) -> Ops {
         Ops { journal: Journal::new(), permissions: super::permissions::Permissions::default(), picker: None, menuactions: None, trashbrowser: None,
-               transfer_retry: (0, Vec::new()), question: None, asked: 0, next_id: 1, live: Arc::new(super::opscancel::Live::new()), pending: Vec::new(), detached: Arc::new(super::opscancel::DetachedJobs::new()), tx }
+               transfer_retry: (0, Vec::new()), question: None, asked: 0, next_id: 1, live: Arc::new(super::opscancel::Live::new()), pending: Vec::new(), settling: Vec::new(), detached: Arc::new(super::opscancel::DetachedJobs::new()), tx }
     }
 
     // Production shares one undo history across every backend in the session; tests keep new().
@@ -178,7 +183,7 @@ pub(crate) fn cancel_transfer(_out: &mut impl Write, ops: &mut Ops, id: usize) {
 
 // One gate for every write: each resolved source and the destination wait while their mount holds a slow write.
 pub(crate) fn pending_on_any(ops: &Ops, sources: &[PathBuf], dests: &[PathBuf]) -> bool {
-    let body = mount_body();
+    let body = if ops.pending.is_empty() { return false } else { mount_body() };
     sources.iter().chain(dests.iter()).any(|p| pending_on(ops, &body, &p.to_string_lossy()))
 }
 
@@ -198,8 +203,8 @@ pub(crate) fn pending_on(ops: &Ops, body: &str, path: &str) -> bool {
 
 // Undo and redo wait while any slow write is pending, naming its path, so no reversal races the late journal.
 fn pending_busy(out: &mut impl Write, ops: &Ops, where_: &str) -> bool {
-    if let Some(held) = ops.pending.first() {
-        let denied = op_err(where_, &held.path, "an operation is already running");
+    if let Some(path) = ops.pending.first().map(|held| held.path.clone()).or_else(|| super::trashland::settling_path(ops)) {
+        let denied = op_err(where_, &path, "an operation is already running");
         writeln!(out, "{}", error_line(&denied)).ok();
         out.flush().ok();
         return true;
@@ -229,7 +234,7 @@ fn forget_pending(ops: &mut Ops, id: usize) {
 
 pub(crate) fn menu_sources(ops: &Ops, id: usize) -> Result<Option<Vec<super::menu_actions::Selected>>, String> {
     if id == 0 { return Ok(None); }
-    ops.menuactions.as_ref().ok_or_else(|| "Menu selection expired; reopen the menu.".to_string())
+    ops.menuactions.as_ref().ok_or_else(|| super::menu_actions::SELECTION_CHANGED.to_string())
         .and_then(|menu| menu.selection(id)).map(Some)
 }
 
@@ -250,9 +255,9 @@ pub(crate) fn start_trash(out: &mut impl Write, ops: &mut Ops, paths: Vec<String
     if pending_busy_for(out, ops, "trash", &sources, &[]) {
         return;
     }
-    ops.claim_transfer();
+    let (id, _) = ops.claim_transfer();
     let tx = ops.tx.clone();
-    thread::spawn(move || run_trash(paths, tx, selection));
+    thread::spawn(move || run_trash(id, paths, tx, selection));
 }
 
 pub(crate) fn start_duplicate(out: &mut impl Write, ops: &mut Ops, path: &str, menu_id: usize) {
@@ -279,27 +284,30 @@ pub(crate) fn start_duplicate(out: &mut impl Write, ops: &mut Ops, path: &str, m
 }
 
 // Rename answers on the calling thread; rclone directory compatibility may copy before removing its source.
-pub(crate) fn do_menu_rename(out: &mut impl Write, ops: &mut Ops, path: &str, to: &str, id: usize) {
-    let checked = ops.menuactions.as_ref().ok_or_else(|| "Menu selection expired; reopen the menu.".to_string())
+pub(crate) fn do_menu_rename(out: &mut impl Write, ops: &mut Ops, path: &str, to: &str, id: usize) -> Vec<PathBuf> {
+    let checked = ops.menuactions.as_ref().ok_or_else(|| super::menu_actions::SELECTION_CHANGED.to_string())
         .and_then(|menu| menu.selected_path(id, Path::new(path)))
         .and_then(|item| item.current());
     if let Err(error) = checked {
         writeln!(out, "{}", error_line(&op_err("rename", path, &error))).ok();
         out.flush().ok();
-        return;
+        return Vec::new();
     }
-    do_rename(out, ops, path, to);
+    do_rename(out, ops, path, to)
 }
 
 // A local rename answers inline; a remote one past the deadline answers slow first and journals when its worker lands, so the loop never waits on a hung share longer than CALL_DEADLINE.
-pub(crate) fn do_rename(out: &mut impl Write, ops: &mut Ops, path: &str, to: &str) {
-    if ops.live.running().is_some() { busy(out, "rename"); return; }
+pub(crate) fn do_rename(out: &mut impl Write, ops: &mut Ops, path: &str, to: &str) -> Vec<PathBuf> {
+    if ops.live.running().is_some() {
+        busy(out, "rename");
+        return Vec::new();
+    }
     let from = path.to_string();
     let name = to.to_string();
     do_rename_with(out, ops, path, CALL_DEADLINE, move || ops::rename(Path::new(&from), &name))
 }
 // The work is a parameter so tests hold it on a channel while production runs the real rename.
-pub(crate) fn do_rename_with<F>(out: &mut impl Write, ops: &mut Ops, path: &str, deadline: Duration, work: F)
+pub(crate) fn do_rename_with<F>(out: &mut impl Write, ops: &mut Ops, path: &str, deadline: Duration, work: F) -> Vec<PathBuf>
 where
     F: FnOnce() -> Result<(PathBuf, Vec<Step>), FleaError> + Send + 'static,
 {
@@ -308,13 +316,13 @@ where
     let source = PathBuf::from(path);
     let target = key.clone();
     if pending_busy_for(out, ops, "rename", &[source], &[target]) {
-        return;
+        return Vec::new();
     }
     let body = mount_body();
     match slow_write_with(&key, &body, "rename", deadline, work) {
         SlowWrite::Ready(result) => land_rename(out, ops, result),
         SlowWrite::Slow { mount, rx } => {
-            writeln!(out, "{}", slow_line("rename", path, &slow_sentence(&mount, "rename"))).ok();
+            writeln!(out, "{}", slow_line("rename", path, &slow_sentence(&mount, SLOW_RENAME))).ok();
             out.flush().ok();
             // The pending id is only a number: the slot stays with whatever holds it, so a transfer beside this write keeps its id and its cancel.
             let id = ops.claim_id();
@@ -325,11 +333,18 @@ where
                 let result = rx.recv().unwrap_or(Err(failed));
                 let _ = tx.send(OpMsg::RenameDone { id, result });
             });
+            // The slow path lands later through RenameDone, which the session patches on arrival.
+            Vec::new()
         }
     }
 }
 // One journal entry per request, so one undo reverses the in-time answer and the late one alike.
-fn land_rename(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec<Step>), FleaError>) {
+// Answers the landed paths, so a session patches its index; failures touched nothing new.
+fn land_rename(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec<Step>), FleaError>) -> Vec<PathBuf> {
+    let touched = match &result {
+        Ok((_, steps)) => Journal::touched_paths(steps),
+        Err(_) => Vec::new(),
+    };
     match result {
         Ok((dst, steps)) => {
             ops.journal.push(Entry { op: "rename".to_string(), steps });
@@ -340,17 +355,21 @@ fn land_rename(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec
         }
     }
     out.flush().ok();
+    touched
 }
 
 // One mkdir(2), so like rename it answers inline on a local mount and goes slow on a remote one.
-pub(crate) fn do_mkdir(out: &mut impl Write, ops: &mut Ops, parent: &str, name: &str) {
-    if ops.live.running().is_some() { busy(out, "mkdir"); return; }
+pub(crate) fn do_mkdir(out: &mut impl Write, ops: &mut Ops, parent: &str, name: &str) -> Vec<PathBuf> {
+    if ops.live.running().is_some() {
+        busy(out, "mkdir");
+        return Vec::new();
+    }
     let base = parent.to_string();
     let given = name.to_string();
     do_mkdir_with(out, ops, parent, CALL_DEADLINE, move || ops::mkdir(Path::new(&base), &given))
 }
 // The work is a parameter so tests hold it on a channel while production runs the real mkdir.
-pub(crate) fn do_mkdir_with<F>(out: &mut impl Write, ops: &mut Ops, parent: &str, deadline: Duration, work: F)
+pub(crate) fn do_mkdir_with<F>(out: &mut impl Write, ops: &mut Ops, parent: &str, deadline: Duration, work: F) -> Vec<PathBuf>
 where
     F: FnOnce() -> Result<(PathBuf, Vec<Step>), FleaError> + Send + 'static,
 {
@@ -358,13 +377,13 @@ where
     // The new folder lands in its parent, so the parent is the whole gate; writes elsewhere run beside the held write.
     let gate = key.clone();
     if pending_busy_for(out, ops, "mkdir", &[gate], &[]) {
-        return;
+        return Vec::new();
     }
     let body = mount_body();
     match slow_write_with(&key, &body, "mkdir", deadline, work) {
         SlowWrite::Ready(result) => land_mkdir(out, ops, result),
         SlowWrite::Slow { mount, rx } => {
-            writeln!(out, "{}", slow_line("mkdir", parent, &slow_sentence(&mount, "mkdir"))).ok();
+            writeln!(out, "{}", slow_line("mkdir", parent, &slow_sentence(&mount, SLOW_MKDIR))).ok();
             out.flush().ok();
             // The pending id is only a number: the slot stays with whatever holds it, so a transfer beside this write keeps its id and its cancel.
             let id = ops.claim_id();
@@ -375,11 +394,17 @@ where
                 let result = rx.recv().unwrap_or(Err(failed));
                 let _ = tx.send(OpMsg::MkdirDone { id, result });
             });
+            // The slow path lands later through MkdirDone, which the session patches on arrival.
+            Vec::new()
         }
     }
 }
 // One journal entry per request, so one undo reverses the in-time answer and the late one alike.
-fn land_mkdir(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec<Step>), FleaError>) {
+fn land_mkdir(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec<Step>), FleaError>) -> Vec<PathBuf> {
+    let touched = match &result {
+        Ok((_, steps)) => Journal::touched_paths(steps),
+        Err(_) => Vec::new(),
+    };
     match result {
         Ok((dir, steps)) => {
             ops.journal.push(Entry { op: "mkdir".to_string(), steps });
@@ -390,16 +415,25 @@ fn land_mkdir(out: &mut impl Write, ops: &mut Ops, result: Result<(PathBuf, Vec<
         }
     }
     out.flush().ok();
+    touched
 }
 
-pub(crate) fn do_undo(out: &mut impl Write, ops: &mut Ops) {
-    if ops.live.running().is_some() { busy(out, "undo"); return; }
-    if pending_busy(out, ops, "undo") { return; }
+// Answers every path the reversal may have touched, failed or not, so a session patches its index.
+pub(crate) fn do_undo(out: &mut impl Write, ops: &mut Ops) -> super::undo::Reached {
+    if ops.live.running().is_some() {
+        busy(out, "undo");
+        return Default::default();
+    }
+    if pending_busy(out, ops, "undo") {
+        return Default::default();
+    }
     match ops.journal.undo() {
         Ok(op) => writeln!(out, "{}", undone_line(&op, true)).ok(),
         Err(e) => writeln!(out, "{}", error_line(&e)).ok(),
     };
     out.flush().ok();
+    // A failing older step stops after newer steps already reversed, so a failed undo patches too.
+    ops.journal.take_last_touched()
 }
 
 // A link the journal cannot identify is removed at once, so only a named leftover stays.
@@ -564,11 +598,10 @@ pub(crate) fn run_link(op: &str, paths: Vec<String>, dest: PathBuf, policy: supe
                             Err(e) => {
                                 // A failed cleanup leaves the link behind, so its result is reported, never ignored.
                                 if let Err(remove) = remove_made_link(&to) {
-                                    // The link holds their name, so restoring them can only fail and they stay in the trash.
-                                    let stayed = if replaced.is_empty() { String::new() } else { "; the replaced item stays in the trash".to_string() };
+                                    // The link holds their name, so restoring them can only fail and they stay in the Trash.
+                                    let sentence = format!("{}; the link at {} could not be removed: {}", e.msg, to.to_string_lossy(), crate::error::io_message(&remove));
                                     // The sentence lives in note, so a landed batch still reports it.
-                                    let sentence = format!("{}; the link left at {} could not be removed ({}){}",
-                                        e.msg, to.to_string_lossy(), crate::error::io_message(&remove), stayed);
+                                    let sentence = if replaced.is_empty() { sentence } else { super::collide::kept_in_trash(&sentence) };
                                     if note.is_empty() {
                                         note = sentence;
                                     } else {
@@ -711,27 +744,30 @@ pub(crate) fn do_permissions_batch(out: &mut impl Write, ops: &mut Ops, paths: V
     out.flush().ok();
 }
 
-pub(crate) fn do_newfile(out: &mut impl Write, ops: &mut Ops, parent: &str, name: &str, id: usize) {
+pub(crate) fn do_newfile(out: &mut impl Write, ops: &mut Ops, parent: &str, name: &str, id: usize) -> Vec<PathBuf> {
     if ops.live.running().is_some() {
         let request = format!(r#"{{"op":"newFile","id":{}}}"#, id);
         writeln!(out, "{}", super::menu_actions::response(&request, Err("An operation is already running.".into()))).ok();
         out.flush().ok();
-        return;
+        return Vec::new();
     }
     // A parent on a pending mount waits; writes elsewhere run beside the held write.
     if pending_on_any(ops, &[PathBuf::from(parent)], &[]) {
         let request = format!(r#"{{"op":"newFile","id":{}}}"#, id);
         writeln!(out, "{}", super::menu_actions::response(&request, Err("An operation is already running.".into()))).ok();
         out.flush().ok();
-        return;
+        return Vec::new();
     }
-    let result = super::menu_actions::create_file(Path::new(parent), name).map(|(path, identity)| {
+    let created = super::menu_actions::create_file(Path::new(parent), name);
+    let touched = created.as_ref().map(|(path, _)| vec![path.clone()]).unwrap_or_default();
+    let result = created.map(|(path, identity)| {
         ops.journal.push(Entry { op: "newfile".into(), steps: vec![super::undo::Step::MadeFile { path: path.clone(), identity }] });
         format!(r#""path":"{}""#, crate::json::escape(&path.to_string_lossy()))
     });
     let request = format!(r#"{{"op":"newFile","id":{}}}"#, id);
     writeln!(out, "{}", super::menu_actions::response(&request, result)).ok();
     out.flush().ok();
+    touched
 }
 
 pub(crate) fn start_redo(out: &mut impl Write, ops: &mut Ops) {
@@ -752,7 +788,9 @@ pub(crate) fn start_redo(out: &mut impl Write, ops: &mut Ops) {
     let tx = ops.tx.clone();
     thread::spawn(move || {
         let result = journal.redo(id, &cancel, &tx);
-        let _ = tx.send(OpMsg::RedoDone { journal, result });
+        // The worker owns this journal alone, so the take cannot race the loop.
+        let touched = journal.take_last_touched();
+        let _ = tx.send(OpMsg::RedoDone { journal, result, touched });
     });
 }
 
@@ -769,17 +807,21 @@ pub(crate) fn report_op(out: &mut impl Write, ops: &mut Ops, msg: OpMsg) {
         OpMsg::Item { id, index, name, ok, err } => {
             writeln!(out, "{}", transferitem_line(id, index, &name, ok, &err)).ok();
         }
-        OpMsg::TransferDone { id, ok, failed, skipped, cancelled, entry, retry, durable, note } => {
+        OpMsg::TransferDone { id, ok, failed, skipped, cancelled, entry, retry, durable, note, refused } => {
             ops.journal.push(entry);
             ops.live.finished();
             ops.transfer_retry = (id, retry);
-            writeln!(out, "{}", transferdone_line(id, ok, failed, skipped, cancelled, &ops.transfer_retry.1, durable, &note)).ok();
+            writeln!(out, "{}", transferdone_line(id, ok, failed, skipped, cancelled, &ops.transfer_retry.1, durable, &note, &refused)).ok();
         }
-        OpMsg::Trashed { ok, failed, entry, reason } => {
+        done @ OpMsg::MergeDone { .. } => {
+            let line = super::merge::transferdone_merge_line(&done);
+            let OpMsg::MergeDone { id, entry, retry, .. } = done else { return };
             ops.journal.push(entry);
             ops.live.finished();
-            writeln!(out, "{}", trashed_line(ok, failed, &reason)).ok();
+            ops.transfer_retry = (id, retry);
+            writeln!(out, "{}", line).ok();
         }
+        landed @ (OpMsg::TrashAnnounced { .. } | OpMsg::Trashed { .. }) => super::trashland::land(out, ops, landed),
         OpMsg::Linked { ok, failed, skipped, entry, note, first_err, dest } => {
             ops.journal.push(entry);
             ops.live.finished();
@@ -794,6 +836,7 @@ pub(crate) fn report_op(out: &mut impl Write, ops: &mut Ops, msg: OpMsg) {
             }
         }
         OpMsg::Asked { turn, question, line } => if super::collide::landed(ops, turn, question) { writeln!(out, "{}", line).ok(); },
+        OpMsg::Pasted { line, entry } => super::pasteimage::land(out, ops, line, entry),
         // A slow remote write reporting late journals exactly as its in-time path would.
         OpMsg::RenameDone { id, result } => {
             land_rename(out, ops, result);
@@ -802,6 +845,16 @@ pub(crate) fn report_op(out: &mut impl Write, ops: &mut Ops, msg: OpMsg) {
         }
         OpMsg::MkdirDone { id, result } => {
             land_mkdir(out, ops, result);
+            forget_pending(ops, id);
+            ops.live.finished_if(id);
+        }
+        OpMsg::BulkRenameDone { id, result } => {
+            super::bulkrename::land_bulkrename(out, ops, result);
+            forget_pending(ops, id);
+            ops.live.finished_if(id);
+        }
+        OpMsg::SetTagsDone { id, result } => {
+            super::tagsreq::land(out, ops, result);
             forget_pending(ops, id);
             ops.live.finished_if(id);
         }
@@ -820,7 +873,7 @@ pub(crate) fn report_op(out: &mut impl Write, ops: &mut Ops, msg: OpMsg) {
                 writeln!(out, "{}", error_line(&op_err("duplicate", "", &err))).ok();
             }
         }
-        OpMsg::RedoDone { journal, result } => {
+        OpMsg::RedoDone { journal, result, .. } => {
             ops.journal = journal;
             ops.live.finished();
             match result {
@@ -908,7 +961,7 @@ mod tests {
         assert!(matches!(&message, OpMsg::MenuDeleteDone { .. }));
         report_op(&mut buf, &mut o, message);
         assert!(o.live.running().is_none());
-        assert!(text(&buf).contains("expired"));
+        assert!(text(&buf).contains(crate::backend::menu_actions::SELECTION_CHANGED));
     }
 
     #[test]
@@ -934,7 +987,7 @@ mod tests {
         assert_eq!(o.journal.len(), 2);
         buf.clear();
         do_menu_rename(&mut buf, &mut o, &foreign.to_string_lossy(), "wrong", 5);
-        assert!(text(&buf).contains("not in the menu selection"));
+        assert!(text(&buf).contains("That item is no longer selected"));
         d.file("first", "replacement");
         buf.clear();
         do_menu_rename(&mut buf, &mut o, &first.to_string_lossy(), "wrong", 5);
@@ -943,7 +996,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&foreign).unwrap(), "foreign");
         buf.clear();
         do_menu_rename(&mut buf, &mut o, &first.to_string_lossy(), "wrong", 4);
-        assert!(text(&buf).contains("expired"));
+        assert!(text(&buf).contains(crate::backend::menu_actions::SELECTION_CHANGED));
         assert!(!d.join("wrong").exists());
     }
 
@@ -1036,7 +1089,7 @@ mod tests {
         report_op(
             &mut buf,
             &mut o,
-            OpMsg::Trashed { ok: 1, failed: 0, entry: Entry { op: "trash".to_string(), steps: vec![Step::Created { path: "/x".into() }] }, reason: String::new() },
+            OpMsg::Trashed { id: 1, ok: 1, failed: 0, entry: Entry { op: "trash".to_string(), steps: vec![Step::Created { path: "/x".into() }] }, reason: String::new(), announced: false },
         );
         assert!(o.live.running().is_none(), "the cap would otherwise refuse every operation for the rest of the session");
         assert_eq!(o.journal.len(), 1);
@@ -1151,7 +1204,7 @@ mod tests {
         link_reported(&mut buf, &mut o, &rx);
         let line = text(&buf);
         assert!(line.contains(r#""ok":1"#) && line.contains(r#""failed":1"#), "{}", line);
-        assert!(line.contains("a hard link to a directory is refused"), "mixed failure silent: {}", line);
+        assert!(line.contains("a hard link cannot point to a folder"), "mixed failure silent: {}", line);
         assert!(line.contains(&sub.to_string_lossy().into_owned()), "mixed failure unnamed: {}", line);
         assert_eq!(o.journal.len(), 1);
     }
@@ -1167,7 +1220,7 @@ mod tests {
         start_link(&mut buf, &mut o, "hard", vec![src.to_string_lossy().to_string()], &dest.to_string_lossy(), ask);
         link_reported(&mut buf, &mut o, &rx);
         let line = text(&buf);
-        assert!(line.contains("a hard link to a directory is refused"), "{}", line);
+        assert!(line.contains("a hard link cannot point to a folder"), "{}", line);
         assert!(line.contains(r#""where":"link""#), "{}", line);
         assert!(std::fs::symlink_metadata(dest.join("src")).is_err());
         assert!(o.journal.is_empty());
@@ -1190,7 +1243,7 @@ mod tests {
         let line = text(&buf);
         let at = dest.join("a.txt");
         assert!(line.contains(&at.to_string_lossy().into_owned()), "leftover unnamed: {}", line);
-        assert!(line.contains("could not be removed"), "cleanup failure silent: {}", line);
+        assert!(line.contains(&format!("the link at {} could not be removed: ", crate::json::escape(&at.to_string_lossy()))), "cleanup failure silent: {}", line);
         assert!(at.symlink_metadata().is_ok(), "the leftover stays and is reported, never dropped");
         assert!(o.journal.is_empty(), "a link never identified journals nothing");
     }
@@ -1349,7 +1402,7 @@ mod tests {
         std::fs::write(dest.join("a.txt"), "someone else").unwrap();
         let (tx, _rx) = channel();
         let redone = o.journal.redo(1, &AtomicBool::new(false), &tx);
-        assert!(redone.unwrap_err().msg.contains("already exists"));
+        assert_eq!(redone.unwrap_err().msg, "an item with that name is already there, so redo left it in place");
         assert_eq!(std::fs::read_to_string(dest.join("a.txt")).unwrap(), "someone else");
     }
 
@@ -1541,7 +1594,7 @@ mod tests {
         let waited = started.elapsed();
         let line = text(&buf);
         assert!(line.contains(r#""t":"slow""#), "a held rename answers slow, never an error: {}", line);
-        assert!(line.contains("is slow"), "the slow line carries its sentence: {}", line);
+        assert!(line.contains(" is slow. The rename will finish on its own."), "the slow line carries its sentence: {}", line);
         assert!(line.contains(r#""op":"rename""#), "the slow line names its op: {}", line);
         assert!(waited >= crate::backend::iomount::CALL_DEADLINE, "the slow line waits out the deadline: {:?}", waited);
         assert!(waited < crate::backend::iomount::CALL_DEADLINE + SLOW_MARGIN, "the slow line answers at the deadline: {:?}", waited);
@@ -1581,6 +1634,7 @@ mod tests {
         do_mkdir_with(&mut buf, &mut o, &parent, SHORT_DEADLINE, work);
         let line = text(&buf);
         assert!(line.contains(r#""t":"slow""#), "a held mkdir answers slow, never an error: {}", line);
+        assert!(line.contains(" is slow. The new folder will finish on its own."), "the mkdir line is its own sentence: {}", line);
         assert!(line.contains(r#""op":"mkdir""#), "the slow line names its op: {}", line);
         assert!(o.journal.is_empty(), "nothing is journalled until the held write lands");
         drop(release);
@@ -2085,7 +2139,7 @@ mod tests {
         let msg = rx.recv_timeout(LAND_BOUND).expect("the delete answers through the op channel");
         let mut late = out();
         report_op(&mut late, &mut o, msg);
-        assert!(text(&late).contains("expired"), "a delete elsewhere reaches the menu's own expiry: {}", text(&late));
+        assert!(text(&late).contains(crate::backend::menu_actions::SELECTION_CHANGED), "a delete elsewhere reaches the menu's own expiry: {}", text(&late));
         assert!(!text(&late).contains("already running"), "a delete elsewhere is never the gate: {}", text(&late));
         assert!(o.live.running().is_none(), "the expired delete frees the slot it claimed");
         // A compress naming the held mount waits before any tool runs.
@@ -2094,7 +2148,7 @@ mod tests {
         let mut busy = out();
         let formats = std::sync::Arc::new(crate::backend::archive::Formats::from_tools(true, true));
         crate::backend::archivereq::start_archive(&mut busy, &mut o, std::sync::Arc::clone(&formats), "compress",
-            vec![remote_compress.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), remote.join("out.tar"), 0);
+            vec![remote_compress.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), remote.join("out.tar"), 0, String::new(), false);
         assert!(text(&busy).contains("already running"), "a compress on a pending mount waits: {}", text(&busy));
         assert!(!text(&busy).contains("archivestarted"), "the refused compress starts nothing: {}", text(&busy));
         assert_eq!(o.journal.len(), journaled, "the refused compress journals nothing");
@@ -2103,7 +2157,7 @@ mod tests {
         let local_compress = local.file("c.txt", "c");
         let mut started = out();
         crate::backend::archivereq::start_archive(&mut started, &mut o, std::sync::Arc::clone(&formats), "compress",
-            vec![local_compress.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), local.join("out.tar"), 0);
+            vec![local_compress.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), local.join("out.tar"), 0, String::new(), false);
         assert!(text(&started).contains("archivestarted"), "a compress elsewhere starts: {}", text(&started));
         for _ in 0..LAND_ROUNDS {
             let msg = rx.recv_timeout(LAND_BOUND).expect("the compress reports through the op channel");
@@ -2118,7 +2172,7 @@ mod tests {
         let local_divergent = local.file("c2.txt", "c");
         let mut busy = out();
         crate::backend::archivereq::start_archive(&mut busy, &mut o, std::sync::Arc::clone(&formats), "compress",
-            vec![local_divergent.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), local.join("out2.tar"), 5);
+            vec![local_divergent.to_string_lossy().to_string()], "tar".into(), PathBuf::new(), local.join("out2.tar"), 5, String::new(), false);
         assert!(text(&busy).contains("already running"), "a divergent selection on a pending mount waits: {}", text(&busy));
         assert!(!text(&busy).contains("archivestarted"), "the refused compress starts nothing: {}", text(&busy));
         // An extract of the held mount waits before any tool runs.
@@ -2127,7 +2181,7 @@ mod tests {
         let journaled = o.journal.len();
         let mut busy = out();
         crate::backend::archivereq::start_archive(&mut busy, &mut o, std::sync::Arc::clone(&formats), "extract",
-            Vec::new(), "tar".into(), remote_archive.clone(), remote_exdest.clone(), 0);
+            Vec::new(), "tar".into(), remote_archive.clone(), remote_exdest.clone(), 0, String::new(), false);
         assert!(text(&busy).contains("already running"), "an extract on a pending mount waits: {}", text(&busy));
         assert!(!text(&busy).contains("archivestarted"), "the refused extract starts nothing: {}", text(&busy));
         assert_eq!(o.journal.len(), journaled, "the refused extract journals nothing");
@@ -2137,7 +2191,7 @@ mod tests {
         let fresh = local.join("exdest-fresh");
         let mut started = out();
         crate::backend::archivereq::start_archive(&mut started, &mut o, std::sync::Arc::clone(&formats), "extract",
-            Vec::new(), "tar".into(), bogus, fresh, 0);
+            Vec::new(), "tar".into(), bogus, fresh, 0, String::new(), false);
         assert!(text(&started).contains("archivestarted"), "an extract elsewhere starts: {}", text(&started));
         for _ in 0..LAND_ROUNDS {
             let msg = rx.recv_timeout(LAND_BOUND).expect("the extract reports through the op channel");
@@ -2200,5 +2254,20 @@ mod tests {
         assert_eq!(o.journal.len(), journaled + 1, "the late entry lands exactly once");
         assert!(o.live.running().is_none(), "no pending entry survives the late Done");
         assert!(o.pending.is_empty(), "the late Done clears its own pending entry");
+    }
+
+    // An absent menu service holds no selection, so every menu route answers the one sentence.
+    const SELECTION_GONE: &str = "Selected items changed; reopen the menu.";
+
+    #[test]
+    fn a_menu_route_with_no_menu_service_says_the_selection_changed() {
+        let d = TestDir::new("dispatchnomenu");
+        let o = ops();
+        assert_eq!(menu_sources(&o, 5).unwrap_err(), SELECTION_GONE);
+        assert!(menu_sources(&o, 0).unwrap().is_none(), "a request with no menu names no selection");
+        let mut o = ops();
+        let mut buf = out();
+        do_menu_rename(&mut buf, &mut o, &d.file("a.txt", "a").to_string_lossy(), "b.txt", 5);
+        assert!(text(&buf).contains(SELECTION_GONE), "{}", text(&buf));
     }
 }

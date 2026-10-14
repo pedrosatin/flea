@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+// What both archive runners answer when the jail's programs are missing.
+pub(crate) const SANDBOX_MISSING: &str = "the sandbox is unavailable: bubblewrap or prlimit is not installed";
 // A private directory beside the destination, so the rename that follows never crosses a filesystem.
 pub(crate) const WORK_PREFIX: &str = ".flea-work-";
 // A cancel is observed within this; a killed child is reaped on the next round.
@@ -87,7 +89,7 @@ impl Work {
                 Err(e) => return Err(from_io("archive", &dir.to_string_lossy(), &e)),
             }
         }
-        Err(op_err("archive", &last, "no free work directory beside the destination"))
+        Err(op_err("archive", &last, "a temporary folder could not be made beside the destination"))
     }
 
     // A cancel past the drain bound leaves the folder for the operator: the tool may still write.
@@ -123,14 +125,14 @@ fn signal_name(signal: i32) -> Option<&'static str> {
 const BWRAP_SIGNAL_BASE: i32 = 128;
 
 // Issue #211: stderr's last non-blank line diagnoses a bad archive; otherwise the status names the signal.
-fn failure_message(what: &str, status: &ExitStatus, stderr: &str) -> String {
+pub(crate) fn failure_message(what: &str, status: &ExitStatus, stderr: &str) -> String {
     // A blank line is not a diagnosis.
     if let Some(line) = stderr.lines().rev().find(|line| !line.trim().is_empty()) {
         return line.trim().to_string();
     }
     let killed = |signal: i32| match signal_name(signal) {
-        Some(name) => format!("the {} tool was killed by signal {} ({})", what, name, signal),
-        None => format!("the {} tool was killed by signal {}", what, signal),
+        Some(name) => format!("the {} tool stopped before it finished (signal {})", what, name),
+        None => format!("the {} tool stopped before it finished (signal {})", what, signal),
     };
     if let Some(signal) = status.signal() {
         return killed(signal);
@@ -138,9 +140,9 @@ fn failure_message(what: &str, status: &ExitStatus, stderr: &str) -> String {
     match status.code() {
         // 128+n is bwrap's rendering of a signal; an unknown one stays an exit status.
         Some(code) if signal_name(code - BWRAP_SIGNAL_BASE).is_some() => killed(code - BWRAP_SIGNAL_BASE),
-        Some(code) => format!("the {} tool exited with status {}", what, code),
+        Some(code) => format!("the {} tool could not finish (exit status {})", what, code),
         // Unreachable in practice; this function always answers a sentence rather than panicking.
-        None => format!("the {} tool failed", what),
+        None => format!("the {} tool could not finish", what),
     }
 }
 
@@ -155,6 +157,36 @@ fn drain_reader(reader: std::thread::JoinHandle<String>) -> bool {
     }
     reader.join().ok();
     true
+}
+
+// A jailed tool's stderr, read whole on its own thread so a full pipe never stalls the tool.
+pub(crate) fn spawn_stderr_reader(stderr: Option<std::process::ChildStderr>) -> std::thread::JoinHandle<String> {
+    #[cfg(test)]
+    let hold_ms = READER_HOLD_MS.with(|c| c.get());
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = stderr {
+            pipe.read_to_string(&mut text).ok();
+        }
+        #[cfg(test)]
+        if hold_ms > 0 {
+            std::thread::sleep(Duration::from_millis(hold_ms));
+        }
+        text
+    })
+}
+
+// A cancel kills the jail and answers after the last stderr writer's EOF; past the bound the work folder stays.
+pub(crate) fn cancel_failure(what: &str, jailed: &mut crate::backend::jail::Jailed,
+                             reader: std::thread::JoinHandle<String>, work: &mut Work) -> FleaError {
+    crate::backend::jail::kill_tree(jailed);
+    if drain_reader(reader) {
+        return op_err(what, "", "cancelled");
+    }
+    let name = work.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    work.keep();
+    // The sentence names the caller, so a convert timeout says convert and not archive.
+    op_err(what, "", &format!("cancelled; the {what} tool did not exit, so its work folder {name} was left in place"))
 }
 
 // The cancellable runner, watched for a cancel: kill and reap here, so nothing is renamed and stderr is drained.
@@ -182,7 +214,7 @@ fn run_boxed_cancellable_inner(what: &str, inner: Vec<String>, read_only: &Path,
     LAST_CPU.with(|c| c.set(Some(cpu)));
     if !sandbox::available() {
         let tool = inner.first().map_or("", |s| s.as_str());
-        return Err(op_err(what, tool, "the sandbox is unavailable: bwrap or prlimit is not on PATH"));
+        return Err(op_err(what, tool, SANDBOX_MISSING));
     }
     // The cap is the only difference between the convert jail and the archive one.
     let mut full = match cpu {
@@ -201,30 +233,10 @@ fn run_boxed_cancellable_inner(what: &str, inner: Vec<String>, read_only: &Path,
     }
     #[cfg(test)]
     std::thread::sleep(Duration::from_micros(SPAWN_HOLD_US.with(|c| c.get())));
-    let stderr = jailed.child.stderr.take();
-    #[cfg(test)]
-    let hold_ms = READER_HOLD_MS.with(|c| c.get());
-    let reader = std::thread::spawn(move || {
-        let mut text = String::new();
-        if let Some(mut pipe) = stderr {
-            pipe.read_to_string(&mut text).ok();
-        }
-        #[cfg(test)]
-        if hold_ms > 0 {
-            std::thread::sleep(Duration::from_millis(hold_ms));
-        }
-        text
-    });
+    let reader = spawn_stderr_reader(jailed.child.stderr.take());
     loop {
         if cancel.load(Ordering::Relaxed) {
-            crate::backend::jail::kill_tree(&mut jailed);
-            if drain_reader(reader) {
-                return Err(op_err(what, "", "cancelled"));
-            }
-            let name = work.dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            work.keep();
-            // The sentence names the caller, so a convert timeout says convert and not archive.
-            return Err(op_err(what, "", &format!("cancelled; the {what} tool did not exit, so its work folder {name} was left in place")));
+            return Err(cancel_failure(what, &mut jailed, reader, work));
         }
         match jailed.child.try_wait() {
             Ok(Some(status)) => {
@@ -376,3 +388,7 @@ fn archive_produced_count_with_inner(inner: Vec<String>, spec: ListSpec, read_on
 #[cfg(test)]
 #[path = "archivework_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "archivework_text_tests.rs"]
+mod text_tests;

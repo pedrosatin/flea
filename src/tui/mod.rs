@@ -3,21 +3,31 @@ mod batch;
 mod completion;
 mod editor;
 mod empty;
-mod graphics;
+pub(crate) mod graphics;
 mod input;
 mod job;
 mod keymap;
 mod media;
 mod model;
+mod mpv;
 mod mounts;
 mod pdf;
 mod preview;
 mod render;
 mod taildrop;
 mod terminal;
+mod wait;
+mod hold;
+#[cfg(test)]
+#[path = "hold_tests.rs"]
+mod hold_tests;
 // src/gui.rs reads the background hex from here, so the OEM key precedence has one parser.
 pub(crate) mod theme;
+mod warm;
 mod wire;
+#[cfg(test)]
+#[path = "run_tests.rs"]
+mod run_tests;
 
 use std::io;
 use std::path::PathBuf;
@@ -26,39 +36,52 @@ extern "C" {
 }
 
 pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
+    // Before any thread starts: a picture job's thread would otherwise open an arena that keeps a few hundred KB.
+    crate::heap::one_arena();
     let result = (|| -> io::Result<()> {
         // LC_CTYPE makes wcwidth use the terminal's inherited locale without changing numeric formatting.
         unsafe {
             setlocale(0, c"".as_ptr());
         }
-        let store = crate::uistore::Store::user().map_err(io::Error::other)?;
-        store.settle().map_err(io::Error::other)?;
-        let settings = store.read();
         let path = path.map(PathBuf::from).unwrap_or(std::env::current_dir()?);
         let path = if path.is_absolute() {
             path
         } else {
             std::env::current_dir()?.join(path)
         };
-        let mut wire = wire::Wire::start()?;
-        let mut terminal = terminal::Terminal::enter()?;
+        // The gvfs head start, before the state settle: gio runs beside settle, spawn and the UI build.
+        let gvfs = warm::start(&path.to_string_lossy());
+        let store = crate::uistore::Store::user().map_err(io::Error::other)?;
+        store.settle().map_err(io::Error::other)?;
+        let settings = store.read();
+        let mut wire = wire::Wire::start(gvfs.as_ref())?;
         let mut model = model::Model::new(path.clone(), &settings);
         model.store = Some(store);
-        let map = keymap::Map::load();
-        let theme = theme::Theme::load();
-        let mut decoder = input::Decoder::default();
         let mut size = terminal::size();
         model.height = render::body_height(size.1).max(1);
         model.columns = size.0;
         model.restore_path = select.map(PathBuf::from);
+        // The listing goes out before the terminal is entered, so gio runs beside raw mode, keymap and theme.
         model.open(path, &mut wire)?;
+        let mut terminal = terminal::Terminal::enter()?;
+        // Rebound after the terminal so it drops first on every exit: mpv's relay writes before the screen is restored.
+        let mut model = model;
+        let map = keymap::Map::load();
+        model.hints = keymap::Hints::new(&map, &model.preset);
+        let theme = theme::Theme::load();
+        let mut decoder = input::Decoder::default();
         let started = std::time::Instant::now();
         let mut frame = String::new();
         let mut graphics = graphics::Graphics::new();
         let mut thumbnail = PathBuf::new();
         let mut preview_generation = 0;
         let mut menu_tracking = false;
+        // The listing, peek and preview hold below owns painted and start.
+        let mut hold = hold::Hold::new();
+        let mut last_input = std::time::Instant::now();
+        let timeout = wait::input_timeout();
         while !model.quit && !terminal.stopped() {
+            hold.sync(&model, std::time::Instant::now());
             while let Ok(event) = wire.events.try_recv() {
                 match event {
                     Ok(value) => model.receive(value, &mut wire)?,
@@ -68,7 +91,7 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
             let mut launch_errors = Vec::new();
             model.launches.retain_mut(|(name, child)| match child.try_wait() {
                 Ok(Some(status)) => {
-                    if !status.success() { launch_errors.push(format!("{} failed ({})", name, status)); }
+                    if !status.success() { launch_errors.push(format!("{} could not finish ({})", name, status)); }
                     false
                 }
                 Ok(None) => true,
@@ -160,7 +183,9 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
                 })
             {
                 if let Some(player) = model.player.take() {
-                    model.playback = Some((player.path.clone(), player.position, player.paused));
+                    if !player.at_rest() {
+                        model.playback = Some((player.path.clone(), player.position, player.paused));
+                    }
                 }
             }
             if !visible
@@ -182,24 +207,33 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
                         && graphics_ready
                         && model.preview_failed.as_ref() != Some(&path)
                     {
-                        match media::Player::start(
-                            &path,
-                            graphics.protocol,
-                            geometry,
-                            size,
-                            pixel_extent,
-                        ) {
-                            Ok(mut player) => {
-                                if let Some((previous, position, paused)) = &model.playback {
-                                    if previous == &path {
-                                        player.resume = Some((*position, *paused));
-                                    }
+                        let resume = media::resume_for(model.playback.as_ref(), &path);
+                        // A plain terminal shows nothing until play; in kitty with shared memory a video's poster stands in for mpv's paused frame.
+                        let rests = resume.is_none()
+                            && (graphics.protocol == graphics::Protocol::None
+                                || (graphics.protocol == graphics::Protocol::Kitty
+                                    && decoder.kitty_shm
+                                    && kind.contains("video")
+                                    && std::path::Path::new(graphics::POSTER).exists()));
+                        if rests {
+                            model.player = Some(media::Player::resting(&path, graphics.protocol, decoder.kitty_shm, geometry, size, pixel_extent));
+                        } else {
+                            match media::Player::start(
+                                &path,
+                                graphics.protocol,
+                                decoder.kitty_shm,
+                                geometry,
+                                size,
+                                pixel_extent,
+                            ) {
+                                Ok(mut player) => {
+                                    player.resume = resume;
+                                    model.player = Some(player);
                                 }
-                                model.player = Some(player);
-                            }
-                            Err(e) => {
-                                model.fail(format!("Media preview: {}", crate::error::io_message(&e)));
-                                model.preview_failed = Some(path.clone());
+                                Err(e) => {
+                                    model.fail(format!("Media preview: {}", crate::error::io_message(&e)));
+                                    model.preview_failed = Some(path.clone());
+                                }
                             }
                         }
                     }
@@ -257,6 +291,19 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
             if let (Some(path), Some(pixels)) = (&model.image_file, pixels) {
                 graphics.request(path.clone(), geometry.0, geometry.1, pixels);
             }
+            if let Some(player) = &mut model.player {
+                if let Some((w, h, milliseconds)) = model.media_probe {
+                    player.probe(milliseconds);
+                    if let Some(pixels) = pixels.filter(|_| player.at_rest()) {
+                        graphics.request_poster(player.path.clone(), geometry.0, geometry.1, pixels, graphics::poster_side((w, h), pixels));
+                    }
+                }
+                // The poster stays the TUI's own image until mpv's first frame replaces it, or for good if none comes.
+                if !player.at_rest() && !player.handing_off() && graphics.holds(&player.path) {
+                    graphics.release();
+                }
+                player.poster_up = player.at_rest() && graphics.shows(&player.path);
+            }
             if visible && graphics.protocol != graphics::Protocol::None && pixels.is_none() && (is_media || is_pdf || model.image_file.is_some()) && model.preview_failed != current {
                 model.fail("Inline preview unavailable: terminal did not report pixel dimensions".into());
                 model.preview_failed = current.clone();
@@ -293,34 +340,52 @@ pub fn run(path: Option<&str>, select: Option<&str>) -> i32 {
                 let error = std::mem::take(&mut pdf.error);
                 if !error.is_empty() { model.fail(error); }
             }
-            let changed = render::draw(
-                &model,
-                &theme,
-                &map,
-                size.0,
-                size.1,
-                cell_pixels,
-                started.elapsed(),
-                &mut frame,
-            )?;
-            let image = model
-                .pdf
-                .as_ref()
-                .map(|p| p.bytes.as_slice())
-                .unwrap_or(&graphics.bytes);
-            if changed && graphics.protocol == graphics::Protocol::Kitty {
-                print!("\x1b_Ga=d,d=I,i=42,q=2\x1b\\");
-                std::io::Write::flush(&mut std::io::stdout())?;
+            // Keep the previous frame until rows, peek and the first screen's preview body land, at most the slow-source cap.
+            let now = std::time::Instant::now();
+            let held = hold.hold(&model, now, started);
+            model.held = held;
+            if !held {
+                let changed = render::draw(
+                    &model,
+                    &theme,
+                    &map,
+                    size.0,
+                    size.1,
+                    cell_pixels,
+                    started.elapsed(),
+                    &mut frame,
+                )?;
+                let writing = changed && !overlay;
+                let transmit = if writing && model.pdf.is_none() { std::mem::take(&mut graphics.transmit) } else { Vec::new() };
+                let image = model
+                    .pdf
+                    .as_ref()
+                    .map(|p| p.bytes.as_slice())
+                    .unwrap_or(&graphics.bytes);
+                // Lowercase d=i drops the placements and keeps kitty's stored copy, so a redraw never re-sends the picture.
+                if changed && graphics.protocol == graphics::Protocol::Kitty {
+                    print!("\x1b_Ga=d,d=i,i=42,q=2\x1b\\");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                }
+                if writing && !image.is_empty() {
+                    use std::io::Write;
+                    let mut stdout = std::io::stdout().lock();
+                    write!(stdout, "\x1b[s\x1b[{};{}H", geometry.3, geometry.2)?;
+                    graphics::send(&mut stdout, transmit)?;
+                    stdout.write_all(image)?;
+                    write!(stdout, "\x1b[u")?;
+                    stdout.flush()?;
+                }
+                hold.mark_painted();
             }
-            if changed && !image.is_empty() && !overlay {
-                use std::io::Write;
-                print!("\x1b[s\x1b[{};{}H", geometry.3, geometry.2);
-                std::io::stdout().write_all(image)?;
-                print!("\x1b[u");
-                std::io::stdout().flush()?;
+            // A held frame's deadline may cut the input wait short, never lengthen it.
+            let input_wait = wait::poll_wait_ms(decoder.waiting(), last_input.elapsed(), timeout);
+            let bytes = terminal.read(wire.wake_fd(), hold.wait_ms(&model, std::time::Instant::now(), started, input_wait))?;
+            wire.drain_wake();
+            if !bytes.is_empty() {
+                last_input = std::time::Instant::now();
             }
-            let bytes = terminal.read()?;
-            for key in decoder.feed(&bytes, bytes.is_empty()) {
+            for key in decoder.feed(&bytes, wait::escape_due(bytes.is_empty(), last_input.elapsed(), timeout)) {
                 if let Err(e) = actions::key(&mut model, &key, &map, &mut wire) {
                     model.fail(crate::error::io_message(&e));
                 }

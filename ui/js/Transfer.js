@@ -5,11 +5,26 @@
 // The model behind ui/TransferCard.qml, kept out of the QML so every state the card can draw is
 // checked without a window. The object each function takes is ui/js/Ops.js's transfer.
 
+// Whole phrases with "%1" for a value, filled by fill so each translates as one; a leading space is the join to the figure drawn before it.
+var WORDS = {
+    movedWaiting: " moved · waiting for the drive",
+    copiedWaiting: " copied · waiting for the drive",
+    moved: " moved",
+    copied: " copied",
+    writingTo: "Writing to %1",
+    moving: "Moving %1 of %2",
+    copying: "Copying %1 of %2",
+    redoing: "Redoing %3 %1 of %2"
+}
+
 // The byte sample for the item in flight. done is the count already finished, so it stays where it
 // was: a sample fills the item in, it does not complete it.
 function sampled(t, index, name, bytes, total, scanned) {
     // A sample carrying none must not unset the total an earlier one already brought.
     var settled = scanned > 0 ? scanned : (t.scanned || 0)
+    // A sample for an item itemDone already closed carries the bytes paced lines left out, so they join moved and the card stays put.
+    if (index < (t.done || 0))
+        return Object.assign({}, t, {moved: (t.moved || 0) + bytes, scanned: settled})
     return Object.assign({}, t, {index: index, name: name, done: index, bytes: bytes, total: total, scanned: settled})
 }
 
@@ -21,6 +36,14 @@ function itemDone(t, index, name) {
     var sampled = t.index === index ? (t.total > 0 ? t.total : t.bytes) : 0
     return Object.assign({}, t, {index: index, name: name, done: index + 1, bytes: 0, total: 0,
                                  moved: (t.moved || 0) + sampled})
+}
+
+// Sample input: itemsDone(t, [{index: 0, name: "a"}, {index: 1, name: "b"}]) is itemDone(itemDone(t, 0, "a"), 1, "b") in one write.
+function itemsDone(t, held) {
+    var next = t
+    for (var i = 0; i < held.length; i++)
+        next = itemDone(next, held[i].index, held[i].name)
+    return next
 }
 
 // TransferCard rule 2: what the whole transfer has moved, the finished items plus the one in flight.
@@ -35,21 +58,27 @@ function markWriting(t, drive) {
     return Object.assign({}, t, {writing: true, drive: drive || "", name: "", bytes: 0, total: 0})
 }
 
-// Cancel is dimmed while the drive is being flushed, because every file is already complete.
+// A surface that pre-renders its own Cancel state carries noCancel; see ui/js/FlashCard.js.
 function cancelEnabled(t) {
+    if (t.noCancel === true)
+        return false
+    // The flush dims Cancel because every file is already complete, so there is nothing left to stop.
     return t.running === true && t.writing !== true
 }
 
 // TransferCard rule 1's line under the bar, as the pieces it is drawn from: a figure the card inks
 // in the foreground, or the muted words between them.
 function byteParts(t, rate) {
+    // A surface that pre-renders its own line carries byteText; see ui/js/FlashCard.js.
+    if (t.byteText !== undefined)
+        return t.byteText
     // The flush has no percentage because the kernel reports none: the confirmed bytes and the wait.
     if (t.writing === true) {
         var confirmed = movedBytes(t)
         if (confirmed <= 0) {
             return []
         }
-        return [figure(Format.size(confirmed)), word((t.moving ? " moved" : " copied") + " · waiting for the drive")]
+        return [figure(Format.size(confirmed)), word(t.moving ? WORDS.movedWaiting : WORDS.copiedWaiting)]
     }
     var moved = movedBytes(t)
     if (moved <= 0) {
@@ -60,7 +89,7 @@ function byteParts(t, rate) {
     if (total > 0) {
         parts.push(word(" of "), figure(Format.size(total)))
     } else {
-        parts.push(word(t.moving ? " moved" : " copied"))
+        parts.push(word(t.moving ? WORDS.moved : WORDS.copied))
     }
     parts.push(word(" · "), figure(Format.size(rate) + "/s"))
     // Rule 3b: an estimate needs both a total and a rate, and a stall has neither to divide by.
@@ -82,13 +111,16 @@ function word(text) {
 // The card's headline, the count with no name in it: the card gives the name a row of its own, and
 // ui/js/Ops.js builds the status bar's one-line form from this same string.
 function head(t) {
-    // The flush names the drive instead of a count: it has no percentage to state.
+    // A surface that pre-renders its own headline carries headText; see ui/js/FlashCard.js.
+    if (t.headText !== undefined)
+        return t.headText
+    // The flush headline names the drive being waited on, with no percentage, because the kernel reports none.
     if (t.writing === true)
-        return "Writing to " + (t.drive && t.drive.length > 0 ? t.drive : "the drive")
+        return Format.fill(WORDS.writingTo, t.drive && t.drive.length > 0 ? t.drive : "the drive")
     // An extract has no items to count, so it names its verb alone.
     if (t.extract)
         return "Extracting"
-    return (t.redo ? "Redoing " + t.redo + " " : t.moving ? "Moving " : "Copying ") + Format.count(t.index + 1) + " of " + Format.count(t.n)
+    return Format.fill(t.redo ? WORDS.redoing : t.moving ? WORDS.moving : WORDS.copying, Format.count(t.index + 1), Format.count(t.n), t.redo)
 }
 
 // The card's second row: the item in flight and how big it is. total is 0 for a directory, whose
@@ -96,6 +128,9 @@ function head(t) {
 // the running count it does have is the byte line's under the bar, and saying it twice is the thing
 // this canvas exists to stop.
 function fileLine(t) {
+    // A surface that pre-renders its own file line carries fileText; see ui/js/FlashCard.js.
+    if (t.fileText !== undefined)
+        return t.fileText
     // The flush carries no file line: every file is already complete.
     if (t.writing === true) {
         return ""
@@ -115,13 +150,23 @@ function transferTotal(t) {
     return t.n === 1 && t.total > 0 ? t.total : (t.scanned || 0)
 }
 
+// A bar figure held to 0 through 1, where a missing or non-numeric one reads as empty.
+function unit(value) {
+    if (typeof value !== "number" || !(value > 0))
+        return 0
+    return value > 1 ? 1 : value
+}
+
 // The bar fills against the same total the line under it names, so the two always agree; with no
 // total yet it counts finished items plus the one in flight's share, as it always did.
 function fraction(t) {
+    // A surface that pre-renders its own share carries it; see ui/js/FlashCard.js.
+    if (t.share !== undefined)
+        return unit(t.share)
     if (t.n <= 0) {
         return 0
     }
     var total = transferTotal(t)
     var at = total > 0 ? movedBytes(t) / total : (t.done + (t.total > 0 ? t.bytes / t.total : 0)) / t.n
-    return at < 0 ? 0 : (at > 1 ? 1 : at)
+    return unit(at)
 }

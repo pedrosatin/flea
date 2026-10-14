@@ -1,3 +1,4 @@
+.import "../../ui/js/Anchor.js" as Anchor
 .import "../../ui/js/Selection.js" as Selection
 
 // The stub pane both tab suites drive, kept here so neither owns it: tests/js/tabs.js covers the
@@ -24,6 +25,8 @@ function pane(path) {
         filterQuery: "",
         filterTyping: false,
         listInFlight: false,
+        listingState: "ready",
+        stateMessage: "",
         tabs: null,
         total: 20,
         windowSize: 40,
@@ -38,13 +41,38 @@ function pane(path) {
     p.selectedIndices = function () { return p.selection.indices() }
     p.clearSelection = function () { p.selection.clear(); p.selectionVersion++ }
     p.setCursor = function (i) { p.cursorIndex = i }
-    p.message = function (text) { p.said.push(text) }
+    // The standing count notice serial, mirroring ui/StatusBar.qml: say bumps it, withdraw names it, errors stand apart.
+    p.statusBar = {
+        notice: "",
+        noticeSerial: 0,
+        errors: [],
+        say: function (text, isError) {
+            if (!text) {
+                if (this.errors.length > 0) this.errors = this.errors.slice(1)
+                else this.notice = ""
+                return
+            }
+            if (isError) {
+                this.errors.push({ text: text })
+                return
+            }
+            this.notice = text
+            this.noticeSerial += 1
+        },
+        withdraw: function (serial) {
+            if (serial === this.noticeSerial) this.notice = ""
+        }
+    }
+    p.message = function (text, isError) { p.said.push(text); p.statusBar.say(text, isError) }
     // A new listing forgets the selection; without ui/Pane.qml's keepHidden it takes the dotfile answer the tab being left chose.
     p.openWithoutHistory = function (next, options) {
+        Anchor.clearWaiting(p)
         if (!options || options.keepHidden !== true)
             p.showHidden = p.preferenceHidden === true
         p.clearedAtOnce = !!options && options.clearAtOnce === true
+        p.superseded = !!options && options.supersede === true
         p.listed.push(next)
+        p.listingPath = next
         p.path = next
         p.cursorIndex = 0
         p.selection.clear()
@@ -58,7 +86,7 @@ function pane(path) {
         listRequests: 0,
         sort: function (by, desc) { p.sorted.push(by + ":" + desc); this.sortBy = by; this.sortDesc = desc },
         window: function (start, count) { p.windows.push(start + ":" + count) },
-        searchcancel: function () { p.searchRunning = false }
+        searchClose: function () {}
     }
     return p
 }

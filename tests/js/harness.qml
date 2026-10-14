@@ -1,12 +1,19 @@
 import QtQuick
 import "archive.js" as ArchiveSuite
+import "archives.js" as ArchivesSuite
+import "archivecards.js" as ArchiveCardsSuite
 import "background.js" as BackgroundSuite
 import "buttons.js" as ButtonsSuite
+import "cardink.js" as CardInkSuite
+import "bulkrename.js" as BulkRenameSuite
+import "bulksheet.js" as BulkSheetSuite
 import "collide.js" as CollideSuite
+import "collidemerge.js" as CollideMergeSuite
 import "clipmarks.js" as ClipMarksSuite
 import "clipboard.js" as ClipboardSuite
 import "columns.js" as ColumnsSuite
 import "columnskeep.js" as ColumnsKeepSuite
+import "columnsback.js" as ColumnsBackSuite
 import "watchgate.js" as WatchGateSuite
 import "contrast.js" as ContrastSuite
 import "copyas.js" as CopyAsSuite
@@ -16,6 +23,9 @@ import "ddtarget.js" as DdtargetSuite
 import "dirsizes.js" as DirSizesSuite
 import "drag.js" as DragSuite
 import "dragout.js" as DragOutSuite
+import "dropkeys.js" as DropKeysSuite
+import "drops.js" as DropsSuite
+import "dropsflow.js" as DropsFlowSuite
 import "dst.js" as DstSuite
 import "errors.js" as ErrorsSuite
 import "facts.js" as FactsSuite
@@ -23,6 +33,10 @@ import "figureservice.js" as FigureServiceSuite
 import "filter.js" as FilterSuite
 import "filter-cursor.js" as FilterCursorSuite
 import "foldersorts.js" as FolderSortsSuite
+import "flash.js" as FlashSuite
+import "flashpane.js" as FlashPaneSuite
+import "framegap.js" as FramegapSuite
+import "folderviews.js" as FolderViewsSuite
 import "focus.js" as FocusSuite
 import "focus-forward.js" as FocusForwardSuite
 import "focus-grid.js" as FocusGridSuite
@@ -30,11 +44,13 @@ import "gridgeometry.js" as GridGeometrySuite
 import "density.js" as DensitySuite
 import "focus-lines.js" as FocusLinesSuite
 import "focus-wrap.js" as FocusWrapSuite
+import "fill.js" as FillSuite
 import "format.js" as FormatSuite
 import "icons.js" as IconsSuite
 import "jump.js" as JumpSuite
 import "jump-heldout.js" as JumpHeldoutSuite
 import "keymap.js" as KeymapSuite
+import "keyreach.js" as KeyReachSuite
 import "localsend.js" as LocalSendSuite
 import "markdown.js" as MarkdownSuite
 import "mdprepared.js" as MdPreparedSuite
@@ -61,11 +77,15 @@ import "match.js" as MatchSuite
 import "motion.js" as MotionSuite
 import "menu.js" as MenuSuite
 import "xwnewfile.js" as XwNewFileSuite
+import "properties.js" as PropertiesSuite
+import "propertyfacts.js" as PropertyFactsSuite
 import "openwith.js" as OpenWithSuite
 import "devices.js" as DevicesSuite
 import "mounts.js" as MountsSuite
 import "names.js" as NamesSuite
 import "nav.js" as NavSuite
+import "navnewest.js" as NavNewestSuite
+import "cursorreturn.js" as CursorReturnSuite
 import "navmouse.js" as NavMouseSuite
 import "network.js" as NetworkSuite
 import "ops.js" as OpsSuite
@@ -74,11 +94,15 @@ import "palette.js" as PaletteSuite
 import "pathbar.js" as PathBarSuite
 import "phones.js" as PhonesSuite
 import "picker.js" as PickerSuite
+import "pickerpath.js" as PickerPathSuite
 import "previewkeys.js" as PreviewKeysSuite
+import "previewask.js" as PreviewAskSuite
 import "places.js" as PlacesSuite
 import "rail.js" as RailSuite
+import "fsslot.js" as FsSlotSuite
 import "placemenu.js" as PlaceMenuSuite
 import "protocols.js" as ProtocolsSuite
+import "railentries.js" as RailEntriesSuite
 import "railkeys.js" as RailKeysSuite
 import "recent.js" as RecentSuite
 import "recentmode.js" as RecentModeSuite
@@ -86,14 +110,18 @@ import "recentdates.js" as RecentDatesSuite
 import "reclick.js" as ReclickSuite
 import "renderer.js" as RendererSuite
 import "rowcells.js" as RowCellsSuite
+import "runfile.js" as RunFileSuite
 import "scroll.js" as ScrollSuite
+import "scrollanchor.js" as ScrollAnchorSuite
 import "scrolloff.js" as ScrollOffSuite
 import "menuscroll.js" as MenuScrollSuite
 import "search.js" as SearchSuite
+import "searchnoblank.js" as SearchNoBlankSuite
 import "selection.js" as SelectionSuite
 import "reload.js" as ReloadSuite
 import "slowclick.js" as SlowClickSuite
 import "slowop.js" as SlowOpSuite
+import "slowsource.js" as SlowSourceSuite
 import "shiftranges.js" as ShiftRangesSuite
 import "sheetquery.js" as SheetQuerySuite
 import "sheetcandidates.js" as SheetCandidatesSuite
@@ -113,6 +141,8 @@ import "statusfix.js" as StatusFixSuite
 import "permissions.js" as PermissionsSuite
 import "trashdates.js" as TrashDatesSuite
 import "taildrop.js" as TaildropSuite
+import "tags.js" as TagsSuite
+import "tagskeys.js" as TagsKeysSuite
 import "textsize.js" as TextSizeSuite
 import "trash.js" as TrashSuite
 import "tap.js" as TapSuite
@@ -126,6 +156,7 @@ import "shelfmodel.js" as ShelfModelSuite
 import "thumbs.js" as ThumbsSuite
 import "extthumbs.js" as ExtThumbsSuite
 import "uistate.js" as UiStateSuite
+import "unlock.js" as UnlockSuite
 import "update.js" as UpdateSuite
 import "watch.js" as WatchSuite
 import "xwwatch.js" as XwWatchSuite
@@ -149,35 +180,38 @@ Item {
 
         var suites = [
             ["clipboard", ClipboardSuite],
-            ["archive", ArchiveSuite], ["background", BackgroundSuite], ["buttons", ButtonsSuite], ["collide", CollideSuite], ["clipmarks", ClipMarksSuite], ["columns", ColumnsSuite], ["columnskeep", ColumnsKeepSuite], ["watchgate", WatchGateSuite], ["contrast", ContrastSuite],
-            ["dirsizes", DirSizesSuite], ["drag", DragSuite], ["dragout", DragOutSuite], ["dst", DstSuite], ["ddtarget", DdtargetSuite],
+            ["archive", ArchiveSuite], ["archives", ArchivesSuite], ["archivecards", ArchiveCardsSuite], ["background", BackgroundSuite], ["buttons", ButtonsSuite], ["cardink", CardInkSuite], ["bulkrename", BulkRenameSuite], ["bulksheet", BulkSheetSuite], ["collide", CollideSuite], ["collidemerge", CollideMergeSuite], ["clipmarks", ClipMarksSuite], ["columns", ColumnsSuite], ["columnskeep", ColumnsKeepSuite], ["columnsback", ColumnsBackSuite], ["watchgate", WatchGateSuite], ["contrast", ContrastSuite],
+            ["dirsizes", DirSizesSuite], ["drag", DragSuite], ["dragout", DragOutSuite], ["dropkeys", DropKeysSuite], ["drops", DropsSuite], ["dropsflow", DropsFlowSuite], ["dst", DstSuite], ["ddtarget", DdtargetSuite],
             ["copyas", CopyAsSuite], ["invert", InvertSuite],
             ["edmonton", DstSuite],
             ["errors", ErrorsSuite], ["facts", FactsSuite], ["figureservice", FigureServiceSuite], ["filter", FilterSuite], ["filter-cursor", FilterCursorSuite],
             ["focus", FocusSuite], ["focus-grid", FocusGridSuite], ["focus-forward", FocusForwardSuite],
+            ["flash", FlashSuite], ["flashpane", FlashPaneSuite], ["framegap", FramegapSuite],
             ["foldersorts", FolderSortsSuite],
+            ["folderviews", FolderViewsSuite],
             ["gridgeometry", GridGeometrySuite], ["density", DensitySuite],
             ["focus-lines", FocusLinesSuite], ["focus-wrap", FocusWrapSuite],
-            ["format", FormatSuite], ["icons", IconsSuite],
-            ["jump", JumpSuite], ["jump-heldout", JumpHeldoutSuite], ["keymap", KeymapSuite], ["localsend", LocalSendSuite], ["listbudget", ListBudgetSuite], ["match", MatchSuite], ["menu", MenuSuite], ["xwnewfile", XwNewFileSuite],
-            ["marks", MarksSuite], ["markdown", MarkdownSuite], ["mdstructure", MdStructureSuite], ["mdlineends", MdLineEndsSuite], ["mdliteral", MdLiteralSuite], ["mdspecfix", MdSpecFixSuite], ["mddraw", MdDrawSuite], ["mdnest", MdNestSuite], ["mdhtml", MdHtmlSuite], ["mdhtmlgh", MdHtmlGhSuite], ["mdhead", MdHeadSuite], ["mdhtmlrow", MdHtmlRowSuite], ["mdr7", MdR7Suite], ["mdround4", MdRound4Suite], ["mdprogress", MdProgressSuite], ["mdslice", MdSliceSuite], ["markdownpictures", MarkdownPicturesSuite], ["mounts", MountsSuite], ["motion", MotionSuite], ["names", NamesSuite], ["nav", NavSuite], ["crumbs", CrumbsSuite], ["devices", DevicesSuite], ["network", NetworkSuite], ["navmouse", NavMouseSuite], ["mdtable", MdTableSuite],
+            ["fill", FillSuite], ["format", FormatSuite], ["icons", IconsSuite],
+            ["jump", JumpSuite], ["jump-heldout", JumpHeldoutSuite], ["keymap", KeymapSuite], ["keyreach", KeyReachSuite], ["localsend", LocalSendSuite], ["listbudget", ListBudgetSuite], ["match", MatchSuite], ["menu", MenuSuite], ["properties", PropertiesSuite], ["propertyfacts", PropertyFactsSuite], ["xwnewfile", XwNewFileSuite],
+            ["marks", MarksSuite], ["markdown", MarkdownSuite], ["mdstructure", MdStructureSuite], ["mdlineends", MdLineEndsSuite], ["mdliteral", MdLiteralSuite], ["mdspecfix", MdSpecFixSuite], ["mddraw", MdDrawSuite], ["mdnest", MdNestSuite], ["mdhtml", MdHtmlSuite], ["mdhtmlgh", MdHtmlGhSuite], ["mdhead", MdHeadSuite], ["mdhtmlrow", MdHtmlRowSuite], ["mdr7", MdR7Suite], ["mdround4", MdRound4Suite], ["mdprogress", MdProgressSuite], ["mdslice", MdSliceSuite], ["markdownpictures", MarkdownPicturesSuite], ["mounts", MountsSuite], ["motion", MotionSuite], ["names", NamesSuite], ["nav", NavSuite], ["navnewest", NavNewestSuite], ["cursorreturn", CursorReturnSuite], ["crumbs", CrumbsSuite], ["devices", DevicesSuite], ["network", NetworkSuite], ["navmouse", NavMouseSuite], ["mdtable", MdTableSuite],
             ["openwith", OpenWithSuite], ["ops", OpsSuite], ["opstrash", OpsTrashSuite],
-            ["palette", PaletteSuite], ["pathbar", PathBarSuite], ["places", PlacesSuite], ["placemenu", PlaceMenuSuite], ["rail", RailSuite], ["scripts", ScriptsSuite],
+            ["palette", PaletteSuite], ["pathbar", PathBarSuite], ["places", PlacesSuite], ["placemenu", PlaceMenuSuite], ["rail", RailSuite], ["fsslot", FsSlotSuite], ["scripts", ScriptsSuite],
             ["phones", PhonesSuite],
             ["picker", PickerSuite],
-            ["previewkeys", PreviewKeysSuite], ["mdprepared", MdPreparedSuite], ["previewswap", PreviewSwapSuite],
-            ["protocols", ProtocolsSuite], ["railkeys", RailKeysSuite],
+            ["pickerpath", PickerPathSuite],
+            ["previewkeys", PreviewKeysSuite], ["previewask", PreviewAskSuite], ["mdprepared", MdPreparedSuite], ["previewswap", PreviewSwapSuite],
+            ["protocols", ProtocolsSuite], ["railentries", RailEntriesSuite], ["railkeys", RailKeysSuite],
             ["recent", RecentSuite],
             ["recentmode", RecentModeSuite],
             ["recentdates", RecentDatesSuite],
             ["reclick", ReclickSuite],
-            ["renderer", RendererSuite], ["rowcells", RowCellsSuite],
-            ["scroll", ScrollSuite], ["scrolloff", ScrollOffSuite], ["menuscroll", MenuScrollSuite], ["search", SearchSuite],
-            ["selection", SelectionSuite], ["shiftranges", ShiftRangesSuite], ["sheetquery", SheetQuerySuite], ["sheetcandidates", SheetCandidatesSuite], ["reload", ReloadSuite], ["slowclick", SlowClickSuite], ["slowop", SlowOpSuite], ["settings", SettingsSuite], ["settingsmenus", SettingsMenusSuite], ["settingsshelf", SettingsShelfSuite], ["settingsabout", SettingsAboutSuite],
-            ["sort", SortSuite], ["swap", SwapSuite], ["startup", StartupSuite], ["trashdates", TrashDatesSuite], ["permissions", PermissionsSuite], ["status", StatusSuite], ["statusfix", StatusFixSuite], ["taildrop", TaildropSuite], ["textsize", TextSizeSuite],
+            ["renderer", RendererSuite], ["rowcells", RowCellsSuite], ["runfile", RunFileSuite],
+            ["scroll", ScrollSuite], ["scrollanchor", ScrollAnchorSuite], ["scrolloff", ScrollOffSuite], ["menuscroll", MenuScrollSuite], ["search", SearchSuite], ["searchnoblank", SearchNoBlankSuite],
+            ["selection", SelectionSuite], ["shiftranges", ShiftRangesSuite], ["sheetquery", SheetQuerySuite], ["sheetcandidates", SheetCandidatesSuite], ["reload", ReloadSuite], ["slowclick", SlowClickSuite], ["slowop", SlowOpSuite], ["slowsource", SlowSourceSuite], ["settings", SettingsSuite], ["settingsmenus", SettingsMenusSuite], ["settingsshelf", SettingsShelfSuite], ["settingsabout", SettingsAboutSuite],
+            ["sort", SortSuite], ["swap", SwapSuite], ["startup", StartupSuite], ["trashdates", TrashDatesSuite], ["permissions", PermissionsSuite], ["status", StatusSuite], ["statusfix", StatusFixSuite], ["taildrop", TaildropSuite], ["tags", TagsSuite], ["tagskeys", TagsKeysSuite], ["textsize", TextSizeSuite],
             ["trash", TrashSuite], ["tap", TapSuite], ["marquee", MarqueeSuite], ["tabs", TabsSuite], ["tabcatcher", TabCatcherSuite], ["tabs-switch", TabsSwitchSuite], ["tabmove", TabMoveSuite], ["tabrestore", TabRestoreSuite], ["shelfmodel", ShelfModelSuite],
             ["mdgates", MdGatesSuite],
-            ["themes", ThemesSuite], ["thumbs", ThumbsSuite], ["extthumbs", ExtThumbsSuite], ["transfer", TransferSuite], ["uistate", UiStateSuite], ["update", UpdateSuite],
+            ["themes", ThemesSuite], ["thumbs", ThumbsSuite], ["extthumbs", ExtThumbsSuite], ["transfer", TransferSuite], ["uistate", UiStateSuite], ["unlock", UnlockSuite], ["update", UpdateSuite],
             ["watch", WatchSuite], ["xwwatch", XwWatchSuite], ["xwanchor-races", XwAnchorRacesSuite], ["renameview", RenameViewSuite], ["xwrl4", Xwrl4Suite], ["gvfsbridge", GvfsBridgeSuite]
         ]
         var argv = Qt.application.arguments

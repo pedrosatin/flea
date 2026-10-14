@@ -60,8 +60,11 @@ pub struct Deletion {
 pub struct Model {
     pub path: PathBuf,
     pub pending: Option<PathBuf>,
+    // The loop keeps the previous frame, so the rows under the cursor are not drawn yet.
+    pub held: bool,
     pub rows: BTreeMap<usize, Row>,
     pub parents: Vec<Row>,
+    peek_sent: Option<PathBuf>,
     pub total: usize,
     pub cursor: usize,
     pub top: usize,
@@ -117,10 +120,13 @@ pub struct Model {
     pub menu_count: usize,
     pub editor: Option<super::editor::Editor>,
     pub preset: String,
+    pub hints: super::keymap::Hints,
     pub player: Option<super::media::Player>,
     pub pdf: Option<super::pdf::Pdf>,
     pub preview_scroll: usize,
     pub image_file: Option<PathBuf>,
+    // The cursor row's probed width, height and length in ms, once its meta answer lands.
+    pub media_probe: Option<(usize, usize, usize)>,
     pub thumb_index: Option<usize>,
     pub filter: String,
     pub restore_cursor: Option<usize>,
@@ -170,8 +176,10 @@ impl Model {
         Self {
             path: path.clone(),
             pending: None,
+            held: false,
             rows: BTreeMap::new(),
             parents: Vec::new(),
+            peek_sent: None,
             total: 0,
             cursor: 0,
             top: 0,
@@ -249,10 +257,12 @@ impl Model {
                 _ => "default",
             }
             .into(),
+            hints: super::keymap::Hints::default(),
             player: None,
             pdf: None,
             preview_scroll: 0,
             image_file: None,
+            media_probe: None,
             thumb_index: None,
             filter: String::new(),
             restore_cursor: None,
@@ -430,14 +440,14 @@ impl Model {
         self.menu_action.clear();
         self.menu = false;
         self.message.clear();
-        self.fail("Taildrop cancelled; selection changed.".into());
+        self.fail("Taildrop cancelled; selection changed".into());
         true
     }
     pub fn advance_taildrop(&mut self, wire: &mut Wire) -> io::Result<()> {
         if self.menu_action != "taildropRefresh" || self.taildrop.loading() { return Ok(()); }
         let current = self.taildrop_target.as_ref().and_then(|peer| self.taildrop.current_peer(peer));
         if current.is_none() || !self.taildrop.error.is_empty() {
-            let reason = if self.taildrop.error.is_empty() { "Taildrop device is unreachable.".into() }
+            let reason = if self.taildrop.error.is_empty() { "Taildrop device is unreachable".into() }
                 else { self.taildrop.error.clone() };
             self.taildrop_target = None;
             self.menu_action.clear();
@@ -507,6 +517,7 @@ impl Model {
         self.preview.clear();
         self.preview_body.clear();
         self.preview_metadata.clear();
+        self.media_probe = None;
         self.preview_display.clear();
         self.preview_loaded = false;
         self.preview_generation = self.preview_generation.wrapping_add(1);
@@ -553,6 +564,10 @@ impl Model {
         }
         self.window(wire)
     }
+    // True while this listing's parent peek is still unanswered.
+    pub fn peek_out(&self) -> bool {
+        matches!((&self.peek_sent, self.path.parent()), (Some(sent), Some(parent)) if sent.as_path() == parent)
+    }
     pub fn receive(&mut self, value: Json, wire: &mut Wire) -> io::Result<()> {
         match text(&value, "t") {
             "listed" => {
@@ -584,19 +599,23 @@ impl Model {
                         self.sort_anchor = None;
                     }
                 }
-                let parent = self
-                    .path
-                    .parent()
-                    .unwrap_or(&self.path)
-                    .to_string_lossy()
-                    .into_owned();
-                wire.send(vec![
-                    ("c", word("peek")),
-                    ("path", word(&parent)),
-                    ("focus", word(&self.path.file_name().unwrap_or_default().to_string_lossy())),
-                    ("first", number(self.height)),
-                    ("hidden", Json::Bool(self.hidden)),
-                ])?;
+                // No parent column at /: clear it and send no peek, so nothing waits.
+                match self.path.parent().map(PathBuf::from) {
+                    None => {
+                        self.parents.clear();
+                        self.peek_sent = None;
+                    }
+                    Some(parent) => {
+                        wire.send(vec![
+                            ("c", word("peek")),
+                            ("path", word(&parent.to_string_lossy())),
+                            ("focus", word(&self.path.file_name().unwrap_or_default().to_string_lossy())),
+                            ("first", number(self.height)),
+                            ("hidden", Json::Bool(self.hidden)),
+                        ])?;
+                        self.peek_sent = Some(parent);
+                    }
+                }
                 self.window(wire)?;
                 if let Some(path) = self.restore_path.as_ref().filter(|_| !self.searching) {
                     wire.send(vec![
@@ -670,6 +689,7 @@ impl Model {
                     && count(&value, "token") == self.preview_requested
                     && self.current_path().as_ref() == Some(&self.preview_path)
                 {
+                    self.media_probe = Some((count(&value, "w"), count(&value, "h"), count(&value, "ms")));
                     for (label, value) in [
                         (
                             "Dimensions",
@@ -755,6 +775,7 @@ impl Model {
                     .map(|p| p.to_string_lossy() == text(&value, "path"))
                     .unwrap_or(false)
                 {
+                    self.peek_sent = None;
                     self.parents = value
                         .get("rows")
                         .and_then(Json::as_array)
@@ -856,7 +877,7 @@ impl Model {
             }
             "renamed" if self.bulk.is_some() && self.menu_action == "bulkRename" => {
                 let result = if flag(&value, "ok") { self.bulk.as_mut().unwrap().complete(text(&value, "path")) }
-                    else { Err(io::Error::other("Bulk rename stopped: the pending rename failed")) };
+                    else { Err(io::Error::other("Bulk rename stopped: a rename could not finish")) };
                 if let Err(error) = result {
                     self.fail(error.to_string());
                     self.bulk.as_mut().unwrap().cancelled = true;
@@ -938,7 +959,7 @@ impl Model {
             "menuaction" if text(&value, "op") == "delete" && count(&value, "id") == self.action_id => {
                 if !matches!(self.menu_action.as_str(), "deleteRunning" | "deleteCancelling") { return Ok(()); }
                 if flag(&value, "stale") && self.menu_action == "deleteRunning" {
-                    self.say("Selection changed; review the new confirmation".into());
+                    self.say("Selection changed; confirm again".into());
                     self.refresh_deletion(wire)?;
                     return Ok(());
                 }
@@ -983,7 +1004,7 @@ impl Model {
                 } else if (text(&value, "op") == "prepareDelete" && self.menu_action == "deletePrepare")
                     || (text(&value, "op") == "refreshDelete" && self.menu_action == "deleteRefresh") {
                     let token = count(&value, "token");
-                    if token == 0 { return Err(io::Error::other("Delete review returned no confirmation token")); }
+                    if token == 0 { return Err(io::Error::other("Deletion could not be confirmed; try again")); }
                     self.menu_count = count(&value, "count");
                     self.deletion = Some(Deletion { token, count: self.menu_count, bytes: count(&value, "bytes"), destructive: false, scroll: 0 });
                     self.menu_action = "deleteConfirm".into();
@@ -1007,7 +1028,7 @@ impl Model {
                         }
                     } else if action == "open" {
                         if !paths.iter().any(|path| PathBuf::from(path) == self.menu_path) {
-                            self.fail("Open failed: the validated selection omitted the selected path".into());
+                            self.fail("Could not open selected file".into());
                         } else if self.menu_directory {
                             if self.pending.is_some() { self.menu_action = "openWaiting".into(); }
                             else {
@@ -1021,7 +1042,7 @@ impl Model {
                         self.message.clear();
                         if let Some(peer) = self.taildrop_target.take() {
                             if self.menu_count == 0 || paths.len() < self.menu_count {
-                                self.fail("Taildrop: selection is incomplete.".into());
+                                self.fail("Taildrop: selection is incomplete".into());
                             } else {
                                 match self.taildrop.send(&peer, &paths[..self.menu_count]) {
                                     Ok(()) => self.say(format!("Sending to {}", peer.label)),
@@ -1148,7 +1169,7 @@ mod tests {
         assert!(model.taildrop_target.is_none());
         assert!(model.menu_action.is_empty());
         assert!(model.message.is_empty());
-        assert_eq!(model.error, "Taildrop cancelled; selection changed.");
+        assert_eq!(model.error, "Taildrop cancelled; selection changed");
         assert!(!model.cancel_taildrop(), "late invalidation must not create another error");
     }
 

@@ -1,15 +1,18 @@
 .pragma library
 
+.import "Format.js" as Format
+.import "Mounts.js" as Mounts
+
 // The DEVICES half of the rail: one lsblk listing turned into the rows ui/DeviceMounts.qml draws.
 // Split out of ui/js/Mounts.js, which keeps the rail's shared vocabulary and the NETWORK half; a
 // block device and a gvfs share have nothing in common but the rail they land in.
 
 // Sample lsblk --bytes --json row, with the columns ui/DeviceMounts.qml asks for:
-// {"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":["/run/media/gm/128GB"],"rm":true,
+// {"name":"sda1","path":"/dev/sda1","label":"128GB","mountpoints":["/run/media/gm/128GB"],"rm":true,"ro":false,
 //  "tran":null,"size":124656812032,"type":"part","model":null,"fstype":"vfat","parttype":"0xb",
 //  "pttype":"dos","partn":1,"uuid":"A1B2-C3D4"}.
 // Two row kinds come out: one "disk" row for the disk that carries /, then one "volume" row for each
-// volume on every other disk. ui/DeviceMounts.qml turns these into rail entries.
+// volume on every disk. ui/DeviceMounts.qml turns these into rail entries.
 function parseDevices(body, unmounted) {
     var tree
     try {
@@ -25,13 +28,11 @@ function parseDevices(body, unmounted) {
         out.push({ kind: "disk", label: String(system.name), device: devicePath(system), path: "/",
                    mounted: true, removable: false, size: deviceBytes(system.size) })
     for (var i = 0; i < nodes.length; i++) {
-        // The system disk is never walked: /boot and a separate home are the box's own plumbing and
-        // the row above already stands for that disk. Everything else on the box is walked, which is
-        // what puts a second internal drive in the rail (operator, 2026-09-11: only sticks appeared).
-        if (!nodes[i].name || nodes[i] === system || isPseudo(nodes[i].name))
+        // Every disk walks the same way; hidden() hides the system disk's plumbing, and its disk row stands for the leaf holding /.
+        if (!nodes[i].name || isPseudo(nodes[i].name))
             continue
         // No transport to inherit at the top: the disk answers for itself inside the walk.
-        collectVolumes([nodes[i]], "", false, out, unmounted === true)
+        collectVolumes([nodes[i]], "", false, out, unmounted === true, unpluggable(nodes[i]))
     }
     return dedupeVolumes(out)
 }
@@ -72,7 +73,7 @@ function holdsRoot(node) {
 // RailAdditions rule 1 adds the third case behind its own switch: a volume nothing has mounted, with
 // a filesystem to browse. With the switch off this is the 0.2.1 rule exactly, which kept a spare EFI
 // or recovery partition out of the rail.
-function collectVolumes(nodes, model, unplugs, out, unmounted) {
+function collectVolumes(nodes, model, unplugs, out, unmounted, removableDisk, holder) {
     for (var i = 0; i < nodes.length; i++) {
         var n = nodes[i]
         var kids = n.children || []
@@ -82,11 +83,11 @@ function collectVolumes(nodes, model, unplugs, out, unmounted) {
         // mariobgsp (PR 74), whose USB drive reports tran=usb on sdb and null on sdb1. It stops
         // there: what a crypt leaf under it reads as is what it read as before that PR.
         var pulls = unpluggable(n) || (unplugs && String(n.type || "") === "part")
-        // The hide rule runs in every branch: a removable ESP, swap or member is no row on any setting.
-        if (n.name && kids.length === 0 && !hidden(n)
-                && (pulls || mountOf(n).length > 0 || (unmounted && browsable(n))))
-            out.push(volumeRow(n, own, pulls, unmounted))
-        collectVolumes(kids, own, pulls, out, unmounted)
+        // No row on any setting for a hidden leaf (ESP, swap, member) or for the leaf holding /, which its disk row stands for.
+        if (n.name && kids.length === 0 && !hidden(n) && !holdsRoot(n)
+                && (pulls || mountOf(n).length > 0 || (unmounted && browsable(n)) || isLockedNode(n)))
+            out.push(volumeRow(n, own, pulls, removableDisk === true, holder))
+        collectVolumes(kids, own, pulls, out, unmounted, removableDisk === true || unpluggable(n), containerName(n))
     }
 }
 
@@ -151,7 +152,7 @@ function isIsohybridKeep(n) {
     var num = parseInt(String(n.parttype || ""), 16)
     if (!(num === 0x0 || num === 0x17))
         return false
-    var partn = String(n.partn == null ? "" : n.partn)
+    var partn = String(n.partn === null || n.partn === undefined ? "" : n.partn)
     if (!(partn === "1" || partn === "2"))
         return false
     var fs = String(n.fstype || "").toLowerCase()
@@ -238,10 +239,19 @@ function dedupeVolumes(rows) {
     return head
 }
 
-// RailAdditions rule 1 gate: a real filesystem to browse, for old lsblk bodies without PARTTYPE.
+// Sample input: {"name":"sdb1","mountpoints":[null],"type":"part","fstype":"crypto_LUKS","fsver":"2"}, a locked leaf.
+function isLockedNode(n) {
+    if (!n || (n.children || []).length > 0)
+        return false
+    if (mountOf(n).length > 0)
+        return false
+    return String(n.fstype || "").toLowerCase().indexOf("crypto_") === 0
+}
+
+// RailAdditions rule 1 gate (old lsblk without PARTTYPE): empty-fs and swap die in hidden() ahead; only crypto and efi decide here.
 function browsable(n) {
     var fs = String(n.fstype || "").toLowerCase()
-    if (fs.length === 0 || fs === "swap" || fs.indexOf("crypto_") === 0)
+    if (fs.indexOf("crypto_") === 0)
         return false
     return String(n.parttypename || "").toLowerCase().indexOf("efi") < 0
 }
@@ -317,16 +327,24 @@ function mountError(op, exitCode, stderr, label) {
     if (/already mounted/.test(text))
         return ""
     if (/busy|in use|in use by/.test(text))
-        return name + " is busy; close what is using it and try again."
+        return Format.fill(Mounts.WORDS.busy, name)
     if (/not authorized|not allowed|refused|dismissed|no authentication|auth/i.test(String(stderr || "")))
-        return name + " was not " + (op === "unmount" ? "unmounted" : op === "eject" ? "ejected" : "mounted") + ": not authorized."
+        return Format.fill(op === "unmount" ? Mounts.WORDS.unmountRefused : op === "eject" ? Mounts.WORDS.ejectRefused : Mounts.WORDS.mountRefused, name)
     if (/no volume|no medium|no media|empty|no device/.test(text))
-        return /medium|media|empty/.test(text) ? name + " has no medium in it." : name + " is not a volume this system can mount."
+        return Format.fill(/medium|media|empty/.test(text) ? Mounts.WORDS.noDisc : Mounts.WORDS.notMountable, name)
+    if (op === "mount" && /wrong fs type|bad superblock|unknown filesystem type|can.t read superblock|structure needs cleaning/.test(text))
+        return Format.fill(Mounts.WORDS.damaged, name)
     if (op === "unmount")
-        return name + " could not be unmounted."
+        return Format.fill(Mounts.WORDS.unmountFailed, name)
     if (op === "eject")
-        return name + " could not be ejected."
-    return name + " could not be mounted."
+        return Format.fill(Mounts.WORDS.ejectFailed, name)
+    return Format.fill(Mounts.WORDS.mountFailed, name)
+}
+
+// gio's own reason as the status bar's detail line; sample "Error mounting /dev/sdb1 at /run/media/u/DATA #2: wrong fs type" and "Error unmounting /dev/sdb1: target is busy" give "wrong fs type" and "target is busy", "gio: file:///x: Error ejecting /dev/sdb: busy" gives "busy" (gio's file-URI lead), "" gives "".
+function mountDetail(stderr) {
+    var lines = String(stderr || "").split("\n").map(function (line) { return line.trim() }).filter(function (line) { return line.length > 0 })
+    return lines.join(" ").replace(/^gio:\s*/, "").replace(/^[a-z][a-z0-9+.-]*:\/\/\S*:\s+/i, "").replace(/^Error (?:mounting|unmounting|ejecting) \S+(?: at .*?)?:\s+/, "").trim()
 }
 
 // Sample: ["/home", "/var/log", "/"] for one btrfs device with several subvolumes mounted, ["[SWAP]"]
@@ -348,15 +366,22 @@ function devicePath(node) {
     return node.path ? String(node.path) : "/dev/" + String(node.name)
 }
 
-// The label ladder is the filesystem label, then the drive's product name, then the kernel name.
-// volumeMenu says the row was built under RailAdditions rule 1, which is what gives it the Mount,
-// Open and Unmount rows; without the switch the row carries the menu it carried in 0.2.1.
-function volumeRow(n, model, unplugs, unmounted) {
+// Sample input: {"name":"sdb1","label":"Backup","fstype":"crypto_LUKS"}, a container its owner named; "" for any other node.
+function containerName(n) {
+    return String(n.fstype || "").toLowerCase().indexOf("crypto_") === 0 && n.label ? String(n.label) : ""
+}
+
+// Labelled by the filesystem label, then the drive's product name, then the kernel name; a crypt keeps its named container's.
+function volumeRow(n, model, unplugs, removableDisk, holder) {
     var path = mountOf(n)
-    var label = n.label ? String(n.label) : (model.length > 0 ? model : String(n.name))
+    var named = String(n.type || "") === "crypt" ? String(holder || "") : ""
+    var label = named.length > 0 ? named : n.label ? String(n.label) : (model.length > 0 ? model : String(n.name))
     var fs = String(n.fstype || "").toLowerCase()
+    // A crypt leaf on a removable drive releases like the stick it sits on; an internal one never does.
+    var removable = unplugs === true || (String(n.type || "") === "crypt" && removableDisk === true)
     return { kind: "volume", label: label, device: devicePath(n), path: path, mounted: path.length > 0,
-             removable: unplugs === true, mediaRemovable: n.rm === true, size: deviceBytes(n.size), volumeMenu: unmounted === true,
+             removable: removable, mediaRemovable: n.rm === true, readOnly: n.ro === true, size: deviceBytes(n.size),
+             locked: isLockedNode(n), fstype: String(n.fstype || ""), fsver: String(n.fsver || ""),
              uuid: fs === "btrfs" && n.uuid ? String(n.uuid) : "" }
 }
 

@@ -2,26 +2,34 @@ mod backend;
 mod chooser;
 mod clip;
 mod defaults;
+mod desktopid;
 mod error;
 mod gui;
 mod heap;
 mod hyprkeys;
+mod icdexclude;
 mod json;
 mod jsondoc;
+mod jsonmembers;
 mod jsonstring;
 mod launcher;
 mod oflags;
 mod open;
 mod paths;
 mod prefetch;
+mod procsignal;
 mod qsregistry;
 mod tearoff;
+mod runfile;
+mod runid;
 mod terminal;
 mod tui;
 mod thp;
+mod unlock;
 mod uischema;
 mod uimigrate;
 mod uistate;
+mod uistatecli;
 mod favourites;
 mod figurebuild;
 mod figurecache;
@@ -42,6 +50,7 @@ mod summon;
 mod uistore;
 mod update;
 mod userfile;
+mod vkprobecache;
 mod vulkan;
 
 use crate::backend::proto::error_line;
@@ -58,9 +67,9 @@ fn claim_both() -> i32 {
     }
     // A source build has no flea.portal to prefer, which is the picker's precondition, not a failure here.
     let status = if chooser::backend_installed() {
-        chooser::claim()
+        chooser::claim("flea --default")
     } else {
-        eprintln!("flea: no portal backend is installed, so the file chooser step was skipped");
+        eprintln!("flea: no file chooser service is installed, so Flea could not become the file chooser");
         0
     };
     // The one undo line this invocation ends on: --default off releases both halves it just claimed.
@@ -71,7 +80,7 @@ fn claim_both() -> i32 {
 // flea --picker on its own, so it owns the undo line --default must not print for it.
 fn claim_picker() -> i32 {
     let installed = chooser::backend_installed();
-    let status = chooser::claim();
+    let status = chooser::claim("flea --picker");
     if installed {
         println!("undo both with: flea --picker off");
     }
@@ -84,14 +93,19 @@ fn release_both() -> i32 {
     handler.max(picker)
 }
 
-fn usage(message: &str) -> ! {
+pub(crate) fn usage(message: &str) -> ! {
     eprintln!("flea: {}", message);
     eprintln!("usage: flea [--tui|--gui] [--select <uri|path>] [path]");
     eprintln!("       flea --default [off]");
     eprintln!("       flea --picker [off]");
     eprintln!("       flea --ui-state [<json patch>]");
     eprintln!("       flea --update [check]");
+    eprintln!("       flea --run <path> <dev> <ino> <size> <mtime_s> <mtime_ns>");
+    eprintln!("       flea --run-terminal <path> <dev> <ino> <size> <mtime_s> <mtime_ns>");
+    eprintln!("       flea --open-text <path>");
+    eprintln!("       flea --open-handler <path> <desktop id> <dev> <ino> <size> <mtime_s> <mtime_ns>");
     eprintln!("       flea --clip get|set copy|cut|clear TOKEN");
+    eprintln!("       flea flash choose [start]");
     eprintln!("       flea --version");
     exit(2)
 }
@@ -107,52 +121,14 @@ fn select_target(raw: &str) -> Option<(PathBuf, PathBuf)> {
     Some((parent, path))
 }
 
-// flea --ui-state, the one path both front ends reach the state file through: no argument reads it,
-// one JSON object merges that patch through the lock. Either way the resulting document is printed.
-fn ui_state(args: &[String]) -> i32 {
-    let store = match uistore::Store::user() {
-        Ok(store) => store,
-        Err(e) => {
-            eprintln!("flea: {}", e);
-            return 2;
-        }
-    };
-    if args.len() > 3 {
-        usage("--ui-state takes nothing, or one JSON object");
-    }
-    let before = store.read();
-    let was = shelf_enabled(&before);
-    let state = match args.get(2) {
-        None => before,
-        Some(patch) => {
-            let merged = jsondoc::parse(patch)
-                .map_err(|e| format!("the ui.json patch is not JSON ({})", e))
-                .and_then(|p| store.update(&p));
-            match merged {
-                Ok(next) => next,
-                Err(e) => {
-                    eprintln!("flea: {}", e);
-                    return 2;
-                }
-            }
-        }
-    };
-    // B1: the Settings switch is the only thing that installs the shelf plugin, and every front end
-    // reaches it through this one path, so the bar follows the switch without a second act.
-    let now = shelf_enabled(&state);
-    if now != was {
-        if let Err(e) = shelfplugin::sync(now) {
-            eprintln!("flea: the shelf plugin was not {} ({})", if now { "enabled" } else { "disabled" }, e);
-        }
-    }
-    print!("{}", jsondoc::render(&state));
-    0
+// Only a flash picker invocation takes the verb: a bare flash is a path like any other, so a folder named flash still opens.
+pub(crate) fn flash_picker(args: &[String]) -> bool {
+    args.get(1).map(String::as_str) == Some("flash") && args.get(2).map(String::as_str) == Some("choose")
 }
 
-// Directive 38: the shelf ships off, so anything but a stored true is off.
-fn shelf_enabled(state: &jsondoc::Json) -> bool {
-    state.get("shelf").and_then(|s| s.get("enabled")).and_then(|v| v.as_bool()) == Some(true)
-}
+#[cfg(test)]
+#[path = "copysrc_tests.rs"]
+mod copysrc_tests;
 
 fn main() {
     // args() panics on a non-UTF-8 argument and a Linux filename is any bytes, so refuse instead.
@@ -211,9 +187,9 @@ fn main() {
         usage("--prewarm takes a path, a first index and a destination");
     }
 
-    // flea --open <path>
+    // flea --open <path>: the window's entrance, which asks the run card; in-process callers use open::open.
     if args.len() == 3 && args[1] == "--open" {
-        exit(open::open(&args[2]));
+        exit(open::open_ask(&args[2]));
     }
     if args.get(1).map(String::as_str) == Some("--open") {
         usage("--open takes one path");
@@ -225,6 +201,16 @@ fn main() {
     }
     if args.get(1).map(String::as_str) == Some("--terminal") {
         usage("--terminal takes one directory");
+    }
+
+    // flea --unlock <device>: the encrypted-drive dialog, see src/unlock.rs.
+    if let Some(code) = unlock::dispatch(&args) {
+        exit(code);
+    }
+
+    // flea --run, --run-terminal, --open-text and --open-handler: the run card's own launches; see src/runfile.rs.
+    if let Some(code) = runfile::dispatch(&args) {
+        exit(code);
     }
 
     // flea --update [check]: ask the installing source for a newer Flea, or open Omarchy's updater; see src/update.rs.
@@ -300,18 +286,16 @@ fn main() {
 
     // flea --ui-state [<json patch>]: the shared ui.json read and update path, see AGENTS.md "The state file".
     if args.get(1).map(String::as_str) == Some("--ui-state") {
-        exit(ui_state(&args));
+        exit(uistatecli::ui_state(&args));
     }
 
-    if args.get(1).map(String::as_str) == Some("--favourites") {
-        exit(favourites::command(&args));
+    // Verbs that parse their own arguments: shelf <verb> serves the shelf plugin, flash choose [start] the flasher's picker.
+    match args.get(1).map(String::as_str) {
+        Some("--favourites") => exit(favourites::command(&args)),
+        Some("shelf") => exit(shelfcli::command(&args)),
+        Some("flash") if flash_picker(&args) => exit(shelfplaces::flash_command(&args)),
+        _ => {}
     }
-
-    // flea shelf <verb>: the drop shelf's own state, minted for a plugin that is another process.
-    if args.get(1).map(String::as_str) == Some("shelf") {
-        exit(shelfcli::command(&args));
-    }
-
     let mut want_tui = false;
     let mut want_gui = false;
     let mut print_target = false;
@@ -336,8 +320,11 @@ fn main() {
         i += 1;
     }
     if want_tui && want_gui {
-        usage("--tui and --gui are mutually exclusive");
+        usage("--tui and --gui cannot be used together");
     }
+    // A relative start or reveal is resolved here, because the window has no launch directory to read it against.
+    let start = start.map(|s| paths::commandline_path(&s));
+    let select_raw = select_raw.map(|s| paths::commandline_path(&s));
 
     // Test-only: prints the resolved (parent, target) pair and exits, so a reveal is testable without a window.
     if print_target {
@@ -381,7 +368,7 @@ fn main() {
             // An upgrade ships a new plugin under a switch that is already on, and the copy in the
             // user's own plugin directory is the one the bar reads.
             if let Ok(store) = uistore::Store::user() {
-                if let Err(e) = shelfplugin::refresh(shelf_enabled(&store.read())) {
+                if let Err(e) = shelfplugin::refresh(uistatecli::shelf_enabled(&store.read())) {
                     eprintln!("flea: the shelf plugin was not refreshed ({})", e);
                 }
             }
@@ -391,5 +378,18 @@ fn main() {
             eprintln!("{}", paths::missing_ui_message());
             exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_named_flash_still_opens() {
+        let bare = ["flea".to_string(), "flash".to_string()];
+        assert!(!flash_picker(&bare), "a bare flash is a path, not the picker");
+        let picker = ["flea".to_string(), "flash".to_string(), "choose".to_string()];
+        assert!(flash_picker(&picker), "flash choose runs the picker");
     }
 }

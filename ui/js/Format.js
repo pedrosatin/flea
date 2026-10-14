@@ -1,6 +1,6 @@
 .pragma library
 
-// SI, because a file's size on disk has no power-of-two basis; GLib's own rule and the whole GUI bracket.
+// SI, because a file's size on disk has no power-of-two basis; GLib's own rule and the whole GUI group.
 var BYTES_PER_UNIT = 1000
 var UNITS = ["B", "kB", "MB", "GB", "TB"]
 // GNOME renders a narrow no-break space before the unit, and Flea's neighbours are GLib-formatted.
@@ -30,6 +30,12 @@ function size(bytes) {
         unit += 1
     }
     return value.toFixed(1) + UNIT_SPACE + UNITS[unit]
+}
+
+// Fills %1 to %9 in one pass: a value prints as given, a dollar sign or placeholder in it included; an unfilled one stays.
+function fill(template) {
+    var values = arguments
+    return String(template).replace(/%([1-9])/g, function (token, at) { return at < values.length ? String(values[at]) : token })
 }
 
 function pad(n) {
@@ -71,6 +77,7 @@ function permissions(mode) {
 // The file type lives in the top four bits of st_mode, as S_IFMT masks it.
 var S_IFMT = 0o170000
 var S_IFREG = 0o100000
+var S_IFDIR = 0o040000
 // The owner execute bit, the one Make executable adds.
 var S_IXUSR = 0o100
 var S_IFLNK = 0o120000

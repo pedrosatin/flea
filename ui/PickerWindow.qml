@@ -90,10 +90,8 @@ ShellRoot {
 
         // Where Back goes, and it only ever goes back: Parent is its own button and pushes here too.
         property var history: []
-        // The save mode's own name, which starts as the caller's suggestion only when that
-        // suggestion is a filename: tools/flea-portal passes current_name through verbatim, so a
-        // separator in it would put a path outside this folder in the field before anyone typed.
-        property string saveName: Picker.validName(win.req.name) ? win.req.name : ""
+        // The save mode's own name. It starts empty and Component.onCompleted seeds it from the caller's name.
+        property string saveName: ""
         onSaveNameChanged: win.invalidateSave()
         property int nextCheck: 0
         property int markRequest: 0
@@ -135,6 +133,8 @@ ShellRoot {
 
         // Exactly one answer leaves this window, whichever way it is asked for.
         property bool answered: false
+        // The typed-path probe: the mark that has the backend refuse a typed file in a save or folder dialog.
+        property int pathProbe: 0
 
         function rowFor(index) {
             var at = index - win.held
@@ -183,15 +183,19 @@ ShellRoot {
             win.storageKnown = false
         }
 
-        // Sort reorders the worker's filtered listing without re-reading the folder, so marks and save review stay; never written to ui.json.
+        // Sort reorders the worker's listing, marks stay; remembers folder sort and default sort in ui.json.
         function requestSort(order) {
             if (!order || !win.sortable || (backend.sortBy === order.key && backend.sortDesc === order.desc))
                 return
             backend.sortBy = order.key
             backend.sortDesc = order.desc
+            // A user sort writes its folder only while remembering is on; the default follows every sort.
+            if (!win.recent && win.path.length > 0 && ViewState.state.rememberSort !== false)
+                backend.rememberFolderSort(win.path, order.key, order.desc)
+            ViewState.changeLeaf("sort", { key: order.key === "mtime" ? "date" : order.key, reverse: order.desc })
             win.clearListing()
             win.pendingListings = 1
-            listing.sort(order.key, order.desc, ViewState.state.foldersFirst !== false, ViewState.state.groupByKind === true)
+            listing.sort(order.key, order.desc, ViewState.state.foldersFirst !== false, ViewState.state.groupByKind === true, ViewState.state.hiddenLast === true)
             // sort answers a listed line and no rows of its own, so the reordered window is asked for.
             listing.window(0, win.windowSize)
             win.focusView()
@@ -329,6 +333,9 @@ ShellRoot {
             win.finish(Picker.RESPONSE_CANCELLED, [])
         }
 
+        // ":" and Ctrl+L are the main window's own pathBar rows; keys.toml is not edited.
+        function openPathBar() { chrome.startEdit() }
+
         // The portal reads this reply after exit, so its atomic write must finish before teardown.
         function finish(response, list) {
             if (win.answered)
@@ -437,8 +444,8 @@ ShellRoot {
                     win.acceptMarks = false
                     win.marksDirty = false
                     win.saveReview = ({})
-                    win.saveError = msg
-                    win.say(msg + "; cancel and reopen this request.", true)
+                    win.saveError = "Flea stopped responding."
+                    win.say("Flea stopped responding. Cancel and reopen this request.", true)
                     win.stepFocus(null, false)
                     return
                 }
@@ -456,7 +463,7 @@ ShellRoot {
             }
             onPickerResult: function (message) {
                 if (win.answered || win.backendUnavailable) return
-                if (message.id === win.markRequest) {
+                if (message.id === win.markRequest || message.id === win.pathProbe) {
                     selection.received(message)
                 } else if (message.id === win.saveRequest) {
                     win.saveRequest = 0
@@ -502,6 +509,8 @@ ShellRoot {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 picker: win
+                listing: listing
+                backend: backend
                 onCancelRequested: win.cancel()
                 onAcceptRequested: win.accept()
                 onBackRequested: { win.focusView(); win.goBack() }
@@ -521,8 +530,8 @@ ShellRoot {
                 edge: win.edge
                 offerRecent: !win.saving
                 onChosen: function (path) { win.open(path); win.focusView() }
-                onNetworkCompleted: function(requestId, uri, success, reason) {
-                    if (networkDialog.item) networkDialog.item.mountFinished(requestId, uri, success, reason)
+                onNetworkCompleted: function(requestId, uri, success, reason, connectFailed) {
+                    if (networkDialog.item) networkDialog.item.mountFinished(requestId, uri, success, reason, connectFailed)
                 }
             }
 
@@ -654,7 +663,7 @@ ShellRoot {
                     anchors.rightMargin: Theme.spacing.gap
                     anchors.verticalCenter: parent.verticalCenter
                     text: win.message.length > 0 ? win.message : !win.marksAllowed ? "" : Picker.statusLine(win.marks.length, Picker.totalBytes(win.marks))
-                    color: win.messageError ? Theme.color.error : Theme.color.foreground
+                    color: win.messageError ? Theme.color.errorOnSurface : Theme.color.foreground
                     font.family: Theme.font.family
                     font.pixelSize: Theme.font.caption
                     textFormat: Text.PlainText
@@ -706,6 +715,8 @@ ShellRoot {
             // other text, as the directory this window opens on.
             var start = win.req.folder.charAt(0) === "/" ? win.req.folder : win.home
             win.viewMode = Picker.rememberedView(ViewState.pickerView)
+            // A one-time seed of a filename only: a binding would read first inside saveReady, and flea-portal passes current_name verbatim.
+            win.saveName = Picker.validName(win.req.name) ? win.req.name : ""
             win.openWithoutHistory(start)
             // Measured on the box: without this the window has the keyboard but the list does not,
             // so Escape reached the surface below and every other key was dropped.
@@ -729,15 +740,22 @@ ShellRoot {
             function chip(): int { return win.filterIndex }
             function saveName(): string { return win.saveName }
             function message(): string { return win.message }
+            function pathBarOpen(): bool { return chrome.editing }
             function checks(): string { return JSON.stringify({marksBusy: win.markRequest > 0, saveBusy: win.saveRequest > 0, submitting: win.submitting, canAccept: win.canAccept, saveReady: win.saveReady, collision: win.saveCollision, review: win.saveReview.review || 0}) }
             function markedUris(): string { return JSON.stringify(win.marks.map(function(mark) { return mark.uri })) }
             function controls(): string { return JSON.stringify(chrome.controls().concat(header.controls(), save.controls(), places.controls())) }
             function rowCentre(index: int): string { return win.centre(win.viewItem().itemAtIndex(index)) }
             function saveState(): string { return JSON.stringify({name: win.saveName, path: win.saveReview.path || "", collision: win.saveCollision, error: win.saveError, field: win.centre(save.fieldItem)}) }
             function snapshot(): string {
+                // One reader answers path, field and Jump together, so a poll reads one instant.
+                var jumpItem = chrome.jump
+                var jumpFrame = jumpItem ? jumpItem.dropItem : null
+                var jumpVisible = jumpFrame ? Math.floor((jumpFrame.height - 2 * Theme.spacing.rowPaddingY) / Theme.rowHeight) : 0
                 return JSON.stringify({path: win.path, total: win.total, held: win.held, rows: win.rows,
+                    pathBarOpen: chrome.editing, pathFieldText: chrome.jump ? chrome.jump.query : "",
+                    jump: {open: !!jumpItem && jumpItem.shown, rows: jumpItem ? jumpItem.entries.length : 0, visibleRows: jumpVisible, contentY: jumpFrame ? jumpFrame.scrollY : 0, cursor: jumpItem ? jumpItem.cursor : -1, paths: jumpItem ? jumpItem.entries.map(function(entry) { return entry.path }) : []},
                     cursor: win.cursorIndex, cursorName: win.rowFor(win.cursorIndex) ? win.rowFor(win.cursorIndex).n : "",
-                    marks: win.marks, state: win.listingState, emptyHero: hero.visible, listingFailed: win.listingFailed, sortBy: backend.sortBy, sortDesc: backend.sortDesc, sortable: win.sortable, filter: win.filterIndex, history: win.history,
+                    marks: win.marks, state: win.listingState, emptyHero: hero.visible, emptyRest: hero.atRest, listingFailed: win.listingFailed, sortBy: backend.sortBy, sortDesc: backend.sortDesc, sortable: win.sortable, filter: win.filterIndex, history: win.history,
                     view: win.viewMode, thumbPending: Object.keys(win.thumbState.file).filter(function(index) { return win.thumbState.file[index] === null || win.thumbState.file[index] === "cache-asked" }).length,
                     marksBusy: win.markRequest > 0, saveBusy: win.saveRequest > 0, submitting: win.submitting, backendUnavailable: win.backendUnavailable,
                     canAccept: win.canAccept, saveReady: win.saveReady, collision: win.saveCollision,

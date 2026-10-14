@@ -36,11 +36,13 @@ function pane(rows, viewMode, stride) {
     p.toggleSelect = function () { Marks.toggleSelect(p) }
     p.clearSelection = function () { p.selection.clear(); p.selectionVersion++ }
     p.commitOpenRename = function () {}
+    p.rowFor = function () { return null }
     p.act = function () {}
     p.message = function () {}
     p.openWithoutHistory = function (path, opts) { p.openedPath = path }
     p.preview = { revealStrip: function () {}, follow: function () {} }
     p.collide = { ask: function (req) { p.moved = req } }
+    p.asks = function () { return p.collide }
     p.clipboard = { paths: [], moving: false }
     p.clipPending = null
     p.pathsPending = null

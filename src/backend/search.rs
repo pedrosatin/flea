@@ -1,7 +1,7 @@
 // The subtree walk behind a search request, ticked a slice at a time so a cancel is never blocked.
 use crate::backend::fuzzy::{rank_order, Fuzzy};
 use crate::backend::listing::Listing;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 // One tick reads this many directories before the loop looks at its channel again, the same "one at a time" idea dirsize uses.
@@ -11,9 +11,11 @@ pub struct Search {
     root: PathBuf,
     // Folded once by Fuzzy, because the comparison runs once per entry and the query never changes mid-walk.
     fuzzy: Fuzzy,
+    // Lowercased tag:<name> terms the query carried; every match must carry all of them.
+    tags: Vec<String>,
     hidden: bool,
-    // Directories still to read, each a path relative to root; the empty string is root itself.
-    pending: Vec<String>,
+    // Directories still to read, each a path relative to root; the empty path is root itself.
+    pending: Vec<PathBuf>,
     // One score per pushed match, in push order, so ranking is a permutation of the listing's spans.
     scores: Vec<i32>,
     pub scanned: usize,
@@ -22,11 +24,13 @@ pub struct Search {
 
 impl Search {
     pub fn new(root: &str, query: &str, hidden: bool) -> Search {
+        let (tags, text) = split_query(query);
         Search {
             root: PathBuf::from(root),
-            fuzzy: Fuzzy::new(query),
+            fuzzy: Fuzzy::new(&text),
+            tags,
             hidden,
-            pending: vec![String::new()],
+            pending: vec![PathBuf::new()],
             scores: Vec::new(),
             scanned: 0,
             started: Instant::now(),
@@ -44,8 +48,8 @@ impl Search {
         self.pending.is_empty()
     }
 
-    fn read_one(&mut self, rel: &str, listing: &mut Listing) {
-        let dir = if rel.is_empty() { self.root.clone() } else { self.root.join(rel) };
+    fn read_one(&mut self, rel: &Path, listing: &mut Listing) {
+        let dir = if rel.as_os_str().is_empty() { self.root.clone() } else { self.root.join(rel) };
         let body = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
         // One bound for opendir, getdents and d_type together, so a dead server costs one deadline, never one per entry.
         let owned = dir.clone();
@@ -53,18 +57,27 @@ impl Search {
             Ok(entries) => entries,
             _ => return,
         };
-        for (name, is_dir) in entries {
+        let tagged = if self.tags.is_empty() { Vec::new() } else { super::searchtags::read_tags(&dir, &body, &entries, self.hidden) };
+        for (i, (raw, is_dir)) in entries.into_iter().enumerate() {
             // corner: a dot-prefixed name is dropped before it is counted, matching scan.rs's own hidden rule.
-            if !self.hidden && name.starts_with('.') {
+            if !self.hidden && super::searchindex::is_hidden(&raw) {
                 continue;
             }
             self.scanned += 1;
-            let child = if rel.is_empty() { name.clone() } else { format!("{}/{}", rel, name) };
+            let child = rel.join(&raw);
+            let text = child.to_string_lossy();
+            // The tags were read in bounded chunks for the names this walk can match; an unread entry carries none.
+            if !self.tags.is_empty() && !names_carry(&tagged[i], &self.tags) {
+                if is_dir {
+                    self.pending.push(child);
+                }
+                continue;
+            }
             // The candidate is the whole relative path, not the base name, so one query can span a
             // separator: "dwnhelp" reaches "downloads/helper.txt", see docs/protocol.md "search".
-            if let Some(score) = self.fuzzy.score(&child) {
-                // The row's name is its path relative to the root, so base.join(name) still reaches the file and every per-row facility works unchanged.
-                listing.push(&child, is_dir);
+            if let Some(score) = self.fuzzy.score(&text) {
+                // The row's name is its path relative to the root; a name that is not UTF-8 rows as lossy text, like every row on the wire, so base.join(name) reaches only a UTF-8 name.
+                listing.push(&text, is_dir);
                 self.scores.push(score);
             }
             // corner: a symlink reports its own type here, so a link to a directory is never descended and no loop is possible.
@@ -99,15 +112,36 @@ impl Search {
     }
 }
 
-// One directory as (name, is_dir) pairs; d_type is free and answers is_dir with no stat.
+// Sample input: "tag:Red holiday snaps" answers (["red"], "holiday snaps"); "dwnhelp" answers ([], "dwnhelp").
+pub fn split_query(query: &str) -> (Vec<String>, String) {
+    let mut tags = Vec::new();
+    let mut words = Vec::new();
+    for word in query.split(char::is_whitespace).filter(|word| !word.is_empty()) {
+        // get answers None when byte 4 splits a character, so a multibyte word is never sliced there.
+        let name = word.get(..4).filter(|head| head.eq_ignore_ascii_case("tag:")).map(|_| &word[4..]);
+        if let Some(name) = name.filter(|name| !name.trim().is_empty()) {
+            tags.push(name.to_lowercase());
+        } else {
+            words.push(word);
+        }
+    }
+    (tags, words.join(" "))
+}
+
+// The one rule for both searches: the names a file has hold every wanted tag, compared case-insensitively.
+pub(crate) fn names_carry(have: &[String], tags: &[String]) -> bool {
+    tags.iter().all(|want| have.iter().any(|got| super::tags::name_matches(got, want)))
+}
+
+// One directory as (name, is_dir) pairs, the name as the kernel spelled it; d_type is free and answers is_dir with no stat.
 // Sample input: a directory holding "a.txt" and a "sub" directory.
-fn read_entries(dir: &std::path::Path) -> Vec<(String, bool)> {
+fn read_entries(dir: &std::path::Path) -> Vec<(std::ffi::OsString, bool)> {
     // corner: an unreadable directory answers empty in silence, as scan.rs's phase one skips an unreadable entry.
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else { return out; };
     for entry in rd.flatten() {
         let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-        out.push((entry.file_name().to_string_lossy().into_owned(), is_dir));
+        out.push((entry.file_name(), is_dir));
     }
     out
 }
@@ -139,6 +173,13 @@ mod tests {
         let mut v = names(l);
         v.sort();
         v
+    }
+
+    #[test]
+    fn a_multibyte_word_splits_without_panicking() {
+        assert_eq!(split_query("abc\u{e9}"), (Vec::new(), "abc\u{e9}".to_string()));
+        assert_eq!(split_query("ta\u{1f5}:x"), (Vec::new(), "ta\u{1f5}:x".to_string()));
+        assert_eq!(split_query("\u{e9}\u{e9}x TAG:Red"), (vec!["red".to_string()], "\u{e9}\u{e9}x".to_string()));
     }
 
     #[test]
@@ -251,5 +292,83 @@ mod tests {
         l.push("a.txt", false);
         assert!(!s.rank(&mut l));
         assert_eq!(names(&l), ["b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn a_tag_term_keeps_only_files_carrying_it() {
+        let d = TestDir::new("tagsearch");
+        d.file("holiday.jpg", "");
+        d.file("notes.txt", "");
+        super::super::tags::write_names(&d.join("holiday.jpg"), &["Red".to_string()]).unwrap();
+        let (l, _) = walk_all(root(&d), "tag:Red", false);
+        assert_eq!(names(&l), ["holiday.jpg"]);
+    }
+
+    #[test]
+    fn a_tag_term_combines_with_the_fuzzy_text_and_ignores_case() {
+        let d = TestDir::new("tagcombo");
+        d.file("holiday.jpg", "");
+        d.file("red-herring.jpg", "");
+        super::super::tags::write_names(&d.join("holiday.jpg"), &["Red".to_string()]).unwrap();
+        let (l, _) = walk_all(root(&d), "TAG:red holiday", false);
+        assert_eq!(names(&l), ["holiday.jpg"]);
+        // red-herring.jpg fuzzy-matches "herring" but carries no Red tag, so the tag half refuses it.
+        let (none, _) = walk_all(root(&d), "TAG:red herring", false);
+        assert!(none.len() == 0);
+    }
+
+    #[test]
+    fn a_tag_query_splits_terms_from_text() {
+        assert_eq!(split_query("tag:Red holiday snaps"), (vec!["red".to_string()], "holiday snaps".to_string()));
+        assert_eq!(split_query("dwnhelp"), (Vec::<String>::new(), "dwnhelp".to_string()));
+        assert_eq!(split_query("tag:"), (Vec::<String>::new(), "tag:".to_string()));
+    }
+
+    #[test]
+    fn a_foreign_non_ascii_tag_matches_in_any_case() {
+        let d = TestDir::new("tagforeigncase");
+        d.file("holiday.jpg", "");
+        d.file("notes.txt", "");
+        super::super::tags::write_names(&d.join("holiday.jpg"), &["\u{c4}rger".to_string()]).unwrap();
+        let (lower, _) = walk_all(root(&d), "tag:\u{e4}rger", false);
+        assert_eq!(names(&lower), ["holiday.jpg"]);
+        let (upper, _) = walk_all(root(&d), "tag:\u{c4}RGER", false);
+        assert_eq!(names(&upper), ["holiday.jpg"]);
+    }
+
+    #[test]
+    fn a_tagged_file_with_a_non_utf8_name_is_still_found() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = TestDir::new("tagnonutf8");
+        let path = d.path().join(std::ffi::OsStr::from_bytes(b"bad\xff.jpg"));
+        std::fs::write(&path, "").unwrap();
+        super::super::tags::write_names(&path, &["Red".to_string()]).unwrap();
+        let (l, _) = walk_all(root(&d), "tag:Red", false);
+        assert_eq!(l.len(), 1, "the tag is read at the entry's own path, never at a lossy copy of its name");
+    }
+
+    #[test]
+    fn a_folder_whose_name_is_not_utf8_is_descended() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = TestDir::new("dirnonutf8");
+        let folder = d.path().join(std::ffi::OsStr::from_bytes(b"bad\xffdir"));
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("bench.txt"), "").unwrap();
+        let (l, s) = walk_all(root(&d), "bench", false);
+        assert_eq!(names(&l), ["bad\u{fffd}dir/bench.txt"], "the folder is read at its own path, never at a lossy copy of its name");
+        assert_eq!(s.scanned, 2);
+    }
+
+    #[test]
+    fn tag_reads_ride_bounded_chunks_not_one_call_per_entry() {
+        crate::backend::iomount::test_reset();
+        let d = TestDir::new("tagbound");
+        d.dir("sub");
+        d.file("sub/holiday.jpg", "");
+        d.file("notes.txt", "");
+        super::super::tags::write_names(&d.join("sub/holiday.jpg"), &["Red".to_string()]).unwrap();
+        let (l, _) = walk_all(root(&d), "tag:Red", false);
+        assert_eq!(names(&l), ["sub/holiday.jpg"]);
+        assert_eq!(crate::backend::iomount::test_calls(), 4, "root and sub each cost the name read plus one chunk, never one per entry");
     }
 }

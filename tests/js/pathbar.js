@@ -50,7 +50,7 @@ function run(check) {
     check("a case-folded completion never hands back less than was typed", folded.text, "~/re")
     check("and it still reports how many share it", folded.matches, 2)
     check("so the sentence names the count rather than staying silent",
-          PathBar.completionMessage("~/re", folded, "/home/gm"), "2 names share that prefix.")
+          PathBar.completionMessage("~/re", folded, "/home/gm"), "2 items start with that")
     // The ordinary fold, where the common prefix is longer than the leaf, still grows the line.
     var grows = PathBar.complete("~/de", ["Desktop"])
     check("a lone case-folded match still completes to the real name", grows.text, "~/Desktop/")
@@ -145,14 +145,14 @@ function run(check) {
           Source.source("ui/WindowBody.qml").indexOf("pathFailed: Nav.pathFailed(view.currentPane)") >= 0, true)
     check("ChromeBar gates the commit on that flag",
           Source.source("ui/ChromeBar.qml").indexOf("PathBar.shouldNavigate(target, root.path, root.pathFailed)") >= 0, true)
-    // Nav.open refuses while a listing is in flight, which is what a different-path Enter meets there.
-    var refused = { said: "", opened: false }
+    // Nav.open takes a different-path Enter while a listing is in flight as the newest request.
+    var taken = { said: "", opened: false }
     var flightPane = { listInFlight: true, path: HOME, history: [], forwardHistory: [],
-        message: function (text) { refused.said = text },
-        openWithoutHistory: function () { refused.opened = true } }
+        message: function (text) { taken.said = text },
+        openWithoutHistory: function (path, options) { taken.opened = path + "|" + (options && options.supersede === true) } }
     Nav.open(flightPane, "/etc")
-    check("a path entered in flight is refused", refused.said, "A directory is already loading.")
-    check("and no listing starts behind it", refused.opened, false)
+    check("a path entered in flight is not refused", taken.said, "")
+    check("and its listing starts behind the one out", taken.opened, "/etc|true")
 
     // Where a completion reads, which is the head of the line and never the half-typed leaf.
     check("the completion directory is the head of the line",
@@ -223,12 +223,12 @@ function run(check) {
           PathBar.completionMessage("/home/gm/Mu", one, HOME), "")
     check("a line that could not move names the directory it read",
           PathBar.completionMessage("/home/gm/zz", PathBar.complete("/home/gm/zz", dirs), HOME),
-          "Nothing in /home/gm starts with that.")
-    check("a line already at the common prefix says how many share it",
-          PathBar.completionMessage("/home/gm/D", many, HOME), "4 names share that prefix.")
+          "Nothing in /home/gm starts with that")
+    check("a line already at the common start says how many items start with it",
+          PathBar.completionMessage("/home/gm/D", many, HOME), "4 items start with that")
     check("and a four-figure match count groups",
           PathBar.completionMessage("/home/gm/D", { text: "/home/gm/D", matches: 1204 }, HOME),
-          "1,204 names share that prefix.")
+          "1,204 items start with that")
 
     // The key half. The bar is drawn in the chrome above both views, so it is global the way the
     // keymap sheet is: the rail has to reach it rather than dropping the key on the floor.

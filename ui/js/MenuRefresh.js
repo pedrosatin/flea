@@ -38,9 +38,9 @@ function pressChanged(menu, pressed) {
         Qt.callLater(function() { if (menu.refreshOwed) menu.refreshProviderRows() })
 }
 
-// Only live delegates can hold a refresh; a destroyed pressed row leaves no state behind.
+// Only live delegates can hold a refresh; a destroyed pressed row leaves no state behind. A null flyout is a closed one, whose held rows only fade.
 function anyPressed(main, flyout) {
-    var repeaters = [main, flyout]
+    var repeaters = flyout === null ? [main] : [main, flyout]
     for (var group = 0; group < repeaters.length; group++) {
         var rows = repeaters[group]
         for (var i = 0; i < rows.count; i++) {
@@ -69,4 +69,15 @@ function refreshedCursor(previous, next, cursor, submenuRow, submenuCursor) {
     var oldTarget = oldSubmenu && oldSubmenu.submenu ? oldSubmenu.submenu[submenuCursor] : null
     var target = sub && !sub.disabled && oldTarget ? (sub.submenu || []).findIndex(function(entry) { return entry.id === oldTarget.id && !entry.disabled }) : -1
     return { cursor: selected, submenuRow: target >= 0 ? subRow : -1, submenuCursor: Math.max(0, target) }
+}
+
+// A changed answer replaces an open menu's rows; cursor and flyout follow their actions, the flyout inside the build hold so it reads its rows once.
+function apply(menu, next) {
+    var selection = refreshedCursor(menu.entries, next, menu.cursor, menu.openSubmenuRow, menu.submenuCursor)
+    // A lone flyout's leaves come from Menu.flyoutEntries, which no provider answer changes, so it keeps its row and highlight.
+    var lone = menu.loneFlyoutAction.length > 0
+    menu.setEntries(next, lone ? undefined : selection.submenuRow)
+    menu.cursor = selection.cursor
+    if (!lone)
+        menu.submenuCursor = selection.submenuCursor
 }

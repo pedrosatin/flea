@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell.Io
 import "js/Devices.js" as Devices
+import "js/Format.js" as Format
 import "js/Mounts.js" as Mounts
 import "js/Eject.js" as Eject
 
@@ -16,8 +17,11 @@ Item {
 
     signal opened(string path)
     signal message(string text, bool isError)
+    // A failed mount, unmount or eject: the headline plus gio's own reason for the status bar's detail line.
+    signal operationResult(string headline, string detail, bool isError)
     // An eject is about to release this mountpoint: readers on it stop first (#232).
     signal quiesce(string path)
+    signal unlockRequested(string device, string label, double size, string fstype)
     // The verdict this surface last posted, so a newer one replaces it and nothing else.
     signal forgetMessage(string text)
     property string _lastVerdict: ""
@@ -54,6 +58,7 @@ Item {
     property string _mountErr: ""
     property string _unmountErr: ""
     property string _ejectErr: ""
+    property string _unmountDevice: ""
     // The device whose eject awaits its verdict, "" when none. The listing taken after gio exits is
     // the only witness: gio's own exit code has been 0 over a volume that was still mounted.
     property string _ejectDevice: ""
@@ -68,15 +73,19 @@ Item {
     property bool _streamPending: false
     // Cleared only when the next listing starts, which onExited's own release of _streamPending
     // guarantees cannot happen until the ended listing is fully done with.
-    property bool _listTimedOut: false
+    property bool listTimedOut: false
     // Set when the chain deadline ends that leg, so its own onExited is swallowed once.
     property bool _unmountEndedLate: false
     // The -t leg's own ended-late flag, never set by an unmount the deadline ends.
     property bool _ejectEndedLate: false
     // The rail's DEVICES gate: true once the first listing answered, timed out or not, without replacing anything.
     property bool firstAnswered: false
+    // Set on the unmount's first turn, since a binding on Process.running would still say idle when PaneRail decides whether to unload this host.
+    property bool _unmounting: false
+    // True while a release is in flight: an eject awaiting its verdict, which a power-off chain holds too, or a user unmount.
+    readonly property bool releasing: root._ejectDevice.length > 0 || root._unmounting
 
-    // The internal disk row reads the hostname alone (GM, 2026-09-08; the canvas drew "<host> · <kernel name>"), and /etc/hostname is the
+    // The internal disk row reads the hostname alone (decided 2026-09-08; the canvas drew "<host> · <kernel name>"), and /etc/hostname is the
     // one source for that host name that costs no process.
     FileView {
         id: hostnameFile
@@ -96,9 +105,11 @@ Item {
     }
     on_PowerOffDiskChanged: if (_powerOffDisk.length > 0) powerSectorsFile.active = true
 
+    // False parks the poll once the first listing answered; a mount or a release in flight reads the next listing, so it keeps polling.
+    property bool polling: true
     Timer {
         interval: root.pollMs
-        running: true
+        running: root.polling || !root.firstAnswered || root.releasing || root._pendingOpenDevice.length > 0 || root._powerOffDisk.length > 0
         repeat: true
         triggeredOnStart: true
         onTriggered: root.poll()
@@ -107,7 +118,7 @@ Item {
     function poll() {
         if (listProcess.running || root._streamPending)
             return
-        root._listTimedOut = false
+        root.listTimedOut = false
         root._streamPending = true
         root._listingsStarted += 1
         listProcess.running = true
@@ -124,12 +135,12 @@ Item {
             if (!listProcess.running)
                 return
             // Ending it is what lets the next poll run at all; a listing nobody can end froze the rail.
-            root._listTimedOut = true
+            root.listTimedOut = true
             listProcess.running = false
         }
     }
 
-    // GM's ruling of 2026-09-08: the machine's row is its hostname alone; the kernel name stays the fallback for a box with no hostname, and r.device still names the disk for the actions.
+    // Decided 2026-09-08: the machine's row is its hostname alone; the kernel name stays the fallback for a box with no hostname, and r.device still names the disk for the actions.
     function hostLabel(fallback) {
         var host = String(hostnameFile.text() || "").trim()
         return host.length > 0 ? host : fallback
@@ -143,8 +154,9 @@ Item {
             var label = r.kind === "disk" ? root.hostLabel(r.label) : r.label
             out.push({ path: r.path, label: label, group: "device", kind: r.kind,
                        device: r.device, mounted: r.mounted, removable: r.removable,
-                       mediaRemovable: r.mediaRemovable === true, size: r.size,
-                       volumeMenu: r.volumeMenu === true, glyph: "drive" })
+                       mediaRemovable: r.mediaRemovable === true, readOnly: r.readOnly === true, size: r.size,
+                       glyph: r.locked === true ? "lock" : "drive", locked: r.locked === true,
+                       fstype: r.fstype || "", fsver: r.fsver || "" })
         }
         // Same rule as ui/NetworkMounts.qml's: an unchanged poll assigns nothing, see Mounts.sameEntries.
         if (!Mounts.sameEntries(root.entries, out))
@@ -174,6 +186,10 @@ Item {
         var e = root.entries[index]
         if (!e)
             return
+        if (e.locked === true) {
+            root.unlockRequested(e.device, e.label, Number(e.size) || 0, String(e.fstype || ""))
+            return
+        }
         if (e.mounted) {
             root.opened(e.path)
             return
@@ -181,9 +197,11 @@ Item {
         root.mountVolume(e)
     }
 
+    function reportFailure(headline, stderr) { root.operationResult(headline, Devices.mountDetail(stderr), true) }
+
     function mountVolume(e) {
         if (mountProcess.running) {
-            root.message("Another device is still mounting; wait for its result.", false)
+            root.message(Mounts.WORDS.anotherMounting, false)
             return
         }
         root._pendingOpenDevice = e.device
@@ -199,14 +217,21 @@ Item {
     function unmount(index) {
         // A chain owns unmountProcess for its legs, so a user unmount waits for the eject.
         if (root._powerOffDisk.length > 0) {
-            root.message("Still ejecting " + root._ejectLabel + "; wait for its result.", false)
+            root.message(Format.fill(Mounts.WORDS.stillEjecting, root._ejectLabel), false)
             return
         }
         var e = root.entries[index]
-        if (!e || e.kind !== "volume" || !e.mounted || unmountProcess.running)
+        if (!e || e.kind !== "volume" || !e.mounted)
             return
+        if (unmountProcess.running) {
+            root.message(Format.fill(Mounts.WORDS.stillUnmounting, root._unmountLabel), false)
+            return
+        }
+        root.quiesce(e.path)
         root._unmountLabel = e.label
+        root._unmountDevice = e.device
         root._unmountErr = ""
+        root._unmounting = true
         unmountProcess.command = ["gio", "mount", "-u", e.path]
         unmountProcess.running = true
     }
@@ -218,6 +243,14 @@ Item {
         root._verdictFromListing = 0
     }
 
+    // Locks the container behind an unmounted or ejected crypt, from the listing an eject was judged on when it has one.
+    property var deviceLock: null
+    function lockCrypt(device, label, listing) {
+        if (deviceLock === null)
+            deviceLock = Qt.createComponent("DeviceLock.qml").createObject(root, { host: root })
+        return deviceLock.lockCryptAfter(listing !== undefined ? listing : root._listing, device, label)
+    }
+
     // Eject goes through the mount point. gio mount dispatches on --device before it ever reads
     // --eject (glib 2.88.3 gio-tool-mount.c:1264 against :1278), so "-e -d <device>" mounts instead.
     // gio's own -f is never passed: forcing an unmount over an open write is how a file manager
@@ -227,7 +260,7 @@ Item {
         if (!e || e.kind !== "volume" || !e.mounted)
             return
         if (ejectProcess.running || root._ejectDevice.length > 0) {
-            root.message("Still ejecting " + root._ejectLabel + "; wait for its result.", false)
+            root.message(Format.fill(Mounts.WORDS.stillEjecting, root._ejectLabel), false)
             return
         }
         // A USB disk that is not media-removable (a USB HDD or SSD bridge) is powered off
@@ -243,14 +276,14 @@ Item {
         ejectProcess.command = ["gio", "mount", "-e", e.path]
         ejectProcess.running = true
         // Replaces the arm prompt, and a stick mid-flush can take a while to come unmounted.
-        root.message("Ejecting " + e.label + ", do not unplug it yet.", false)
+        root.message(Format.fill(Mounts.WORDS.ejecting, e.label), false)
     }
 
     // Unmount every volume, then stop the drive, so nothing is left for udiskie to remount.
     function powerOff(e, disk) {
         // A user unmount already in flight owns unmountProcess; adopting it would skip the queue.
         if (unmountProcess.running) {
-            root.message(e.label + " is still unmounting; wait for its result.", false)
+            root.message(Format.fill(Mounts.WORDS.stillUnmountingTryAgain, e.label), false)
             return
         }
         root.quiesce(e.path)
@@ -258,7 +291,7 @@ Item {
         root._powerOffDisk = disk
         root._powerOffQueue = Devices.powerOffQueue(root.entries, disk)
         root._powerSectors = ""
-        root.message("Ejecting " + e.label + ", do not unplug it yet.", false)
+        root.message(Format.fill(Mounts.WORDS.ejecting, e.label), false)
         root.powerOffNext()
     }
 
@@ -303,16 +336,18 @@ Item {
             return
         var verdict = Eject.verdict(body, root._ejectDevice)
         if (verdict !== "unknown")
-            root.reportEject(verdict, Eject.blockers(body, root._ejectDevice))
+            root.reportEject(verdict, Eject.blockers(body, root._ejectDevice), body)
     }
 
     // "Safe to unplug" is a safety claim: Eject.sentence says it for the "safe" verdict only.
-    function reportEject(verdict, others) {
+    function reportEject(verdict, others, body) {
         if (root._ejectDevice.length === 0)
             return
         powerOffTimeout.stop()
         ejectVerdictTimeout.stop()
         var s = Eject.sentence(verdict, root._ejectLabel, others)
+        if (!s.isError)
+            root.lockCrypt(root._ejectDevice, root._ejectLabel, body)
         root._ejectDevice = ""
         // The newest verdict about this device is the true one, so it replaces the last one rather
         // than queueing behind it: a refusal is an error and stands until dismissed, and without
@@ -330,7 +365,7 @@ Item {
             if (root._pendingOpenDevice.length === 0)
                 return
             root._pendingOpenDevice = ""
-            root.message(root._pendingOpenLabel + " mounted but never reported a folder to open.", true)
+            root.message(Format.fill(Mounts.WORDS.noFolder, root._pendingOpenLabel), true)
         }
     }
 
@@ -363,7 +398,7 @@ Item {
             root._powerOffQueue = []
             root._ejectDevice = ""
             // A verdict replaces the last one, so the next chain's safe sentence retires this error.
-            var text = label + " did not finish ejecting and is still mounted."
+            var text = Format.fill(Mounts.WORDS.ejectUnfinished, label)
             root.forgetMessage(root._lastVerdict)
             root._lastVerdict = text
             root.message(text, true)
@@ -377,16 +412,15 @@ Item {
         // which hid / behind /home here and left the system disk unidentifiable.
         // TRAN is the transport, asked for because RM alone misses a USB bridge: a WD My Passport
         // reports rm=false with tran=usb, and a drive you can unplug has to offer Eject (PR 74).
-        // PARTTYPE, PTTYPE, PARTN and UUID are the hide rule's own columns: a firmware type, an
-        // installer ISO keep, a recovery label and the dedupe key never come out of FSTYPE alone.
-        command: ["lsblk", "--bytes", "--json", "-o", "NAME,PATH,LABEL,MOUNTPOINTS,RM,TRAN,SIZE,TYPE,MODEL,FSTYPE,PARTTYPENAME,PARTTYPE,PTTYPE,PARTN,UUID"]
+        // PARTTYPE, PTTYPE, PARTN and UUID are the hide rule's own columns (a firmware type, an installer ISO keep, a recovery label, the dedupe key); FSVER beside FSTYPE names LUKS1 or LUKS2; RO keeps Flash image off a write-protected card.
+        command: ["lsblk", "--bytes", "--json", "-o", "NAME,PATH,LABEL,MOUNTPOINTS,RM,RO,TRAN,SIZE,TYPE,MODEL,FSTYPE,FSVER,PARTTYPENAME,PARTTYPE,PTTYPE,PARTN,UUID"]
         stdout: StdioCollector {
             id: listOut
             waitForEnd: true
             // The verdict is read here, from this run's own text, so it can never come off the
             // stale fallback onExited keeps for the rail.
             onStreamFinished: {
-                if (root._listTimedOut)
+                if (root.listTimedOut)
                     return
                 root._streamPending = false
                 root._listOutput = text
@@ -398,7 +432,7 @@ Item {
             // A listing this timer ended collected nothing, and reading that as "no devices" would
             // empty the rail, taking Eject with it exactly when a device is misbehaving. The stream
             // guard is released here because a stream this timer cut off may never finish on its own.
-            if (root._listTimedOut) {
+            if (root.listTimedOut) {
                 root._streamPending = false
             } else {
                 root._listing = listOut.text || root._listOutput || ""
@@ -411,6 +445,7 @@ Item {
 
     Process {
         id: mountProcess
+        objectName: "mountProcess"
         stderr: StdioCollector { onStreamFinished: root._mountErr = this.text }
         onExited: function (exitCode) {
             // The wait starts here, not at launch: an admin polkit prompt longer than the
@@ -430,13 +465,16 @@ Item {
             }
             mountTimeout.stop()
             root._pendingOpenDevice = ""
-            root.message(sentence.length > 0 ? sentence : label + " could not be mounted.", true)
+            root.reportFailure(sentence.length > 0 ? sentence : Format.fill(Mounts.WORDS.mountFailed, label), root._mountErr)
         }
     }
 
     Process {
         id: unmountProcess
+        objectName: "unmountProcess"
         stderr: StdioCollector { onStreamFinished: root._unmountErr = this.text }
+        // A spawn that fails raises this and never exited, so the flag ends here with every other end.
+        onRunningChanged: if (!unmountProcess.running) root._unmounting = false
         onExited: function (exitCode) {
             // A power-off unmounts each volume first; a refusal stops the chain instead of
             // powering off under a volume that is still mounted.
@@ -451,7 +489,7 @@ Item {
                     root._powerOffDisk = ""
                     root._powerOffQueue = []
                     root._ejectDevice = ""
-                    root.message(Devices.mountError("unmount", exitCode, root._unmountErr, root._ejectLabel), true)
+                    root.reportFailure(Devices.mountError("unmount", exitCode, root._unmountErr, root._ejectLabel), root._unmountErr)
                 } else {
                     root.powerOffNext()
                 }
@@ -459,13 +497,16 @@ Item {
                 return
             }
             if (exitCode !== 0)
-                root.message(Devices.mountError("unmount", exitCode, root._unmountErr, root._unmountLabel), true)
+                root.reportFailure(Devices.mountError("unmount", exitCode, root._unmountErr, root._unmountLabel), root._unmountErr)
+            else if (root.lockCrypt(root._unmountDevice, root._unmountLabel))
+                return
             root.poll()
         }
     }
 
     Process {
         id: ejectProcess
+        objectName: "ejectProcess"
         stderr: StdioCollector { onStreamFinished: root._ejectErr = this.text }
         onExited: function (exitCode) {
             // A refused stop says so at once; a stop that ran is judged on the listing that
@@ -482,7 +523,7 @@ Item {
                 root._powerOffQueue = []
                 root._ejectDevice = ""
                 ejectVerdictTimeout.stop()
-                root.message(sentence.length > 0 ? sentence : root._ejectLabel + " could not be ejected.", true)
+                root.reportFailure(sentence.length > 0 ? sentence : Format.fill(Mounts.WORDS.ejectFailed, root._ejectLabel), root._ejectErr)
                 root.poll()
                 return
             }

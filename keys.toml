@@ -142,7 +142,7 @@ action = "copyPath"
 # The preset overlay, the four-value chooser the Keys settings section walks: default, vim, mac and
 # windows, in SettingsKeys.html's own order. It is consulted before every table above, so a preset
 # can claim a chord the shared tables also bind, and a chord listed here is live only while its own
-# preset is selected. GM's ruling, 2026-09-06: every preset reaches every action this table governs,
+# preset is selected. Decided 2026-09-06: every preset reaches every action this table governs,
 # so default and vim carry the three view chords SettingsKeys.html's inventory leaves as a dash. On
 # every other row a preset governs the shared tables already bind a bare key, and Default is what a
 # missing or unknown name means. A chord claimed twice inside one preset is a generator error, which
@@ -151,7 +151,7 @@ action = "copyPath"
 # section prints beside the label, and it is spelled the way SettingsKeys.html spells a chord. Each
 # block writes name, mods, key, keys, action, then label, in that order.
 
-# The three views are bound in no shared table, so a preset claiming nothing left a fresh install
+# The four views are bound in no shared table, so a preset claiming nothing left a fresh install
 # with no keyboard route to them at all, on a keyboard-first file manager. Default and Vim take the
 # spelling the Mac rows below already use, because only one preset is ever live and the two never
 # meet; the bare digits are tab1 through tab9, so a chord is the only free shape here.
@@ -180,6 +180,14 @@ action = "viewGrid"
 label = "grid"
 
 [[preset]]
+name = "default"
+mods = "ctrl"
+key = "4"
+keys = "ctrl-4"
+action = "viewDual"
+label = "dual pane"
+
+[[preset]]
 name = "vim"
 mods = "ctrl"
 key = "1"
@@ -202,6 +210,14 @@ key = "3"
 keys = "ctrl-3"
 action = "viewGrid"
 label = "grid"
+
+[[preset]]
+name = "vim"
+mods = "ctrl"
+key = "4"
+keys = "ctrl-4"
+action = "viewDual"
+label = "dual pane"
 
 # Finder's own chords, read with Cmd as Ctrl the way Omarchy's universal clipboard already delivers
 # them; ui/js/Keymap.js's shared ctrl table keeps only the chords both platforms agree on.
@@ -229,6 +245,14 @@ keys = "ctrl-3"
 action = "viewGrid"
 label = "grid"
 
+[[preset]]
+name = "mac"
+mods = "ctrl"
+key = "4"
+keys = "ctrl-4"
+action = "viewDual"
+label = "dual pane"
+
 [[preset]]# Historical Ctrl navigation aliases remain additive.
 
 name = "mac"
@@ -254,7 +278,7 @@ mods = "ctrl"
 key = "Delete"
 keys = "ctrl-delete"
 action = "trash"
-label = "move to trash"
+label = "move to Trash"
 
 # Finder's Connect to Server. Bare a stays a shared key, so the Windows preset loses only the chord.
 [[preset]]
@@ -299,6 +323,14 @@ key = "3"
 keys = "ctrl-shift-3"
 action = "viewGrid"
 label = "grid"
+
+[[preset]]
+name = "windows"
+mods = "ctrlshift"
+key = "4"
+keys = "ctrl-shift-4"
+action = "viewDual"
+label = "dual pane"
 
 [[shift]]
 key = "Down"
@@ -381,7 +413,7 @@ action = "rename"
 key = "F5"
 action = "reload"
 
-# GM's fix, 2026-09-13: the arrows are the letter pair's own spelling, so Left is h's parent and
+# Decided 2026-09-13: the arrows are the letter pair's own spelling, so Left is h's parent and
 # Right is l's browse-in, in the list, the columns and both dual panes. A preview takes them back
 # through the preview-context rows at the end of this file, where they seek in media and turn the
 # page in a PDF, and the grid claims them as its own sideways move in ui/js/Focus.js before the map
@@ -412,7 +444,7 @@ action = "cursorFirst"
 char = "G"
 action = "cursorLast"
 
-# GM's ruling, 2026-09-01: the keymap sheet's own letters. Selection moved off x, which now cuts,
+# Decided 2026-09-01: the keymap sheet's own letters. Selection moved off x, which now cuts,
 # onto v, which is also the TUI board's visual-mode key.
 [[text]]
 char = "v"
@@ -430,8 +462,8 @@ action = "extendUp"
 char = "h"
 action = "parent"
 
-# Narrows the rows already listed, in place and with no round trip. ui/js/Focus.js keeps it to the
-# list view, the one the canvas draws a filter in, the same way it keeps addNetwork to the rail.
+# Narrows the rows already listed, in place and with no round trip, in every view; ui/js/Focus.js
+# drops it only while a search owns the header.
 [[text]]
 char = "/"
 action = "filter"
@@ -455,6 +487,11 @@ action = "pathBar"
 [[text]]
 char = "t"
 action = "tabNew"
+
+# The Tags flyout's own key, from the listing; the seven digits toggle while that list is open.
+[[text]]
+char = "T"
+action = "tags"
 
 [[text]]
 char = "w"
@@ -550,8 +587,8 @@ char = "?"
 action = "keymapSheet"
 
 # The PDF viewer's own three, reachable only with a PDF preview open. ui/js/Focus.js discards them
-# everywhere else, the same way it already discards addNetwork outside the rail. Expand takes e
-# because f is search and Space is preview; the canvas names no key, GM ruled that it gets one.
+# everywhere else. Expand takes e because f is search and Space is preview; the canvas names no key,
+# but it gets one.
 [[text]]
 char = "-"
 action = "zoomOut"
@@ -604,16 +641,16 @@ sheet = false
 # narrows or orders what is already listed. Change writes something, or opens the surface that does.
 [sheetgroups]
 move = ["cursorDown", "cursorUp", "cursorFirst", "cursorLast", "pageDown", "pageUp", "open",
-        "parent", "pageForward", "historyBack", "historyForward", "focusNext", "focusPreview",
+        "parent", "pageForward", "historyBack", "historyForward", "focusNext", "focusPrevious", "focusPreview",
         "tabNew", "openTab", "tabClose", "tabNext", "tabPrevious", "tabMoveLeft", "tabMoveRight", "windowNew", "escape"]
-look = ["viewList", "viewColumns", "viewGrid", "togglePreview", "loadPreview", "preview",
+look = ["viewList", "viewColumns", "viewGrid", "viewDual", "togglePreview", "loadPreview", "preview",
         "toggleHidden", "sidebar", "zoomIn", "zoomOut", "expand", "mute", "textSizeUp", "textSizeDown",
         "textSizeReset", "keymapSheet"]
 find = ["filter", "search", "reveal", "sortNext", "sortReverse", "pathBar", "reload"]
 change = ["copy", "cut", "paste", "movePaste", "duplicate", "rename", "trash",
           "deletePermanently", "undo", "redo", "newFolder", "copydirpath", "copyPath", "toggleSelect",
           "selectAll", "extendDown", "extendUp", "menu", "properties", "addNetwork", "eject",
-          "openTerminal", "settings", "autofitColumns", "copyAs", "pasteAs", "invertSelection"]
+          "openTerminal", "settings", "autofitColumns", "copyAs", "pasteAs", "invertSelection", "tags"]
 
 # The digit range, expanded by the generator into tab1 through tab9.
 [digits]
@@ -732,6 +769,11 @@ label = "trash"
 keys = "z ^z"
 action = "undo"
 label = "undo"
+
+[[sheet]]
+keys = "T"
+action = "tags"
+label = "tags"
 
 [[sheet]]
 keys = "^N"
@@ -988,7 +1030,7 @@ label = "open the peeked directory in a new tab"
 # leaf is the directory already listed, so it has nowhere of its own to go, and the frozen List view
 # board draws it in the foreground role while every segment above it is muted. The row column reads
 # "parent" for that reason: a row saying "crumb" would promise a press the leaf never answers. A
-# parent answers on the first tap (GM, 2026-09-22), because waiting to rule out a double click held
+# parent answers on the first tap (decided 2026-09-22), because waiting to rule out a double click held
 # every crumb click for the whole double-click interval, so the double click that opens the bar
 # lives only where a tap opens nothing: the leaf, the collapsed marker and the strip around them,
 # which the second row calls "inert".
@@ -1406,6 +1448,17 @@ label = "undo"
 frontend = "all"
 context = "listing"
 
+# Redo on the default preset. A legacy terminal sends Ctrl+Shift+Z as Ctrl+Z, so the TUI sees this chord only under the kitty keyboard protocol.
+[[preset]]
+name = "default"
+mods = "ctrlshift"
+key = "Z"
+keys = "ctrl-shift-z"
+action = "redo"
+label = "redo"
+frontend = "all"
+context = "listing"
+
 [[preset]]
 name = "mac"
 mods = "supershift"
@@ -1627,7 +1680,7 @@ label = "cursorDown"
 frontend = "all"
 context = "rail,menu,panel,preview,media"
 
-# Space closes every preview now (GM, 2026-09-11), so the media strip's play control needed a key of
+# Space closes every preview now (decided 2026-09-11), so the media strip's play control needed a key of
 # its own: without one a keyboard-first file manager could only play and pause with the pointer.
 [[preset]]
 name = "all"
@@ -1707,9 +1760,9 @@ mods = "shift"
 key = "Tab"
 keys = "shift-tab"
 action = "focusPrevious"
-label = "focusPrevious"
+label = "focus back"
 frontend = "all"
-context = "rail,menu,panel,preview,pdf,media"
+context = "listing,rail,menu,panel,preview,pdf,media"
 
 [[preset]]
 name = "all"
@@ -1717,9 +1770,9 @@ mods = "shift"
 key = "Backtab"
 keys = "shift-backtab"
 action = "focusPrevious"
-label = "focusPrevious"
+label = "focus back"
 frontend = "all"
-context = "rail,menu,panel,preview,pdf,media"
+context = "listing,rail,menu,panel,preview,pdf,media"
 
 [[preset]]
 name = "all"
@@ -1748,6 +1801,77 @@ key = "l"
 keys = "l"
 action = "menuRight"
 label = "menuRight"
+frontend = "all"
+context = "menu"
+
+# The Tags flyout's own digits: while that list is open 1 to 7 toggle the tag they name.
+[[preset]]
+name = "all"
+mods = "text"
+key = "1"
+keys = "1"
+action = "tag1"
+label = "tag 1"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "2"
+keys = "2"
+action = "tag2"
+label = "tag 2"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "3"
+keys = "3"
+action = "tag3"
+label = "tag 3"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "4"
+keys = "4"
+action = "tag4"
+label = "tag 4"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "5"
+keys = "5"
+action = "tag5"
+label = "tag 5"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "6"
+keys = "6"
+action = "tag6"
+label = "tag 6"
+frontend = "all"
+context = "menu"
+
+[[preset]]
+name = "all"
+mods = "text"
+key = "7"
+keys = "7"
+action = "tag7"
+label = "tag 7"
 frontend = "all"
 context = "menu"
 
@@ -1904,7 +2028,6 @@ label = "pageForward"
 frontend = "all"
 context = "preview,pdf,media"
 
-
 # Scroll documents in Quick Look while the cursor keys continue to follow files.
 [[preset]]
 name = "all"
@@ -1946,7 +2069,7 @@ label = "scroll up"
 frontend = "gui"
 context = "preview"
 
-# GM 2026-10-03: r flips the open Markdown Quick Look to source and back, and the listing's r stays rename (preview context only).
+# Decided 2026-10-03: r flips the open Markdown Quick Look to source and back, and the listing's r stays rename (preview context only).
 [[preset]]
 name = "all"
 mods = "text"
@@ -1965,7 +2088,7 @@ keys = "-"
 action = "zoomOut"
 label = "zoomOut"
 frontend = "all"
-context = "pdf"
+context = "preview,pdf"
 
 [[preset]]
 name = "all"
@@ -1975,7 +2098,18 @@ keys = "+"
 action = "zoomIn"
 label = "zoomIn"
 frontend = "all"
-context = "pdf"
+context = "preview,pdf"
+
+# Media040 callout 3: 0 returns a Quick Look image to fit (image preview only; a PDF has no fit key).
+[[preset]]
+name = "all"
+mods = "text"
+key = "0"
+keys = "0"
+action = "zoomFit"
+label = "zoomFit"
+frontend = "all"
+context = "preview"
 
 [[preset]]
 name = "all"

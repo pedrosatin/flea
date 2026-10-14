@@ -15,13 +15,16 @@ function fromFile(text) {
     return { state: {}, unreadable: text.length > 0 }
 }
 
+// The one sentence for a ui.json that could not be read when favorites were refreshed, said by this module and by ViewState.
+var FAVOURITES_UNREAD = "Favorites could not be refreshed because ui.json could not be read. The old list stays."
+
 // External favourites update independently of this window's settings drafts and pending patches.
 function refreshedFavourites(state, text) {
     var read = fromFile(text)
     var places = read.state.places
     if (text.length === 0 || read.unreadable || (places !== undefined && (!places || typeof places !== "object" || Array.isArray(places)))
             || (places && places.favourites !== undefined && !Array.isArray(places.favourites)))
-        return { state: state, error: "Favorites could not be refreshed: invalid ui.json; previous entries kept." }
+        return { state: state, error: FAVOURITES_UNREAD }
     var records = places && places.favourites || []
     if (JSON.stringify((state.places || {}).favourites || []) === JSON.stringify(records))
         return { state: state, error: "" }
@@ -166,18 +169,6 @@ function dropInvalid(unsaved, inflightText) {
         }
     }
     return out
-}
-
-// Drop a refused patch's keys from what is owed, so one refusal never blocks later saves; settled stays the revert source in revertedState.
-function pruneRefused(unsaved, inflightText, settled) {
-    var out = dropInvalid(unsaved, inflightText)
-    var refused = invalidKeys(inflightText)
-    var dropped = []
-    for (var r = 0; r < refused.length; r++) {
-        if (out[refused[r]] === undefined && unsaved[refused[r]] !== undefined)
-            dropped.push(refused[r])
-    }
-    return { unsaved: out, dropped: dropped }
 }
 
 // Reverts only refused keys still showing the refused value, so a newer change made behind the refused writer survives.

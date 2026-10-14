@@ -6,7 +6,9 @@ import "js/Thumbs.js" as Thumbs
 import "js/ExtThumbs.js" as ExtThumbs
 import "js/Keymap.js" as Keymap
 import "js/PreviewKeys.js" as PreviewKeys
+import "js/Search.js" as Search
 import "js/PreviewSettle.js" as PreviewSettle
+import "js/PreviewAsk.js" as PreviewAsk
 import "js/PreviewSwap.js" as PreviewSwap
 
 // Selection loading is independent of column visibility and the separate Quick Look overlay.
@@ -64,15 +66,18 @@ Flea.PreviewColumn {
         : (root.loadedIndex >= 0 ? Thumbs.fileFor(root.pane.thumbState, root.loadedIndex) : "")) : ""
     noThumbComing: root.row !== null && (root.row.t !== true || !root.pane
         || Thumbs.refused(root.pane.thumbState, root.loadedIndex))
-    loadingHeldOff: root.swap !== null && root.swap.fellBack
+    // True from a move's clear until the next plain clear, the load's own; only then may the swap's fallback end, and its held-off mark show.
+    property bool moved: false
+    loadingHeldOff: root.swap !== null && root.swap.fellBack && !root.moved
 
     // What the swap waits for: the cursor row's preview whole, or nothing more coming for it.
     // A held frame is whole from the listing alone, cached thumbnail or not.
     readonly property bool ready: {
         if (root.manualHold)
             return !root.pending
+        // A move's clear writes pending false and then true, and ready must not read true between the two: that ends the swap's fallback at every step of a held key.
         if (root.pane === null || root.row === null)
-            return !root.pending
+            return !root.pending && !root.moved
         if (root.loadedIndex !== root.pane.cursorIndex)
             return false
         return PreviewSwap.columnReady({ state: root.previewState, thumb: root.thumb.length > 0,
@@ -103,11 +108,13 @@ Flea.PreviewColumn {
 
     function clear() {
         settle.stop()
+        root.moved = false
         root.clearShown()
     }
 
     // A move's clear: the loading state stands under the swap's picture until the settle loads the new row.
     function clearForMove() {
+        root.moved = true
         root.clearShown()
         root.pending = true
     }
@@ -119,6 +126,8 @@ Flea.PreviewColumn {
         // A true duplicate preserves the frame and timer; a changed identity lets a same-key refresh proceed.
         // A queued load stands for the same key: clearing behind it would wipe the load when it lands.
         if (key === root.lastMoveKey && (root.isShown() || root.loadQueuedKey === key)) return
+        // A burst's move for this key already waits on its settle, so a rows landing under it holds nothing again.
+        if (key === root.lastMoveKey && root.moved && settle.running && root.settleKey === key) return
         if (root.swap && ViewState.previewAutomatic && root.canRead) {
             // The picture first, the exact contract a deferred load keeps; the scheduler may load under it at once.
             root.swap.hold(root.clearForMove, key)
@@ -204,7 +213,7 @@ Flea.PreviewColumn {
         root.loadedDirectory = root.pane.path
         root.loadedIdentity = root.identity(candidate)
         root.row = Object.assign({}, candidate)
-        root.path = root.pane.join(root.pane.path, candidate.n)
+        root.path = root.pane.join(Search.baseOf(root.pane), candidate.n)
         root.kindName = root.pane.kindNames[candidate.k] || ""
         root.selectionCount = root.pane.selectionCount()
         root.loadedSelection = PreviewSettle.selectionKey(root.pane.selectionCount(), root.pane.selectionVersion)
@@ -233,7 +242,7 @@ Flea.PreviewColumn {
         root.loadedDirectory = pane.path
         root.loadedIdentity = root.identity(current)
         root.row = Object.assign({}, current)
-        root.path = pane.join(pane.path, current.n)
+        root.path = pane.join(Search.baseOf(pane), current.n)
         root.kindName = pane.kindNames[current.k] || ""
         root.selectionCount = pane.selectionCount()
         root.loadedSelection = PreviewSettle.selectionKey(pane.selectionCount(), pane.selectionVersion)
@@ -250,12 +259,35 @@ Flea.PreviewColumn {
     // so asking early would thumbnail a NAS image in full over the network.
     function askThumb() {
         var pane = root.pane
-        if (!root.canRead || !pane || !pane.storageKnown || root.loadedIndex < 0 || root.selectionCount > 1) return
+        if (!pane || root.loadedIndex < 0) return
         if (root.manualHold || !root.isShown()) return
         var current = pane.rowFor(root.loadedIndex)
-        if (!current || !current.t || pane.thumbState.file[root.loadedIndex] !== undefined) return
-        var work = { ask: [root.loadedIndex], drop: [] }
-        work.cacheOnly = ExtThumbs.cacheOnly(pane.storageClass, ViewState.preview)
+        var work = PreviewAsk.workFor({ canRead: root.canRead, storageKnown: pane.storageKnown,
+            selectionCount: root.selectionCount, index: root.loadedIndex,
+            rowT: current ? !!current.t : false,
+            asked: pane.thumbState.file[root.loadedIndex] !== undefined,
+            storageClass: pane.storageClass, preview: ViewState.preview })
+        if (!work) return
+        root.thumbsApplied(work)
+        pane.backend.thumb(work.ask, work.cacheOnly)
+    }
+
+    // Idle press asks the cursor thumb before the capture, so load's own ask sends nothing twice.
+    function askCursorThumb() {
+        if (!ViewState.previewAutomatic || !ViewState.previewColumn) return
+        var pane = root.pane
+        if (!pane) return
+        var current = pane.rowFor(pane.cursorIndex)
+        if (!Columns.isFileRow(current)) return
+        var key = root.swapKey()
+        var work = PreviewAsk.earlyWorkFor({ now: Date.now(), lastMoveAt: root.lastMoveAt,
+            interval: settle.interval, key: key, lastMoveKey: root.lastMoveKey,
+            armed: settle.running && root.settleKey === key, canRead: root.canRead,
+            storageKnown: pane.storageKnown, selectionCount: pane.selectionCount(),
+            index: pane.cursorIndex, rowT: !!current.t,
+            asked: pane.thumbState.file[pane.cursorIndex] !== undefined,
+            storageClass: pane.storageClass, preview: ViewState.preview })
+        if (!work) return
         root.thumbsApplied(work)
         pane.backend.thumb(work.ask, work.cacheOnly)
     }

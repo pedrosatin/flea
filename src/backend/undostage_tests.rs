@@ -1,4 +1,4 @@
-// The staged file text is the old render byte for byte, and one batched rebase equals one rebase per pair.
+// The staged file text renders keys v, gen, undo, redo in that order, and one batched rebase equals one rebase per pair.
 use super::undocodec::encode;
 use super::undocost_tests::identity;
 use super::undorebase::RebaseMap;
@@ -49,14 +49,14 @@ fn path(text: &str) -> PathBuf {
 pub(super) fn fixture_doc() -> Doc {
     let plain = ItemIdentity::from_parts(1, 2, 0o100000, 3, (4, 5), (6, 7), None);
     let steps = vec![
-        Step::Moved { from: path("/a/one \"quoted\".txt"), to: path("/b/uni\u{e9}\u{4e2d}.txt"), before: identity(1, 1), after: identity(2, 1) },
+        Step::Moved { from: path("/a/one \"quoted\".txt"), to: path("/b/uni\u{e9}\u{4e2d}.txt"), before: identity(1, 1), after: identity(2, 1), rename_fat: false },
         Step::Created { path: path("/a/made") },
         Step::Linked { path: path("/a/link"), identity: plain.clone(), source: path("/a/one"), kind: LinkKind::Relative },
-        Step::Copied { from: path("/a/c"), to: path("/b/c"), source: identity(3, 1), created: plain.clone(), manifest: None, manifest_nonce: Some(7) },
+        Step::Copied { from: path("/a/c"), to: path("/b/c"), source: identity(3, 1), created: plain.clone(), manifest: None, manifest_nonce: Some(7), merge: false, rename_fat: false },
         Step::MadeDir { path: path("/a/dir"), identity: identity(4, 2) },
         Step::MadeFile { path: path("/a/file"), identity: plain.clone() },
-        Step::Trashed(crate::backend::trash::Entry { original: path("/a/gone"), uri: "trash:///gone\n2".to_string() }),
-        Step::Mode { path: path("/a/mode"), before: 0o644, after: 0o600, dev: 9, ino: 10, born: Some((11, 12)) },
+        Step::Trashed(crate::backend::trash::Entry { original: path("/a/gone"), uri: "trash:///gone\n2".to_string(), before: Vec::new(), trashed_at: String::new() }),
+        Step::Mode { path: path("/a/mode"), before: 0o644, after: 0o600, dev: 9, ino: 10, born: Some((11, 12)), generation: None },
     ];
     let replay = Replay::from_steps("copy".to_string(), vec![
         (steps[3].clone(), Some(identity(3, 1)), Some((path("/b"), identity(5, 1)))),
@@ -77,7 +77,9 @@ fn empty() -> Doc {
 fn the_staged_text_is_the_old_render_byte_for_byte() {
     let doc = fixture_doc();
     let staged = Staged::new(&doc);
-    assert_eq!(staged.text(), GOLDEN, "the journal file did not change a byte");
+    // The v2 to v3 bump moves the version line alone; every other byte stays pinned.
+    let want = GOLDEN.replacen("\"v\": 2", "\"v\": 3", 1);
+    assert_eq!(staged.text(), want, "the journal file did not change a byte");
     assert_eq!(staged.text(), render(&encode(&doc)));
     assert_eq!(staged.len(), GOLDEN.len() as u64, "the staged size is the written size");
     for doc in [empty(), Doc { undo: Vec::new(), redo: fixture_doc().redo, push_gen: 1 }, Doc { undo: fixture_doc().undo, redo: Vec::new(), push_gen: u64::MAX }] {
@@ -87,7 +89,7 @@ fn the_staged_text_is_the_old_render_byte_for_byte() {
     }
 }
 
-// The old loop: render the whole document on every turn and drop the oldest until it fits.
+// The reference trim: render the whole document on every turn and drop the oldest until it fits.
 fn old_trim(doc: &mut Doc, cap: u64) {
     while render(&encode(doc)).len() as u64 > cap {
         if doc.undo.len() > 1 { doc.undo.remove(0); } else if !doc.redo.is_empty() { doc.redo.remove(0); } else { break; }
@@ -110,7 +112,7 @@ fn trimming_by_piece_sizes_keeps_what_trimming_by_whole_renders_kept() {
         assert_eq!(staged.text(), render(&encode(&old)), "cap {}", cap);
         assert_eq!(staged.fits(cap), render(&encode(&old)).len() as u64 <= cap);
     }
-    assert_eq!(MAX_FILE_BYTES, MAX_FILE_MIB * 1024 * 1024, "the cap is the old one");
+    assert_eq!(MAX_FILE_BYTES, MAX_FILE_MIB * 1024 * 1024, "AGENTS.md documents the shared journal cap as 32 MiB");
 }
 
 // A small identity space, so moves collide and chain: a new identity is often the next move's old one.
@@ -127,8 +129,8 @@ fn small_identity(state: &mut u64) -> ItemIdentity {
 fn small_step(state: &mut u64) -> Step {
     let id = small_identity(state);
     match lcg(state) % STEP_KINDS {
-        0 => Step::Moved { from: path("/f"), to: path("/t"), before: id, after: small_identity(state) },
-        1 => Step::Copied { from: path("/f"), to: path("/t"), source: id, created: small_identity(state), manifest: None, manifest_nonce: None },
+        0 => Step::Moved { from: path("/f"), to: path("/t"), before: id, after: small_identity(state), rename_fat: false },
+        1 => Step::Copied { from: path("/f"), to: path("/t"), source: id, created: small_identity(state), manifest: None, manifest_nonce: None, merge: false, rename_fat: false },
         2 => Step::MadeFile { path: path("/m"), identity: id },
         3 => Step::MadeDir { path: path("/d"), identity: id },
         _ => Step::Linked { path: path("/l"), identity: id, source: path("/s"), kind: LinkKind::Hard },
@@ -165,9 +167,9 @@ fn one_batched_rebase_equals_one_rebase_per_pair() {
 }
 
 // A journal one version above this reader, empty: what a newer writer leaves.
-const NEWER_JOURNAL: &str = "{\"v\":3,\"undo\":[],\"redo\":[]}";
+const NEWER_JOURNAL: &str = "{\"v\":4,\"undo\":[],\"redo\":[]}";
 
-// A journal the reader ignores (here a symlink) still answers newer when its target is, as it did before the single read.
+// A journal the reader ignores (here a symlink) still answers newer when its target is.
 #[test]
 fn an_ignored_journal_that_a_newer_writer_owns_is_still_refused() {
     let sandbox = crate::backend::testdir::TestDir::new("ustage-newer-link");
@@ -183,4 +185,22 @@ fn an_ignored_journal_that_a_newer_writer_owns_is_still_refused() {
     assert!(journal.symlink_metadata().unwrap().file_type().is_symlink(), "the journal path is still the link");
     assert_eq!(std::fs::read_link(&journal).unwrap(), target, "the link still points at the newer file");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), NEWER_JOURNAL, "the newer file keeps its bytes");
+}
+
+#[test]
+fn a_journal_with_a_merge_step_is_written_past_v2() {
+    let id = identity(9, 1);
+    let step = Step::Copied { from: path("/a/trip"), to: path("/b/trip"), source: id.clone(), created: id,
+        manifest: None, manifest_nonce: None, merge: true, rename_fat: false };
+    let doc = super::undoshare::Doc { undo: vec![Entry { op: "copy".to_string(), steps: vec![step] }], redo: Vec::new(), push_gen: 0 };
+    let text = Staged::new(&doc).text();
+    let version: u64 = text.split("\"v\": ").nth(1).and_then(|rest| rest.split(',').next())
+        .and_then(|num| num.trim().parse().ok()).expect("the staged text carries a version");
+    assert_eq!(version, 3, "a merge step is written past v2: {text}");
+    assert!(version > 2, "a v2-only reader answers this file Newer");
+    assert!(matches!(super::undostage::read(&text), super::undostage::Read::Doc(_)), "this reader still reads it");
+    for old in [r#"{"v":1,"gen":0,"undo":[],"redo":[]}"#, r#"{"v":2,"gen":0,"undo":[],"redo":[]}"#] {
+        assert!(matches!(super::undostage::read(old), super::undostage::Read::Doc(_)), "a v1/v2 journal still reads: {old}");
+    }
+    assert!(matches!(super::undostage::read(NEWER_JOURNAL), super::undostage::Read::Newer), "one past this reader is Newer");
 }

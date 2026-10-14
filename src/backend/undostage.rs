@@ -14,7 +14,7 @@ pub(crate) enum Read {
     Malformed,
 }
 
-// Sample input: {"v":2,"gen":1,"undo":[],"redo":[]}
+// Sample input: {"v":3,"gen":1,"undo":[],"redo":[]}
 pub(crate) fn read(text: &str) -> Read {
     #[cfg(test)]
     super::undoprobe::decode();
@@ -22,8 +22,8 @@ pub(crate) fn read(text: &str) -> Read {
     let Some(pairs) = root.as_object() else { return Read::Malformed };
     match get(pairs, "v") {
         Some(Json::Num(literal)) if literal.parse::<u64>().is_ok_and(|v| v > VERSION as u64) => return Read::Newer,
-        // v1 files predate the barrier kind and still read; anything else is foreign.
-        Some(Json::Num(literal)) if literal == "1" || literal == &VERSION.to_string() => {}
+        // v1 files predate the barrier kind and v2 the merge kinds; both still read, anything else is foreign.
+        Some(Json::Num(literal)) if literal == "1" || literal == "2" || literal == &VERSION.to_string() => {}
         _ => return Read::Malformed,
     }
     match decode_pairs(pairs) {
@@ -111,7 +111,7 @@ fn write_list(out: &mut impl Write, pieces: &[String]) {
     let _ = write!(out, "\n{}]", INDENT);
 }
 
-// Same bytes as the old render of the whole tree: keys v, gen, undo, redo in that order, then one newline.
+// Renders keys v, gen, undo, redo in that order, then one newline.
 fn write_document(out: &mut impl Write, push_gen: u64, undo: &[String], redo: &[String]) {
     let _ = write!(out, "{{\n{}\"v\": {},\n{}\"gen\": {},\n{}\"undo\": ", INDENT, VERSION, INDENT, push_gen, INDENT);
     write_list(out, undo);

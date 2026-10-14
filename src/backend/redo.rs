@@ -28,9 +28,17 @@ fn error(path: &Path, message: &str) -> FleaError {
     FleaError { where_: "redo".into(), path: path.to_string_lossy().into(), msg: message.into() }
 }
 
+// Sample output: "1 item was left in place: a: no", or "2 items were left in place: a: no; b: no".
+pub(crate) fn left_in_place(skipped: &[String]) -> String {
+    match skipped {
+        [only] => format!("1 item was left in place: {only}"),
+        many => format!("{} items were left in place: {}", many.len(), many.join("; ")),
+    }
+}
+
 fn source(step: &Step) -> Option<&Path> {
     match step {
-        Step::Moved { from, .. } | Step::Copied { from, .. } => Some(from),
+        Step::Moved { from, .. } | Step::Copied { from, .. } | Step::Tags { path: from, .. } => Some(from),
         Step::Linked { source, .. } => Some(source),
         Step::Trashed(entry) => Some(&entry.original),
         _ => None,
@@ -41,7 +49,7 @@ fn destination(step: &Step) -> Option<&Path> {
     match step {
         Step::Moved { to, .. } | Step::Copied { to, .. } => Some(to),
         Step::Linked { path, .. } => Some(path),
-        Step::MadeDir { path, .. } | Step::MadeFile { path, .. } => Some(path),
+        Step::MadeDir { path, .. } | Step::MadeFile { path, .. } | Step::RemovedEmptyDir { path, .. } => Some(path),
         _ => None,
     }
 }
@@ -51,7 +59,7 @@ impl Replay {
         let mut steps = Vec::new();
         for step in entry.steps {
             if matches!(step, Step::Created { .. } | Step::Barrier) {
-                return Err(error(Path::new(""), "this interrupted operation has no recorded source to redo"));
+                return Err(error(Path::new(""), "this operation cannot be redone"));
             }
             let input = match &step {
                 Step::Copied { source, .. } => Some(source.clone()),
@@ -91,20 +99,23 @@ impl Replay {
     }
     fn check(saved: &ReplayStep, vacated: bool) -> Result<(), FleaError> {
         if let (Some(path), Some(identity)) = (source(&saved.step), &saved.input) {
-            if !path.is_absolute() || !identity.unchanged_for_move(&ItemIdentity::inspect(path)?) {
+            // A tag write moves the file's ctime, so a tag step is judged by the item alone and its replay compares the tags.
+            let judge: fn(&ItemIdentity, &ItemIdentity) -> bool = if matches!(saved.step, Step::Tags { .. }) { ItemIdentity::same_item } else { ItemIdentity::unchanged_for_move };
+            if !path.is_absolute() || !judge(identity, &ItemIdentity::inspect(path)?) {
                 return Err(error(path, "the original item changed or was replaced; redo left it in place"));
             }
         }
         if let Some((path, identity)) = &saved.parent {
             if !identity.same_item(&ItemIdentity::inspect(path)?) {
-                return Err(error(path, "the destination folder was replaced; redo was refused"));
+                return Err(error(path, "the destination folder was replaced, so nothing was redone"));
             }
         }
-        if let Some(path) = destination(&saved.step).filter(|_| !vacated) {
+        super::mergeapply::check_emptied(&saved.step)?;
+        if let Some(path) = destination(&saved.step).filter(|_| !vacated && !matches!(saved.step, Step::RemovedEmptyDir { .. })) {
             match path.symlink_metadata() {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(from_io("redo", &path.to_string_lossy(), &e)),
-                Ok(_) => return Err(error(path, "the destination already exists; redo never replaces it")),
+                Ok(_) => return Err(error(path, "an item with that name is already there, so redo left it in place")),
             }
         }
         Ok(())
@@ -128,7 +139,7 @@ impl Replay {
                 let before = entry.steps.len();
                 match apply(saved, id, index, cancel, tx, &mut entry.steps) {
                     Ok(()) => {}
-                    Err(e) if matches!(saved.step, Step::Mode { .. }) => {
+                    Err(e) if matches!(saved.step, Step::Mode { .. } | Step::Tags { .. }) => {
                         skipped.push(format!("{}: {}", e.path, e.msg));
                         continue;
                     }
@@ -148,7 +159,7 @@ impl Replay {
                 }
             }
             if !skipped.is_empty() {
-                return Err(error(Path::new(""), &format!("{} path(s) left in place: {}", skipped.len(), skipped.join("; "))));
+                return Err(error(Path::new(""), &left_in_place(&skipped)));
             }
             Ok(self.op.clone())
         })();
@@ -171,6 +182,7 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
                 }
             };
             let mut durability = super::durable::Durability::begin(to.parent().unwrap_or(to));
+            durability.rename_fat = matches!(saved.step, Step::Copied { rename_fat: true, .. } | Step::Moved { rename_fat: true, .. });
             let moving = matches!(saved.step, Step::Moved { .. });
             let mut progress = Progress { cancel, on_bytes: &mut sink, partial: None, tree: None, manifest: None, durability: Some(&mut durability), for_move: moving };
             let result = if moving { move_any(from, to, &mut progress) } else { copy_any(from, to, &mut progress) };
@@ -180,12 +192,16 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
                 // The bytes landed; only the folder confirmation can still fail, so the step stays journalled either way.
                 let step = if moving { undo::moved(from, to, identity) } else { undo::copied(from, to, identity) };
                 let flushed = durability.flush_dirs();
-                steps.push(step?);
+                let mut step = step?;
+                if durability.rename_fat { super::fatnames::mark_step(&mut step); }
+                steps.push(step);
                 if flushed.is_err() {
                     return Err(error(to, super::durable::DIR_UNCONFIRMED));
                 }
             } else if let Some(partial) = partial {
-                steps.push(undo::copied(from, &partial, identity)?);
+                let mut step = undo::copied(from, &partial, identity)?;
+                if durability.rename_fat { super::fatnames::mark_step(&mut step); }
+                steps.push(step);
             }
             result
         }
@@ -194,6 +210,7 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
             steps.push(Step::MadeDir { path: path.clone(), identity: ItemIdentity::inspect(path)? });
             Ok(())
         }
+        Step::RemovedEmptyDir { path, mode } => super::mergeapply::redo_emptied(path, *mode, steps),
         Step::MadeFile { path, .. } => {
             let parent = path.parent().ok_or_else(|| error(path, "the new file has no parent"))?;
             let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| error(path, "the filename cannot be represented"))?;
@@ -207,7 +224,8 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
             steps.push(Step::Trashed(trashed.remove(0)));
             Ok(())
         }
-        Step::Created { path } => Err(error(path, "this operation has no recorded replay source")),
+        Step::Tags { path, before, after, dev, ino, born, generation } => super::tagsundo::replay(path, before, after, (*dev, *ino), (*born, *generation), &saved.step, steps),
+        Step::Created { path } => Err(error(path, "this operation cannot be redone")),
         // A barrier never reaches a replay; refusing here keeps it from running as a file.
         Step::Barrier => Err(error(Path::new(""), "That operation was too large to undo.")),
         // A link replays through the same exclusive create, so a name taken
@@ -222,8 +240,8 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
                 kind: kind.clone(), identity: ItemIdentity::inspect(path)? });
             Ok(())
         }
-        Step::Mode { path, before, after, dev, ino, born } => {
-            super::permissions::chmod_pinned(path, *dev, *ino, *born, *before, *after)
+        Step::Mode { path, before, after, dev, ino, born, generation } => {
+            super::permissions::chmod_pinned(path, *dev, *ino, (*born, *generation), *before, *after)
                 .map_err(|msg| error(path, &msg))?;
             steps.push(saved.step.clone());
             Ok(())
@@ -232,166 +250,8 @@ fn apply(saved: &ReplayStep, id: usize, index: usize, cancel: &AtomicBool, tx: &
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::{ops, testdir::TestDir, undo::Journal};
-    use std::sync::mpsc::channel;
-
-    fn guard(sandbox: &TestDir, paths: &[&Path]) {
-        for path in paths {
-            assert!(!path.as_os_str().is_empty() && path.is_absolute() && path.starts_with(sandbox.path()));
-        }
-        assert!(sandbox.path().join(".flea-test-sandbox").is_file());
-    }
-    // Before Linux 6.13 ctime ticks every few milliseconds, so the rewrite repeats until the filesystem records it.
-    fn rewrite_until_recorded(path: &Path, payload: &str) {
-        const TRIES: u32 = 1_000_000;
-        let before = ItemIdentity::inspect(path).unwrap();
-        for _ in 0..TRIES {
-            std::fs::write(path, payload).unwrap();
-            if !before.unchanged_for_move(&ItemIdentity::inspect(path).unwrap()) {
-                return;
-            }
-        }
-        panic!("{} kept its ctime across {} rewrites", path.display(), TRIES);
-    }
-    fn redo(journal: &mut Journal) -> Result<String, FleaError> {
-        let (tx, _rx) = channel();
-        journal.redo(1, &AtomicBool::new(false), &tx)
-    }
-
-    #[test]
-    fn redo_classifies_the_existing_parent_not_the_missing_name() {
-        let sandbox = TestDir::new("redo-parent");
-        let original = sandbox.file("original", "payload");
-        let (result, steps) = ops::duplicate(&original);
-        let copy = result.unwrap();
-        let mut journal = Journal::new();
-        journal.push(Entry { op: "duplicate".into(), steps });
-        assert_eq!(journal.undo().unwrap(), "duplicate");
-        assert!(!copy.exists());
-        // Only the missing name is marked, so probing it answers durable and probing its parent does not.
-        crate::backend::durable::test_reset();
-        crate::backend::durable::test_mark_durable(&copy);
-        crate::backend::durable::test_set_fail_dirs(true);
-        let redone = redo(&mut journal);
-        crate::backend::durable::test_set_fail_dirs(false);
-        crate::backend::durable::test_reset();
-        assert!(redone.is_ok(), "the parent was classified, so no folder flush ran to fail: {:?}", redone.err().map(|e| e.msg));
-    }
-
-    #[test]
-    fn copy_rename_chain_survives_two_complete_undo_redo_cycles() {
-        let sandbox = TestDir::new("redo-chain");
-        let original = sandbox.file("original", "keep this payload");
-        let (result, steps) = ops::duplicate(&original);
-        let copy = result.unwrap();
-        let mut journal = Journal::new();
-        journal.push(Entry { op: "duplicate".into(), steps });
-        let (renamed, steps) = ops::rename(&copy, "renamed").unwrap();
-        journal.push(Entry { op: "rename".into(), steps });
-        for _ in 0..2 {
-            guard(&sandbox, &[&original, &copy, &renamed]);
-            assert_eq!(journal.undo().unwrap(), "rename");
-            guard(&sandbox, &[&original, &copy, &renamed]);
-            assert_eq!(journal.undo().unwrap(), "duplicate");
-            assert!(!copy.exists() && !renamed.exists());
-            assert_eq!(redo(&mut journal).unwrap(), "duplicate");
-            assert_eq!(redo(&mut journal).unwrap(), "rename");
-            assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "keep this payload");
-            assert_eq!(std::fs::read_to_string(&original).unwrap(), "keep this payload");
-        }
-    }
-
-    #[test]
-    fn recreated_parent_rebinds_child_destination_without_accepting_a_foreign_parent() {
-        let sandbox = TestDir::new("redo-parent");
-        let mut journal = Journal::new();
-        let (parent, steps) = ops::mkdir(sandbox.path(), "parent").unwrap();
-        journal.push(Entry { op: "mkdir".into(), steps });
-        let (child, steps) = ops::mkdir(&parent, "child").unwrap();
-        journal.push(Entry { op: "mkdir".into(), steps });
-        guard(&sandbox, &[&parent, &child]);
-        journal.undo().unwrap();
-        guard(&sandbox, &[&parent, &child]);
-        journal.undo().unwrap();
-        redo(&mut journal).unwrap();
-        redo(&mut journal).unwrap();
-        assert!(child.is_dir());
-        guard(&sandbox, &[&parent, &child]);
-        journal.undo().unwrap();
-        let moved = sandbox.join("old-parent");
-        guard(&sandbox, &[&parent, &moved]);
-        std::fs::rename(&parent, &moved).unwrap();
-        std::fs::create_dir(&parent).unwrap();
-        assert!(redo(&mut journal).unwrap_err().msg.contains("replaced"));
-        assert!(!child.exists());
-    }
-
-    #[test]
-    fn redo_refuses_changed_sources_and_destination_collisions() {
-        let sandbox = TestDir::new("redo-refusal");
-        let original = sandbox.file("original", "before");
-        let (result, steps) = ops::duplicate(&original);
-        let copy = result.unwrap();
-        let mut journal = Journal::new();
-        journal.push(Entry { op: "duplicate".into(), steps });
-        guard(&sandbox, &[&original, &copy]);
-        journal.undo().unwrap();
-        rewrite_until_recorded(&original, "changed payload");
-        assert!(redo(&mut journal).unwrap_err().msg.contains("changed"));
-        assert!(!copy.exists());
-        let (result, steps) = ops::duplicate(&original);
-        let copy = result.unwrap();
-        journal.push(Entry { op: "duplicate".into(), steps });
-        guard(&sandbox, &[&original, &copy]);
-        journal.undo().unwrap();
-        std::fs::write(&copy, "foreign destination").unwrap();
-        assert!(redo(&mut journal).unwrap_err().msg.contains("already exists"));
-        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "foreign destination");
-    }
-
-    #[test]
-    fn a_cancel_before_redo_starts_is_answered_before_any_step_is_checked() {
-        let sandbox = TestDir::new("redo-cancel");
-        let original = sandbox.file("original", "payload");
-        let (result, steps) = ops::duplicate(&original);
-        let copy = result.unwrap();
-        let mut journal = Journal::new();
-        journal.push(Entry { op: "duplicate".into(), steps });
-        guard(&sandbox, &[&original, &copy]);
-        journal.undo().unwrap();
-        std::fs::write(&copy, "foreign destination").unwrap();
-        let (tx, _rx) = channel();
-        assert_eq!(journal.redo(1, &AtomicBool::new(true), &tx).unwrap_err().msg, "redo cancelled", "the check never ran past the cancel");
-        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "foreign destination");
-    }
-
-    #[test]
-    fn new_file_is_recreated_but_changed_or_replaced_files_survive_undo() {
-        let sandbox = TestDir::new("redo-newfile");
-        let (path, identity) = super::super::menu_actions::create_file(sandbox.path(), "new").unwrap();
-        let mut journal = Journal::new();
-        journal.push(Entry { op: "newfile".into(), steps: vec![Step::MadeFile { path: path.clone(), identity }] });
-        guard(&sandbox, &[&path]);
-        journal.undo().unwrap();
-        redo(&mut journal).unwrap();
-        assert_eq!(path.metadata().unwrap().len(), 0);
-        std::fs::write(&path, "user content").unwrap();
-        guard(&sandbox, &[&path]);
-        assert!(journal.undo().unwrap_err().msg.contains("changed"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user content");
-        let (empty, identity) = super::super::menu_actions::create_file(sandbox.path(), "empty").unwrap();
-        journal.push(Entry { op: "newfile".into(), steps: vec![Step::MadeFile { path: empty.clone(), identity }] });
-        let saved = sandbox.join("saved");
-        guard(&sandbox, &[&empty, &saved]);
-        std::fs::rename(&empty, &saved).unwrap();
-        std::fs::write(&empty, "replacement").unwrap();
-        guard(&sandbox, &[&empty, &saved]);
-        assert!(journal.undo().is_err());
-        assert_eq!(std::fs::read_to_string(empty).unwrap(), "replacement");
-    }
-}
+#[path = "redo_tests.rs"]
+mod tests;
 
 #[cfg(test)]
 #[path = "redo_birth_tests.rs"]

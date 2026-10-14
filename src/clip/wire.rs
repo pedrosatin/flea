@@ -11,14 +11,17 @@ pub const ZWLR_MANAGER: &str = "zwlr_data_control_manager_v1";
 
 // Where the compositor listens: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY, or WAYLAND_DISPLAY as is.
 pub fn socket_path() -> Result<PathBuf, String> {
-    let display = std::env::var_os("WAYLAND_DISPLAY")
-        .ok_or_else(|| "WAYLAND_DISPLAY is not set, so there is no clipboard to use".to_string())?;
+    socket_path_in(std::env::var_os("WAYLAND_DISPLAY"), std::env::var_os("XDG_RUNTIME_DIR"))
+}
+
+// Split so a test names both values without writing this process's environment.
+pub(crate) fn socket_path_in(display: Option<std::ffi::OsString>, runtime: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    let display = display.ok_or_else(|| "WAYLAND_DISPLAY is not set, so there is no clipboard to use".to_string())?;
     let display = PathBuf::from(display);
     if display.is_absolute() {
         return Ok(display);
     }
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .ok_or_else(|| "XDG_RUNTIME_DIR is not set, so the display socket cannot be found".to_string())?;
+    let dir = runtime.ok_or_else(|| "XDG_RUNTIME_DIR is not set, so the display socket cannot be found".to_string())?;
     Ok(PathBuf::from(dir).join(display))
 }
 
@@ -34,12 +37,6 @@ pub fn put_string(out: &mut Vec<u8>, s: &str) {
     while out.len() % 4 != 0 {
         out.push(0);
     }
-}
-
-// A null string is a zero length and no bytes at all.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn put_null_string(out: &mut Vec<u8>) {
-    put_u32(out, 0);
 }
 
 // One request: the 8-byte header ahead of the payload, host byte order.
@@ -75,7 +72,7 @@ pub fn get_string(body: &[u8], at: &mut usize) -> Option<String> {
 }
 
 // The largest message accepted; a lying size would otherwise grow the buffer waiting for bytes that never come.
-pub const MAX_MESSAGE: usize = 64 * 1024 * 1024;
+const MAX_MESSAGE: usize = 64 * 1024 * 1024;
 // The header holds the object id plus the size and opcode word.
 const HEADER_BYTES: usize = 8;
 
@@ -99,6 +96,17 @@ extern "C" {
     fn poll(fds: *mut PollFd, nfds: usize, timeout: c_int) -> c_int;
 }
 
+// One file descriptor waited on for input; the caller names a refusal after its own wait.
+pub(super) fn poll_in(fd: RawFd, timeout_ms: u32) -> std::io::Result<bool> {
+    let mut p = PollFd { fd, events: POLLIN, revents: 0 };
+    // WAIT_FOREVER arrives here as -1, which is poll's own infinite wait.
+    let n = unsafe { poll(&mut p, 1, timeout_ms as c_int) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(n > 0)
+}
+
 // What one fill saw: bytes, the poll deadline, or the peer's orderly end.
 enum Fill { Data, Timeout, Eof }
 
@@ -112,6 +120,14 @@ pub struct Conn {
 impl Conn {
     pub fn connect() -> Result<Conn, String> {
         Self::connect_to(&socket_path()?)
+    }
+
+    // Production passes None; a test names the fake compositor's socket.
+    pub fn open(socket: Option<&std::path::Path>) -> Result<Conn, String> {
+        match socket {
+            Some(path) => Conn::connect_to(path),
+            None => Conn::connect(),
+        }
     }
 
     pub fn connect_to(path: &std::path::Path) -> Result<Conn, String> {
@@ -135,12 +151,8 @@ impl Conn {
     }
 
     fn readable(&mut self, timeout_ms: u32) -> Result<bool, String> {
-        let mut p = PollFd { fd: self.sock.as_raw_fd(), events: POLLIN, revents: 0 };
-        let n = unsafe { poll(&mut p, 1, timeout_ms as c_int) };
-        if n < 0 {
-            return Err(format!("waiting for the compositor failed ({})", std::io::Error::last_os_error()));
-        }
-        Ok(n > 0)
+        poll_in(self.sock.as_raw_fd(), timeout_ms)
+            .map_err(|e| format!("the compositor did not answer ({})", e))
     }
 
     fn fill(&mut self, timeout_ms: u32) -> Result<Fill, String> {

@@ -3,12 +3,14 @@ import qs.Commons
 import "." as Flea
 import "js/Facts.js" as Facts
 import "js/Kinds.js" as Kinds
+import "js/Search.js" as Search
 import "js/Thumbs.js" as Thumbs
 import "js/ExtThumbs.js" as ExtThumbs
 import "js/MarkdownPrepared.js" as Prepared
 import "js/Motion.js" as Motion
 import "js/PreviewSettle.js" as PreviewSettle
 import "js/PreviewSwap.js" as PreviewSwap
+import "js/Swap.js" as Swap
 
 // The overlay lives inside the Flea window, Finder's Quick Look shape: a second window breaks omarchy-drive focus flea and every test that narrows on it.
 Item {
@@ -60,10 +62,10 @@ Item {
     function mediaLoaded() { return mediaLoader.item !== null }
     function textShown() { return root.isMarkdown
         ? (markdownLoader.item ? markdownLoader.item.rawText : "") : textPane.shownText() }
-    function markdownView() { return root.active && root.isMarkdown && markdownLoader.item ? markdownLoader.item.shownView : "" }
-    function markdownCloseState() { return JSON.stringify(root.active && root.isMarkdown && markdownLoader.item ? markdownLoader.item.closeState() : {}) }
-    function markdownEndGap() { return root.active && root.isMarkdown && markdownLoader.item ? markdownLoader.item.endGap() : -1 }
-    function markdownScrollY() { return root.active && root.isMarkdown && markdownLoader.item ? Math.round(markdownLoader.item.scrollY) : -1 }
+    function markdownView() { return root.markdownShown ? root.markdownShown.shownView : "" }
+    function markdownCloseState() { return JSON.stringify(root.markdownShown ? root.markdownShown.closeState() : {}) }
+    function markdownEndGap() { return root.markdownShown ? root.markdownShown.endGap() : -1 }
+    function markdownScrollY() { return root.markdownShown ? Math.round(root.markdownShown.scrollY) : -1 }
     function archiveNames() { return root.archiveMeta && root.archiveMeta.names ? root.archiveMeta.names.map(function (e) { return e.n }).join("|") : "" }
     readonly property bool pdfExpanded: root.isPdf && pdfLoader.item !== null && pdfLoader.item.expanded
     // The PDF surface, null with no document loaded: ui/Ipc.qml answers "" for that, so an unmeasured state never reads as a value.
@@ -75,6 +77,7 @@ Item {
     readonly property bool muted: Flea.MediaSound.muted
     // fleaWindow.itemRect needs the real Item, the same seam rowCentre already reads through pane.
     readonly property var seekSlider: mediaStrip.seekItem
+    readonly property var volumeSlider: mediaStrip.volumeItem
     readonly property string status: {
         if (!root.active) return ""
         // A fresh media item still carries its empty path until onLoaded binds it; its
@@ -111,6 +114,14 @@ Item {
     property int imageRow: -1
     // One meta ask per show; onRowsChanged never re-asks behind it.
     property bool imageAsked: false
+    // The row whose thumbnail may stand in for an image that cannot decode and had none at open, -1 when none is owed; the sentence waits while it is set.
+    property int thumbRow: -1
+    // One thumbnail ask per show, sent only once the final decode has failed.
+    property bool thumbAsked: false
+    // A listing started while the thumbnail is owed, so its map and row indices are the old listing's.
+    property bool thumbRelist: false
+    readonly property bool imageUndecodable: root.isImage && imageLoader.item !== null && imageLoader.item.pictureFailed
+    onImageUndecodableChanged: root.settleThumb()
     function swapState() {
         if (root.swap) return root.swap.describe()
         return { holding: false, capturing: false, fellBack: false, holds: 0, fallbacks: 0,
@@ -121,6 +132,8 @@ Item {
     readonly property bool swapBuilt: swapLoader.active
     // The memory suite asserts both Markdown loader items are null without a Markdown file.
     readonly property var markdownItem: markdownLoader.item
+    // The open Markdown document, null unless Quick Look shows one; the guarded readers share this null.
+    readonly property var markdownShown: root.active && root.isMarkdown ? markdownLoader.item : null
     // Exposes the eager panes for the live swap gate, so it can pin the wiring.
     readonly property var panesItem: panes
     // Synchronous: a local source: URL answers item on the same call that sets active.
@@ -144,6 +157,94 @@ Item {
     readonly property int followSettleMs: 120
     // The same dim ui/SettingsPanel.qml lays over the listing.
     readonly property real groundOpacity: 0.5
+    // The card and dim open once the content can draw, or early over the loading state, so no frame shows an empty card.
+    readonly property bool revealed: root.landed || root.revealedEarly
+    // Set by the cap, or by a press or the wheel during the hold.
+    property bool revealedEarly: false
+    // When the early loading state first drew, 0 while none stands; content replaces it only after Swap.MIN_SHOW_MS.
+    property double loadingSince: 0
+    // True once this open's content first drew; later moves are the swap's to count.
+    property bool landed: false
+    readonly property bool revealedOpen: root.active && root.revealed
+    // The hold: the card and dim draw nothing, a reopen inside the close fade included, and a move takes no picture.
+    readonly property bool unrevealed: root.active && !root.revealed
+    // An early reveal shows the loading state at once, for every kind, until this open's content lands.
+    readonly property bool loadingEarly: root.revealedEarly && !root.landed
+    // Frames drawn with the card showing during the hold; tests/ui.sh lookopen and tests/quicklook-hold.sh read them.
+    property int lookEmptyFrames: 0
+    property int revealCaps: 0
+    // The cap's start stamp and the sequence number of show()'s return, ordered by openSeq so tests/quicklook-firstkind.qml reads arm-before-show or after with no clock.
+    property var revealCapStart: null
+    property int openSeq: 0
+    property int shownSeq: 0
+    // The kinds whose Loader item this window has built once, so a repeat of one is a warm open.
+    property var builtKinds: ({})
+    function openState() {
+        return { revealed: root.revealed, revealedEarly: root.revealedEarly, landed: root.landed, lookEmptyFrames: root.lookEmptyFrames, revealCaps: root.revealCaps, revealCapStart: root.revealCapStart, shownSeq: root.shownSeq }
+    }
+    // A move still settling lands nothing, and followSettle reruns this once it stops, so what reveals is the cursor's own file.
+    // Past the cap, content that is ready waits out the loading state's minimum, so it never blinks for under 100 ms.
+    function revealIfReady() {
+        if (!root.active || !root.lookReady || followSettle.running)
+            return
+        var left = root.loadingEarly ? Swap.showLeft(root.loadingSince, Date.now()) : 0
+        if (left > 0) {
+            minShow.interval = left
+            minShow.restart()
+        } else {
+            root.landed = true
+        }
+    }
+    function showEarly() {
+        root.loadingSince = Date.now()
+        root.revealedEarly = true
+    }
+    function revealNow() {
+        root.revealIfReady()
+        if (root.unrevealed)
+            root.showEarly()
+    }
+    // The ready test runs after the open's own turn, because lookReady still reads the closed overlay inside this handler.
+    onActiveChanged: {
+        root.revealedEarly = false
+        root.loadingSince = 0
+        root.landed = false
+        minShow.stop()
+        if (!root.active)
+            revealCap.stop()
+        else
+            Qt.callLater(root.revealIfReady)
+    }
+    onLookReadyChanged: root.revealIfReady()
+    // Armed by load(): before show() for a warm kind, after it for a kind's first build, beside the swap's own cap.
+    Timer {
+        id: revealCap
+        objectName: "revealCap"
+        repeat: false
+        onTriggered: {
+            if (!root.unrevealed)
+                return
+            root.revealCaps += 1
+            root.showEarly()
+        }
+    }
+    // The early loading state has stood its minimum, so ready content lands now.
+    Timer {
+        id: minShow
+        repeat: false
+        onTriggered: root.revealIfReady()
+    }
+    // afterAnimating runs just before each frame is synchronised, so it sees a frame that draws the card or dim with neither content nor the loading state.
+    Connections {
+        target: root.active && !root.landed && !root.loadingEarly && (surface.opacity > 0 || lookDim.opacity > 0) ? root.Window.window : null
+        function onAfterAnimating() { root.lookEmptyFrames += 1 }
+    }
+    // One fade for the card and dim, so the hold can cut a close fade still running.
+    property real fade: root.revealedOpen ? 1 : 0
+    Behavior on fade {
+        enabled: !Theme.reducedMotion
+        NumberAnimation { duration: root.active ? Motion.durMs.open : Motion.durMs.close; easing.type: Easing.OutCubic }
+    }
 
     // Read through to PreviewMedia so this file never imports QtMultimedia, and 0 before the loader has an item.
     readonly property int position: (root.isMedia && mediaLoader.item) ? mediaLoader.item.position : 0
@@ -152,7 +253,7 @@ Item {
     // Shown on open, hidden stripHideMs after the last reveal, video only: audio has nothing else to look at.
     property bool stripShown: true
     // StatusBar.messageMs, the OEM's own transient interval, which Sidebar's unmount arm reuses for the same reason.
-    readonly property int stripHideMs: 4000
+    property int stripHideMs: 4000
 
     function revealStrip() {
         root.stripShown = true
@@ -175,7 +276,8 @@ Item {
     // The PDF viewer's three actions come through this file, so ui/js/Focus.js never learns a Loader item answers them.
     function turnPage(delta) { if (root.isPdf && pdfLoader.item) pdfLoader.item.turn(delta) }
 
-    function zoomBy(steps) { if (root.isPdf && pdfLoader.item) pdfLoader.item.zoomBy(steps) }
+    function zoomBy(steps) { if (root.isPdf && pdfLoader.item) pdfLoader.item.zoomBy(steps); else if (root.isImage && imageLoader.item) imageLoader.item.zoomBy(steps) }
+    function zoomFit() { if (root.isImage && imageLoader.item) imageLoader.item.zoomFit() }
 
     function toggleExpand() { if (root.isPdf && pdfLoader.item) pdfLoader.item.toggleExpand() }
 
@@ -192,7 +294,7 @@ Item {
         if (document) document.scrollBy(direction * (isPage ? (root.isMarkdown ? document.viewportHeight : document.height) / 2 : Theme.font.body))
     }
 
-    // GM 2026-10-03: a Markdown Quick Look opens rendered, and r flips only the open one (no stored choice).
+    // Decided 2026-10-03: a Markdown Quick Look opens rendered, and r flips only the open one (no stored choice).
     function toggleMarkdownView() {
         if (root.isMarkdown) root.markdownSource = !root.markdownSource
     }
@@ -205,10 +307,10 @@ Item {
     function follow(newPath, newIcon, newSize, newKind, newThumb) {
         var key = newPath + "\n" + newIcon + "\n" + newSize + "\n" + newKind
         // Pending covers a repeat; a settled revisit of the shown target stays put, anything else reloads.
-        if (key === root.lastMoveKey && followSettle.running) return
-        if (key === root.lastMoveKey && root.isShown(newPath, newIcon, newSize, newKind)) return
         var now = Date.now()
-        var idle = PreviewSettle.due(now, root.lastMoveAt, root.followSettleMs)
+        var decision = PreviewSettle.plan(now, root.lastMoveAt, root.followSettleMs, key, root.lastMoveKey, followSettle.running)
+        if (decision === "same") return
+        if (key === root.lastMoveKey && root.isShown(newPath, newIcon, newSize, newKind)) return
         root.lastMoveKey = key
         root.lastMoveAt = now
         root.pendingPath = newPath
@@ -217,12 +319,13 @@ Item {
         root.pendingKind = newKind
         root.pendingThumb = newThumb || ""
         root.pendingImageRow = root.pane ? root.pane.cursorIndex : -1
-        if (root.active) {
+        // During the hold a move takes no picture, and a burst still trails so it asks nothing per row.
+        if (root.revealedOpen) {
             var held = root.ensureSwap()
             if (held)
                 held.hold(null, newPath)
         }
-        if (idle) {
+        if (decision === "now") {
             followSettle.stop()
             root.load(newPath, newIcon, newSize, newKind, newThumb, root.pendingImageRow)
         } else {
@@ -239,6 +342,7 @@ Item {
     // Dropping the loader's source is what stops playback: media dies with the loader.
     function close() {
         if (root.swap) root.swap.cancel()
+        root.revealCapStart = null
         followSettle.stop()
         root.lastMoveKey = ""
         root.pendingThumb = ""
@@ -250,6 +354,9 @@ Item {
         root.imageOrient = 1
         root.imageRow = -1
         root.imageAsked = false
+        root.thumbRow = -1
+        root.thumbAsked = false
+        root.thumbRelist = false
         stripHideTimer.stop()
         root.active = false
         root.kind = ""
@@ -266,14 +373,23 @@ Item {
         if (root.pane) root.pane.listArea.forceActiveFocus()
     }
 
-    // Under the held picture when a move took one; Space's own open has none and draws as it builds.
+    // Under the held picture when a move took one; Space's own open has none and reveals once its content can draw.
     // The swap starts after its mutation: show runs at once or waits for the capture, start runs with it.
     function load(newPath, newIcon, newSize, newKind, newThumb, newRow) {
         var isPdf = Kinds.quickLookKind(newIcon, newPath) === Kinds.PDF
         var swapItem = root.ensureSwap()
         var show = function () {
+            // A warm kind counts from the key, before show() builds the Loader items; a kind's first build (a PDF's compile above all) is outside the cap, which starts once show() returns; a move during the hold keeps the open's deadline.
+            var kindKey = root.kindFor(newPath, newIcon, newThumb, newRow)
+            var arm = (!root.active || !root.revealed) && !revealCap.running
+            var warm = root.builtKinds[kindKey] === true
+            if (arm && warm) root.armRevealCap(isPdf)
             root.show(newPath, newIcon, newSize, newKind, newThumb, newRow)
             if (swapItem) swapItem.start(isPdf)
+            root.shownSeq = ++root.openSeq
+            root.builtKinds[kindKey] = true
+            if (arm && !warm) root.armRevealCap(isPdf)
+            else if (!arm && !revealCap.running) root.revealCapStart = null
         }
         if (swapItem && (swapItem.holding || swapItem.capturing))
             swapItem.hold(show, newPath, true)
@@ -281,11 +397,28 @@ Item {
             show()
     }
 
+    // The row at index while its name under the listing's base is path, else null: how this file identifies a row.
+    function namedRow(index, path) {
+        if (!root.pane || index < 0) return null
+        var row = root.pane.rowFor(index)
+        return row !== null && root.pane.join(Search.baseOf(root.pane), row.n) === path ? row : null
+    }
+
+    function kindFor(newPath, newIcon, newThumb, newRow) {
+        var row = root.namedRow(newRow, newPath)
+        return Kinds.quickLookKind(newIcon, newPath, (row !== null && row.t === true) || (newThumb || "").length > 0)
+    }
+
+    function armRevealCap(isPdf) {
+        revealCap.interval = PreviewSwap.capMs(isPdf)
+        revealCap.start()
+        root.revealCapStart = { seq: ++root.openSeq }
+    }
+
     function show(newPath, newIcon, newSize, newKind, newThumb, newRow) {
-        var row = root.pane ? root.pane.rowFor(newRow) : null
-        var named = row && root.pane.join(root.pane.path, row.n) === newPath
-        root.inlineMarkdownPath = named && Prepared.readsInline(row, root.pane.storageClass, root.pane.storageKnown) ? newPath : ""
-        root.kind = Kinds.quickLookKind(newIcon, newPath)
+        var row = root.namedRow(newRow, newPath)
+        root.inlineMarkdownPath = row !== null && Prepared.readsInline(row, root.pane.storageClass, root.pane.storageKnown) ? newPath : ""
+        root.kind = root.kindFor(newPath, newIcon, newThumb, newRow)
         // A pane of another kind goes before the path moves, or it tries to open a file it cannot draw: an image
         // pane handed a video logged "Unsupported image format" on every move from a picture to a clip.
         if (!root.isMedia) mediaLoader.source = ""
@@ -300,7 +433,10 @@ Item {
         root.imageH = 0
         root.imageOrient = 1
         root.imageAsked = false
+        root.thumbAsked = false
+        root.thumbRelist = false
         root.path = newPath
+        root.thumbRow = root.thumbOwed(newRow)
         root.iconName = newIcon
         root.size = newSize
         // MediaPdf rule 6: the overlay is the bigger surface, so it says at least what the column says, and the kind is the caller's because the backend named it for that row.
@@ -319,15 +455,21 @@ Item {
     // Bounded prefetch: the next row's cache entry only, once per rest, never a decode and never a meta.
     function maybePrefetch() {
         if (!root.active || !root.pane || followSettle.running) return
-        if (!ViewState.previewAutomatic || root.pane.listInFlight || !root.pane.storageKnown) return
-        if (ExtThumbs.manualHold(root.pane.storageClass, ViewState.preview)) return
+        if (!ViewState.previewAutomatic) return
         var next = root.pane.cursorIndex + 1
         if (root.pane.thumbState.file[next] !== undefined) return
         var row = root.pane.rowFor(next)
-        if (!row || row.d || row.t !== true || !Thumbs.allowed(row, ViewState.thumbnailMode)) return
+        if (!row || row.d || row.t !== true || !root.thumbClear(row)) return
         var work = { ask: [next], drop: [], cacheOnly: true }
         root.pane.thumbState = Thumbs.applied(root.pane.thumbState, work)
         root.pane.backend.thumb(work.ask, true)
+    }
+
+    // Whether a thumbnail ask may go out for this row here: the listing settled, the class known, no manual hold, and the row allowed.
+    function thumbClear(row) {
+        if (!root.pane || root.pane.listInFlight || !root.pane.storageKnown) return false
+        if (ExtThumbs.manualHold(root.pane.storageClass, ViewState.preview)) return false
+        return Thumbs.allowed(row, ViewState.thumbnailMode)
     }
 
     // One row, only while an archive is the thing open: the same no-sweep rule the column follows.
@@ -359,12 +501,8 @@ Item {
         root.pane.backend.askMeta(root.imageRow, false, false, false)
     }
 
-    // The row at imageRow still names the shown file: its name under the pane's path is
-    // the path this show opened, the way the rest of this file identifies a row.
     function imageRowShown() {
-        if (!root.pane || root.imageRow < 0) return false
-        var row = root.pane.rowFor(root.imageRow)
-        return row !== null && root.pane.join(root.pane.path, row.n) === root.path
+        return root.namedRow(root.imageRow, root.path) !== null
     }
 
     // The captured index drifted onto another file: take the cursor when it names the
@@ -372,11 +510,49 @@ Item {
     function resolveImageRow() {
         if (root.imageRowShown()) return
         var at = root.pane ? root.pane.cursorIndex : -1
-        var row = root.pane && at >= 0 ? root.pane.rowFor(at) : null
-        if (row !== null && root.pane.join(root.pane.path, row.n) === root.path)
-            root.imageRow = at
-        else
-            root.imageRow = -1
+        root.imageRow = root.namedRow(at, root.path) !== null ? at : -1
+    }
+
+    // A re-list clears the owed row's entry: take the cursor when it names the shown file, else drop the owed thumbnail with no ask.
+    function resolveThumbRow() {
+        if (root.namedRow(root.thumbRow, root.path) !== null) return
+        var at = root.pane ? root.pane.cursorIndex : -1
+        root.thumbRow = root.namedRow(at, root.path) !== null ? at : -1
+    }
+
+    // The row whose thumbnail may stand in if this image cannot decode: only with none held, clear to ask, and not refused.
+    function thumbOwed(newRow) {
+        if (!root.isImage || root.interimThumb.length > 0) return -1
+        var at = newRow !== undefined ? newRow : -1
+        if (!root.thumbClear(root.namedRow(at, root.path)) || Thumbs.refused(root.pane.thumbState, at)) return -1
+        return at
+    }
+
+    // After a failed final decode: ask the one row's thumbnail, then bind its reply to the shown file; a refusal or a forgotten ask ends on the sentence.
+    function settleThumb() {
+        if (root.thumbRow < 0 || !root.imageUndecodable || root.pane.listInFlight) return
+        // A re-list cleared the map under the owed row: find the shown file again and ask once on the new listing, or end on the sentence when it is gone.
+        if (root.thumbRelist) {
+            root.thumbRelist = false
+            root.resolveThumbRow()
+            root.thumbAsked = false
+            if (root.thumbRow < 0) return
+        }
+        // An insert or a re-sort since the capture moves another file to the index, so the row must still name the shown file.
+        var at = root.namedRow(root.thumbRow, root.path) !== null ? root.thumbRow : -1
+        var state = root.pane.thumbState
+        var file = at >= 0 ? Thumbs.fileFor(state, at) : ""
+        // Nothing more is owed once a name landed, the row was refused, or our own ask was forgotten.
+        if (at < 0 || file.length > 0 || Thumbs.refused(state, at) || (root.thumbAsked && state.file[at] === undefined)) {
+            if (file.length > 0) root.interimThumb = file
+            root.thumbRow = -1
+            return
+        }
+        if (root.thumbAsked || Thumbs.pending(state.file[at])) return
+        root.thumbAsked = true
+        var work = { ask: [at], drop: [], cacheOnly: false }
+        root.pane.thumbState = Thumbs.applied(state, work)
+        root.pane.backend.thumb(work.ask, false)
     }
 
     Connections {
@@ -402,6 +578,13 @@ Item {
             if (root.active && root.isMedia && root.mediaRate === 0) root.askMedia()
             if (root.active && root.isImage && root.imageW === 0) root.askImage()
         }
+        // The cursor and the rows are final once the listing lands, so an owed row is found again there.
+        function onListInFlightChanged() {
+            if (!root.pane) return
+            if (root.pane.listInFlight) root.thumbRelist = root.thumbRelist || root.thumbRow >= 0
+            else root.settleThumb()
+        }
+        function onThumbStateChanged() { root.settleThumb() }
     }
 
     Timer {
@@ -409,13 +592,18 @@ Item {
         interval: root.followSettleMs
         repeat: false
         onTriggered: root.load(root.pendingPath, root.pendingIcon, root.pendingSize, root.pendingKind, root.pendingThumb, root.pendingImageRow)
+        onRunningChanged: if (!followSettle.running) Qt.callLater(root.revealIfReady)
     }
 
     Timer {
         id: stripHideTimer
         interval: root.stripHideMs
         repeat: false
-        onTriggered: root.stripShown = false
+        // A held seek or volume press is contact too, so the strip waits for the release before it goes.
+        onTriggered: {
+            if (mediaStrip.scrubbing || (mediaStrip.volumeItem && mediaStrip.volumeItem.pressing)) stripHideTimer.restart()
+            else root.stripShown = false
+        }
     }
 
     MouseArea {
@@ -425,7 +613,7 @@ Item {
         acceptedButtons: Qt.LeftButton | Qt.RightButton
         hoverEnabled: true
         // A click behind the overlay would silently move the cursor or open the listing's menu on it.
-        // A left click outside the surface closes, GM's rule of 2026-09-11, and a right click is only swallowed.
+        // A left click outside the surface closes, a rule of 2026-09-11, and a right click is only swallowed.
         onClicked: function (mouse) {
             if (mouse.button === Qt.LeftButton && !surface.contains(surface.mapFromItem(root, mouse.x, mouse.y)))
                 root.close()
@@ -437,13 +625,10 @@ Item {
 
     // PdfViewer.html and MediaPlayer.html draw a pane with its own edge: on the surface colour alone the inset vanished into the listing behind it.
     Rectangle {
+        id: lookDim
         anchors.fill: parent
         color: Theme.color.background
-        opacity: root.active ? root.groundOpacity : 0
-        Behavior on opacity {
-            enabled: !Theme.reducedMotion
-            NumberAnimation { duration: root.active ? Motion.durMs.open : Motion.durMs.close; easing.type: Easing.OutCubic }
-        }
+        opacity: root.unrevealed ? 0 : root.fade * root.groundOpacity
     }
 
     Rectangle {
@@ -451,10 +636,10 @@ Item {
         x: Theme.cardOrigin(parent.width, width)
         y: Theme.cardOrigin(parent.height, height) + surface.rise
         border.width: Theme.spacing.hairline
-        border.color: Theme.color.muted
+        border.color: Theme.color.mutedFrame
         // Open rises into place and close only fades, faster, because the translation is enabled: root.active.
-        property real rise: root.active ? 0 : Motion.translateUpPx
-        opacity: root.active ? 1 : 0
+        property real rise: root.revealedOpen ? 0 : Motion.translateUpPx
+        opacity: root.unrevealed ? 0 : root.fade
         // Expand drops the Quick Look inset, which is the whole of the canvas's "expand fills the window".
         readonly property real inset: root.pdfExpanded ? 1 : Theme.preview.fraction
         width: Theme.cardSpan(parent.width * surface.inset, parent.width)
@@ -466,14 +651,6 @@ Item {
         Behavior on rise {
             enabled: root.active && !Theme.reducedMotion
             NumberAnimation { duration: Motion.durMs.open; easing.type: Easing.OutCubic }
-        }
-
-        Behavior on opacity {
-            enabled: !Theme.reducedMotion
-            NumberAnimation {
-                duration: root.active ? Motion.durMs.open : Motion.durMs.close
-                easing.type: Easing.OutCubic
-            }
         }
 
         // Every kind's pane, eager the way 0.3.5 drew them: the first Space decodes and never
@@ -538,6 +715,9 @@ Item {
                 anchors.fill: parent
                 onLoaded: {
                     item.path = Qt.binding(function () { return root.path })
+                    item.origW = Qt.binding(function () { return root.imageW })
+                    item.origH = Qt.binding(function () { return root.imageH })
+                    item.thumbPending = Qt.binding(function () { return root.thumbRow >= 0 })
                     item.interimThumb = Qt.binding(function () { return root.interimThumb })
                     item.interimVisible = Qt.binding(function () { return root.interimVisible })
                     item.interimX = Qt.binding(function () { return root.interimBox !== null ? root.interimBox.x : 0 })
@@ -616,7 +796,7 @@ Item {
                     width: Theme.stateMarkSize
                     height: Theme.stateMarkSize
                     name: root.archiveFailed ? "alert" : "file"
-                    color: root.archiveFailed ? Theme.color.error : Theme.color.muted
+                    color: root.archiveFailed ? Theme.color.error : Theme.color.mutedFrame
                 }
 
                 Text {
@@ -634,8 +814,8 @@ Item {
             // Media still buffering or an image still decoding shows the crawl; LoadingState's hold-off keeps a fast local open from flashing it.
             Flea.LoadingState {
                 anchors.fill: parent
-                visible: (root.isMedia || root.isImage || root.isArchive) && root.status === "loading"
-                heldOff: root.swap !== null && root.swap.fellBack
+                visible: root.loadingEarly || (root.isMedia || root.isImage || root.isArchive) && root.status === "loading"
+                heldOff: root.loadingEarly || root.swap !== null && root.swap.fellBack
             }
 
             // MediaStrip unframed: quiet over the video, permanent on audio, and the column draws the framed form of the same file.
@@ -669,6 +849,20 @@ Item {
                 item.groundInset = Qt.binding(function () { return surface.border.width })
                 item.groundRadius = Qt.binding(function () { return Math.max(0, surface.radius - surface.border.width) })
             }
+        }
+    }
+
+    // During the hold a press or the wheel reveals at once and reaches nothing unseen, so no click closes a card that never drew.
+    MouseArea {
+        id: holdShield
+        anchors.fill: parent
+        // Held through its own press, so the release after the reveal clicks nothing either.
+        enabled: root.unrevealed || holdShield.pressed
+        acceptedButtons: Qt.AllButtons
+        onPressed: root.revealNow()
+        onWheel: function (wheel) {
+            wheel.accepted = true
+            root.revealNow()
         }
     }
 }

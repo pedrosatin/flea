@@ -24,8 +24,12 @@ Item {
     property bool selected: false
     // List.qml derives it per visible row, so an empty clipboard costs nothing.
     property string clipMark: ""
+    // True while a strip explains the run, so the highlight content builds with the strip and no keystroke pays for it.
+    property bool markArmed: false
+    // True from the turn after a search strip's first frame, so the location layout builds hidden and an answer only shows it.
+    property bool locateArmed: false
     // The mark's own size: 12 px in the muted role, 9 px after the name, per the board.
-    readonly property int clipPx: 12
+    readonly property int clipPx: Theme.clipMarkSize
     // The per-response dictionary row.k indexes into; List.qml hands down the same array every row of one response shares.
     property var kindNames: []
     // The row is its own rename editor while this is true, per the States artboard.
@@ -70,7 +74,7 @@ Item {
     readonly property int nameBudget: root.dropTarget ? root.localNameBudget() : (root.assignedNameBudget > -2 ? root.assignedNameBudget : root.localNameBudget())
     readonly property string elidedName: root.nameRun.start < 0 && root.nameBudget >= 0 ? Format.middleElide(root.decoratedName, root.nameBudget) : root.decoratedName
     // A long name would otherwise hide the location entirely, and the location is what tells two matches apart.
-    readonly property real nameShare: 0.66
+    readonly property real nameShare: Theme.searchNameShare
     // What the name and location share: the row less its padding, the mark, their own gap, and the size column while it is drawn.
     readonly property real searchSlot: Math.max(0, root.width - 2 * Theme.spacing.rowPaddingX - root.markSlot - 2 * Theme.spacing.gap
                                                 - (root.sizeShown ? root.sizeWidth + Theme.spacing.gap : 0))
@@ -86,7 +90,7 @@ Item {
     // A lifted row is the cursor, the pointer, or a selection member; all three take the same fill treatment, per qui Minimal.
     property bool lifted: root.cursor || root.hovered || root.selected || root.dropTarget
     // The OEM derives its secondary ink from the foreground rather than reading a separate palette key.
-    readonly property color dim: Qt.darker(Theme.color.foreground, 1.4)
+    readonly property color dim: Theme.color.metadata
     // One ink serves four cells, lifts metadata to foreground and carries cut dim without child opacity.
     readonly property color cellInk: Util.alpha(root.lifted || root.foregroundMetadata ? Theme.color.foreground : root.dim, root.dimOpacity)
     // A cut row dims its content, never the state fills, and every dimmed child reads this one value.
@@ -109,19 +113,18 @@ Item {
     Rectangle {
         width: root.paintWidth > 0 ? root.paintWidth : parent.width
         height: parent.height
-        // The cursor uses accent ink; marked rows keep the OEM's distinct selection rung.
+        // The cursor uses accent ink; marked rows keep the OEM's distinct selection rung, muted to the selected rung in a pane without focus.
         color: root.cursor && root.paneFocused ? Style.selectedAccentFill
-             : root.selected && root.paneFocused ? Style.selectionFill
+             : root.selected ? (root.paneFocused ? Style.selectionFill : Style.selectedFill)
              : root.hovered ? Style.hoverFill
              : "transparent"
     }
 
     // Twice the hairline, thick enough to read as a cursor mark against the row edge.
     Rectangle {
-        visible: root.cursor
         width: Theme.spacing.hairline * 2
         height: parent.height
-        color: root.paneFocused ? Theme.color.accent : Theme.color.muted
+        color: !root.cursor ? "transparent" : root.paneFocused ? Theme.color.accent : Theme.color.mutedFrame
     }
 
     // One Loader for the drop frame, the drop label and the clip mark, so a row at rest builds none.
@@ -165,7 +168,7 @@ Item {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.verticalCenterOffset: -1
                 name: root.clipMark
-                color: Theme.color.muted
+                color: Theme.color.mutedFrame
             }
         }
     }
@@ -199,7 +202,7 @@ Item {
         width: root.markSlot
         height: root.markSlot
         name: root.row ? Icons.glyphForRow(root.row.i, root.row.p) : Icons.FALLBACK
-        color: root.dimmed(root.dualMode ? (root.cursor && root.paneFocused ? Theme.color.accent : Theme.color.muted) : root.lifted ? Theme.color.foreground : root.dim)
+        color: root.dimmed(root.dualMode ? (root.cursor && root.paneFocused ? Theme.color.accent : Theme.color.mutedFrame) : root.lifted ? Theme.color.foreground : Theme.color.metadataFrame)
     }
 
     // What the row actually draws, so a test catches the binding being cut and not only the lookup.
@@ -251,8 +254,10 @@ Item {
         anchors.rightMargin: (root.modeShown ? Theme.spacing.gap : 0) + (root.clipMark.length > 0 ? Theme.spacing.gap + root.clipPx : 0) + (root.dropTarget ? root.dropExtra() : 0)
         anchors.verticalCenter: parent.verticalCenter
         text: root.elidedName
-        matchStart: root.nameRun.start
+        // Hidden while the row locates, or may at its next key, so it builds no mark beside the drawn one; a filter's own run still draws.
+        matchStart: root.locating || (root.locateArmed && !root.filtering) ? -1 : root.nameRun.start
         matchLength: root.nameRun.length
+        armed: root.markArmed && !root.locating
         color: root.dimmed(root.nameColor())
         accent: root.dimmed(Theme.color.accent)
         elideMiddle: true
@@ -261,7 +266,8 @@ Item {
     // One lazy path split: Recent reserves Location; search keeps the inline name share.
     Loader {
         id: locatingLoader
-        active: root.locating
+        active: root.locating || root.locateArmed
+        visible: root.locating
         anchors.left: icon.right
         anchors.leftMargin: Theme.spacing.gap
         anchors.right: size.left
@@ -279,6 +285,7 @@ Item {
                 text: root.decoratedName
                 matchStart: root.nameRun.start
                 matchLength: root.nameRun.length
+                armed: root.markArmed || root.locateArmed
                 color: root.dimmed(root.nameColor())
                 accent: root.dimmed(Theme.color.accent)
                 // A search base name keeps its extension the same way a list name does.
@@ -306,7 +313,7 @@ Item {
     Text {
         id: mode
         anchors.right: size.left
-        anchors.rightMargin: root.sizeShown && !root.dualMode ? Theme.spacing.gap : 0
+        anchors.rightMargin: (root.row && root.row.shown ? Theme.tagSlotWidth + Theme.spacing.gap : 0) + (root.sizeShown && !root.dualMode ? Theme.spacing.gap : 0)
         anchors.verticalCenter: parent.verticalCenter
         visible: root.modeShown && !root.dropTarget
         width: root.modeShown ? Theme.column.mode : 0
@@ -316,6 +323,13 @@ Item {
         font.pixelSize: Theme.font.caption
         elide: Text.ElideRight
         textFormat: Text.PlainText
+    }
+    // A tagged row mounts its swatches (ui/TagSlot.qml) on first need and keeps them; an untagged row builds nothing.
+    property var tagItem: null
+    onRowChanged: {
+        var names = root.row ? root.row.tg : undefined
+        if (root.tagItem !== null) root.tagItem.tags = names || []
+        else if (names !== undefined) root.tagItem = Qt.createComponent("TagSlot.qml").createObject(root, { tags: names, after: mode })
     }
     Text {
         id: size
@@ -371,7 +385,7 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         width: parent.width * 0.3
         height: Theme.font.caption
-        color: Theme.color.muted
+        color: Theme.color.mutedFrame
         opacity: 0.2
     }
 

@@ -2,13 +2,13 @@ use super::*;
 use crate::backend::testdir::TestDir;
 use crate::clip::protocol::{DISPLAY, DISPLAY_GET_REGISTRY, DISPLAY_SYNC};
 use crate::clip::wire::Conn;
-use crate::clip::DisplayEnv;
 use crate::json::field_str;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener;
-use std::sync::mpsc::{channel, RecvTimeoutError};
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::thread::ThreadId;
+use std::thread::{JoinHandle, ThreadId};
 use std::time::Duration;
 
 // Hang bounds for handshakes that must arrive, never durations the code under test is held to.
@@ -36,6 +36,28 @@ fn clip_line(message: OpMsg) -> String {
     line
 }
 
+// A silent compositor for the clear path: it signals the handshake, then holds the stream open until released.
+fn fake_compositor(tag: &str) -> (TestDir, PathBuf, Receiver<()>, Sender<()>, JoinHandle<()>) {
+    let dir = TestDir::new(tag);
+    let sock = dir.join("fake-hung");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let (accepted_tx, accepted) = channel();
+    let (release_tx, release) = channel();
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut conn = Conn::over(OwnedFd::from(stream));
+        // Both handshake requests are read, so closing later ends the stream cleanly, never with a reset.
+        for opcode in [DISPLAY_GET_REGISTRY, DISPLAY_SYNC] {
+            let event = conn.next_raw(TEST_WAIT_MS).unwrap().expect("a handshake request");
+            assert_eq!((event.sender, event.opcode), (DISPLAY, opcode));
+        }
+        accepted_tx.send(()).unwrap();
+        // The accepted stream stays open and silent until the test lets go of it.
+        release.recv_timeout(TEST_HOLD_WATCHDOG).unwrap();
+    });
+    (dir, sock, accepted, release_tx, worker)
+}
+
 #[test]
 fn a_request_runs_beside_the_loop_that_made_it() {
     let (replies, result) = channel();
@@ -44,7 +66,7 @@ fn a_request_runs_beside_the_loop_that_made_it() {
     beside(replies, move || {
         entered.send(()).unwrap();
         proceed.recv_timeout(TEST_HOLD_WATCHDOG).unwrap();
-        reply::reply_clear(true, false, "")
+        reply::reply_clear(Ok(false))
     });
     // The work is parked until released here, so a call that ran it inline would never reach this line.
     running.recv_timeout(TEST_WATCHDOG).unwrap();
@@ -83,33 +105,13 @@ fn a_silent_set_owner_never_holds_the_request_loop_and_still_refuses() {
 
 #[test]
 fn a_hung_compositor_gets_a_refusal_once_it_lets_go() {
+    let (_dir, sock, accepted, release, compositor) = fake_compositor("clip-clear-hang");
     let queue = SetQueue::new();
-    let dir = TestDir::new("clip-clear-hang");
-    let sock = dir.join("hang");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let env = DisplayEnv::set(Some(&sock));
-    let (accepted, held) = channel();
-    let (release, proceed) = channel();
-    let compositor = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut conn = Conn::over(OwnedFd::from(stream));
-        // Both handshake requests are read, so closing later ends the stream cleanly, never with a reset.
-        for opcode in [DISPLAY_GET_REGISTRY, DISPLAY_SYNC] {
-            let event = conn.next_raw(TEST_WAIT_MS).unwrap().expect("a handshake request");
-            assert_eq!((event.sender, event.opcode), (DISPLAY, opcode));
-        }
-        accepted.send(()).unwrap();
-        // The accepted stream stays open and silent until the test lets go of it.
-        proceed.recv_timeout(TEST_HOLD_WATCHDOG).unwrap();
-        drop(conn);
-    });
     let (replies, result) = channel();
-    queue.clear(replies, || clear_line("", &["/tmp/a.txt".to_string()]));
-    held.recv_timeout(TEST_WATCHDOG).unwrap();
+    queue.clear(replies, move || clear_line("", &["/tmp/a.txt".to_string()], Some(&sock)));
+    accepted.recv_timeout(TEST_WATCHDOG).unwrap();
     release.send(()).unwrap();
-    // The reply is the clear worker's last act, so the display is restored only after it read it.
     let line = clip_line(result.recv_timeout(TEST_WATCHDOG).unwrap());
-    drop(env);
     compositor.join().unwrap();
     assert!(line.contains(r#""ok":false"#), "{}", line);
     assert_eq!(field_str(&line, "error").as_deref(), Some("the compositor closed the connection"));
@@ -118,8 +120,9 @@ fn a_hung_compositor_gets_a_refusal_once_it_lets_go() {
 #[test]
 fn a_watch_starts_once_and_the_second_is_silent() {
     use crate::backend::{dirsizeworker::Worker, listing::Listing, state::{Held, State}};
-    // No display, so the thread ends after one honest error line and the channel closes with it.
-    let _env = DisplayEnv::set(None);
+    // A socket nobody listens on, so the thread ends after one honest error line and the channel closes with it.
+    let dir = TestDir::new("clip-watch-no-compositor");
+    let missing = dir.join("no-compositor");
     let (tx, rx) = channel();
     let (events, _events) = channel();
     // Exhaustive construction pins that the backend retains no clipboard report state.
@@ -133,18 +136,20 @@ fn a_watch_starts_once_and_the_second_is_silent() {
         dirsize_queue: Vec::new(),
         dirsize_worker: Worker::new(events),
         search: None,
+        search_session: None,
         search_reported: std::time::Instant::now(),
         generation: 0,
         held: Held::List,
         clip_watching: false,
     };
-    request_watch(tx.clone(), &mut state.clip_watching);
+    request_watch(tx.clone(), &mut state.clip_watching, Some(missing.clone()));
     assert!(state.clip_watching);
-    request_watch(tx, &mut state.clip_watching);
+    request_watch(tx, &mut state.clip_watching, Some(missing.clone()));
     let mut lines = 0;
     for m in rx.iter() {
         let line = clip_line(m);
         assert!(line.contains(r#""op":"changed""#));
+        assert!(line.contains(&missing.display().to_string()), "the error names the socket the request passed: {}", line);
         lines += 1;
     }
     assert_eq!(lines, 1, "one watcher means one error line, never two");
@@ -210,7 +215,7 @@ fn a_clear_waits_for_the_held_set_to_answer() {
     queue.clear(clear_replies, move || {
         record_start_event(&clear_events, "second start");
         observed.send(set_result.lock().unwrap().try_recv().map(clip_line)).unwrap();
-        let line = clear_line("", &[]);
+        let line = clear_line("", &[], None);
         record_start_event(&clear_events, "second end");
         line
     });
@@ -225,31 +230,25 @@ fn a_clear_waits_for_the_held_set_to_answer() {
 
 #[test]
 fn a_silent_compositor_clear_reports_the_timeout() {
+    let (_dir, sock, _accepted, release, compositor) = fake_compositor("clip-clear-timeout");
     let queue = SetQueue::new();
-    let dir = TestDir::new("clip-clear-timeout");
-    let sock = dir.join("silent");
-    let listener = UnixListener::bind(&sock).unwrap();
-    let env = DisplayEnv::set(Some(&sock));
-    let (release, proceed) = channel();
-    let compositor = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut conn = Conn::over(OwnedFd::from(stream));
-        for opcode in [DISPLAY_GET_REGISTRY, DISPLAY_SYNC] {
-            let event = conn.next_raw(TEST_WAIT_MS).unwrap().expect("a handshake request");
-            assert_eq!((event.sender, event.opcode), (DISPLAY, opcode));
-        }
-        // Keep the stream open until the worker answers, so only its deadline can end the read.
-        proceed.recv_timeout(TEST_HOLD_WATCHDOG).unwrap();
-        drop(conn);
-    });
     let (replies, result) = channel();
-    queue.clear(replies, || clear_line("", &["/tmp/a.txt".into()]));
+    queue.clear(replies, move || clear_line("", &["/tmp/a.txt".into()], Some(&sock)));
     let line = clip_line(result.recv_timeout(TEST_HOLD_WATCHDOG).unwrap());
     release.send(()).unwrap();
     compositor.join().unwrap();
-    drop(env);
     assert!(line.contains(r#""ok":false"#), "{}", line);
     assert!(line.contains("the compositor timed out waiting for a message"), "{}", line);
+}
+
+#[test]
+fn an_empty_clear_token_is_refused() {
+    let queue = SetQueue::new();
+    let (tx, rx) = channel();
+    queue.clear(tx, || clear_line("", &[], None));
+    let line = clip_line(rx.recv_timeout(TEST_WATCHDOG).expect("a clear reply"));
+    assert!(line.contains(r#""ok":false"#));
+    assert_eq!(field_str(&line, "op").as_deref(), Some("clear"));
 }
 
 #[test]

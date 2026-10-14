@@ -10,6 +10,8 @@ Item {
 
     property var peers: []
     property string reason: "checking"
+    // What state the reason is, for logic: ui/js/Taildrop.js status() names the codes.
+    property string code: ""
     property string sendCommand: ""
     property bool checking: false
     property bool _awaitingStart: false
@@ -26,6 +28,7 @@ Item {
         var provider = facts.taildrop || {}, sender = facts.taildropSend || {}
         sendCommand = sender.command || ""
         reason = provider.reason || sender.reason || "checking"
+        code = ""
         if (!provider.command || !sendCommand) return true
         checking = true
         _awaitingStart = true
@@ -64,16 +67,18 @@ Item {
             if (root._awaitingStart && !running) {
                 root._awaitingStart = false
                 root.checking = false
-                root.reason = "Tailscale status helper could not start"
+                root.reason = "Tailscale could not be checked"
+                root.code = ""
                 root.refreshed()
             }
         }
         onExited: function (exitCode) {
             root._awaitingStart = false
             var state = TaildropJs.status(statusOut.text || root._statusOutput, exitCode,
-                exitCode === 137 || exitCode === 9 ? "Tailscale status was interrupted or timed out" : statusErr.text || root._statusError)
+                exitCode === 137 || exitCode === 9 ? "Tailscale did not answer in time" : statusErr.text || root._statusError)
             root.peers = state.peers
             root.reason = state.reason
+            root.code = state.code
             root.checking = false
             root.refreshed()
         }
