@@ -1,6 +1,7 @@
 .pragma library
 
 .import "Archive.js" as Archive
+.import "Format.js" as Format
 
 // How a row is classified: which of the twelve preview states it is, and the extension families that
 // decide the three the backend's icon cannot. Split out of Facts.js, which owns the fact tables.
@@ -17,6 +18,7 @@ var MULTI = "multi"
 var LOADING = "loading"
 var ERROR = "error"
 var UNSUPPORTED = "unsupported"
+var FONT = "font"
 
 // src/backend/rows.rs's own UNKNOWN_KIND: the Kind a row gets when nothing could describe its type.
 var UNKNOWN_KIND = "Data"
@@ -50,6 +52,38 @@ function isMarkdown(name) {
         }
     }
     return false
+}
+
+function isHtml(name) { return /\.(html|htm)$/i.test(String(name)) }
+
+// TrueType, OpenType and collections (font/ttf, font/otf, font/collection); the backend checks the MIME type again.
+var FONT_EXTENSIONS = [".ttf", ".otf", ".ttc"]
+
+function isFont(name) {
+    var lower = String(name).toLowerCase()
+    return FONT_EXTENSIONS.some(function (e) { return lower.length > e.length && lower.indexOf(e, lower.length - e.length) !== -1 })
+}
+
+// Quick Look's font sample: one sentence at three sizes, in board pixels before the text-size ratio and the pixel ratio.
+var SAMPLE_TEXT = "The quick brown fox jumps over the lazy dog"
+var SAMPLE_SIZES = [22, 15, 12]
+
+// One count for every font pane, so an answer meant for an earlier pane never carries a later pane's id.
+var lookSeq = 0
+function nextLookId() { lookSeq += 1; return lookSeq }
+
+// "Inter · Bold · 312.0 kB · 2,548 glyphs"; a table the font lacks drops its part, and the size is always known.
+// pluralWord is Ops.pluralWord, handed in because Ops reaches Sort.js and RecentMode.js, which import this file.
+function fontLine(family, style, bytes, glyphs, pluralWord) {
+    var parts = [family, style, Format.size(bytes)].filter(function (p) { return p })
+    if (glyphs > 0)
+        parts.push(pluralWord(glyphs, "%1 glyph", "%1 glyphs").replace("%1", Format.count(glyphs)))
+    return parts.join(" \u00b7 ")
+}
+
+// The eleven camera RAW types the backend copies a preview out of, told apart by extension like a PDF; Sample input: "IMG_0412.CR3" is true.
+function isRaw(name) {
+    return /\.(cr[23]|nef|nrw|arw|sr2|dng|raf|orf|rw2|pef)$/i.test(String(name))
 }
 
 function isPdf(name) {
@@ -92,13 +126,16 @@ function isPreviewable(row) {
 function stateByExtension(name) {
     if (isPdf(name)) return PDF
     if (Archive.isArchive(name)) return ARCHIVE
+    if (/\.(csv|tsv)$/i.test(String(name))) return TEXT
     return ""
 }
 
 // Quick Look's kind from the icon, the name and a served thumbnail, Facts.state's row-free tests; code and markdown read as text.
 function quickLookKind(icon, name, thumbnailed) {
     if (isPdf(name)) return PDF
+    if (isFont(name)) return FONT
     if (isMarkdown(name)) return TEXT
+    if (/\.(csv|tsv)$/i.test(String(name))) return TEXT
     // The client's own extension rule, because the backend's icon cannot name the widened formats.
     if (Archive.isArchive(name)) return ARCHIVE
     var byIcon = kindState(icon)
